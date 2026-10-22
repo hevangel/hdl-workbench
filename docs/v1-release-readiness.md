@@ -54,7 +54,7 @@ pnpm demo
 | Native Xezim suite on current branch | Pass in Linux builder | Complete `cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1`; includes the 705-test integration target, 4 UPF tests, and doctests. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 7 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1`. |
 | Official CI workflow | Pending GitHub execution | `.github/workflows/luna09-browser-e2e.yml`. |
-| License/distribution review | Pending before external release | Surfer notice is retained; distribution model still requires review. |
+| License/distribution review | Technical inventory complete; release-channel notice and qualified review pending | See [Surfer distribution review](surfer-distribution-review.md) for the EUPL requirements, exact bundle changes, checksums, and remaining release-channel decisions. |
 
 ## Implemented bounds and remaining memory risk
 
@@ -77,4 +77,4 @@ pnpm demo
 
 1. Run the workflow on GitHub and retain its logs as release evidence; local Linux-builder results are documented, but the hosted CI run is still pending.
 2. Define the minimum supported browser/device and measure total process memory and stress limits there; keep large designs out of v1 claims until measured.
-3. Review the Surfer EUPL distribution obligations for the intended release format.
+3. Choose the release format, present Surfer's license/source/modification information in that channel, and obtain qualified review of the Surfer bundle and combined application. The [technical inventory](surfer-distribution-review.md) is complete; this release gate is not.

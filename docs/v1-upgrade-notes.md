@@ -31,7 +31,7 @@ The vendored Xezim defaults retain the native allocator and native dependency/bu
 
 ## Bundled Surfer
 
-Surfer v0.7.0 is pinned to commit `bd749b1f786c1c62cd67893ca71346cbe6983915`. Its EUPL-1.2 license text is distributed at `apps/ide/public/surfer/LICENSE-EUPL-1.2.txt`; upstream and local asset checksums are listed alongside it. The [Surfer upstream project](https://gitlab.com/surfer-project/surfer) identifies Surfer as EUPL-1.2 licensed, and the [European Commission's EUPL-1.2 text](https://interoperable-europe.ec.europa.eu/collection/eupl/eupl-text-eupl-12) provides the license terms. Preserve these notices and source provenance when copying the bundle. This repository records the license and notice status; it is not a legal determination that every distribution model or combination of works satisfies the license. Review the intended distribution and source-availability obligations before external release.
+Surfer v0.7.0 is pinned to commit `bd749b1f786c1c62cd67893ca71346cbe6983915`. Its EUPL-1.2 license text is distributed at `apps/ide/public/surfer/LICENSE-EUPL-1.2.txt`; upstream and local asset checksums are listed alongside it. The [Surfer upstream project](https://gitlab.com/surfer-project/surfer) identifies Surfer as EUPL-1.2 licensed, and the [European Commission's EUPL-1.2 text](https://interoperable-europe.ec.europa.eu/collection/eupl/eupl-text-eupl-12) provides the license terms. The [distribution review](surfer-distribution-review.md) records the exact local change, source availability, and release-channel gaps. Surface the required notice/source information and complete qualified review before external release.
 
 ## Protocol compatibility
 
