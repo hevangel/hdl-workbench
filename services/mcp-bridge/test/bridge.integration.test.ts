@@ -283,6 +283,27 @@ describe("LUNA-07 MCP bridge integration", () => {
     browser.socket.close();
   });
 
+  it("serializes concurrent writes that share an expected revision", async () => {
+    const context = await startBridge();
+    const original = parseText(await context.client.callTool({ name: "read_project_file", arguments: { path: "top.sv" } })) as { revision: string };
+    const contents = ["module top; logic first; endmodule\n", "module top; logic second; endmodule\n"];
+    const results = await Promise.all(contents.map((content) => context.client.callTool({
+      name: "write_project_file",
+      arguments: {
+        path: "top.sv",
+        expected_revision: original.revision,
+        content_base64: Buffer.from(content, "utf8").toString("base64"),
+      },
+    })));
+
+    expect(results.filter((result) => !result.isError)).toHaveLength(1);
+    const failures = results.filter((result) => result.isError);
+    expect(failures).toHaveLength(1);
+    expect(await errorCode(failures[0]!)).toBe("REVISION_CONFLICT");
+    const final = parseText(await context.client.callTool({ name: "read_project_file", arguments: { path: "top.sv" } })) as { contentBase64: string };
+    expect(contents).toContain(Buffer.from(final.contentBase64, "base64").toString("utf8"));
+  });
+
   it("rejects untrusted origins, missing or invalid tokens, traversal, and symlink escapes", async () => {
     const context = await startBridge();
     const status = parseText(await context.client.callTool({ name: "get_connection_status", arguments: {} })) as Record<string, unknown>;

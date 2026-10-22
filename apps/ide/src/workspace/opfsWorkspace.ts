@@ -23,6 +23,7 @@ const DEFAULT_PROJECT_ID = "counter-lab" as ProjectId;
 const DEFAULT_PROJECT_NAME = "counter-lab";
 const MAX_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
+const PERSIST_REQUEST_TIMEOUT_MS = 250;
 
 export interface WorkspaceProject {
   id: ProjectId;
@@ -229,6 +230,20 @@ function storageError(error: unknown): never {
 async function withProjectLock<T>(projectId: ProjectId, action: () => Promise<T>): Promise<T> {
   if (!navigator.locks) throw new WorkspaceStorageError("CROSS_TAB_LOCK_UNAVAILABLE", "This browser lacks cross-tab workspace locks; writes are disabled to avoid overwriting another tab.");
   return navigator.locks.request(`xezim-studio:${projectId}`, { mode: "exclusive" }, action);
+}
+
+async function requestPersistentStorage(): Promise<boolean> {
+  if (typeof navigator.storage.persist !== "function") return false;
+  return await new Promise<boolean>((resolve) => {
+    const timeout = setTimeout(() => resolve(false), PERSIST_REQUEST_TIMEOUT_MS);
+    void navigator.storage.persist().then((persistent) => {
+      clearTimeout(timeout);
+      resolve(persistent);
+    }).catch(() => {
+      clearTimeout(timeout);
+      resolve(false);
+    });
+  });
 }
 
 function recordsForProject(database: IDBDatabase, projectId: ProjectId): Promise<FileRecord[]> {
@@ -512,11 +527,7 @@ class BrowserWorkspaceManager implements PersistentWorkspaceManager {
     let persistent = false;
     const persistentStorageSupported = typeof navigator.storage.persist === "function";
     if (persistentStorageSupported) {
-      try {
-        persistent = await navigator.storage.persist();
-      } catch {
-        // Ordinary origin storage remains usable when the request is rejected.
-      }
+      persistent = await requestPersistentStorage();
     }
     let usageBytes: number | undefined;
     let quotaBytes: number | undefined;

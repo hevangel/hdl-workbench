@@ -32,6 +32,9 @@ import { runXezimProjectWorker } from "../workers/xezimClient.js";
 import type { ProjectFileInput } from "../workers/xezimProtocol.js";
 import { OpfsWaveformStore } from "./OpfsWaveformStore.js";
 
+const MAX_PROJECT_INPUT_BYTES = 16 * 1024 * 1024;
+const MAX_PROJECT_FILES = 4096;
+
 export class BrowserControllerError extends Error {
   constructor(readonly code: string, message: string, readonly retryable = false) {
     super(message);
@@ -93,6 +96,14 @@ function bridgeSnapshotId(files: Array<{ path: string; revision: string }>): Pro
 }
 
 function toWorkerFiles(files: Array<{ path: string; bytes: Uint8Array }>): ProjectFileInput[] {
+  if (files.length === 0 || files.length > MAX_PROJECT_FILES) {
+    throw new BrowserControllerError("RESOURCE_LIMIT", `Xezim accepts between 1 and ${MAX_PROJECT_FILES} project files.`);
+  }
+  const encoder = new TextEncoder();
+  const totalBytes = files.reduce((sum, file) => sum + encoder.encode(file.path).byteLength + file.bytes.byteLength, 0);
+  if (totalBytes > MAX_PROJECT_INPUT_BYTES) {
+    throw new BrowserControllerError("RESOURCE_LIMIT", `Xezim project input exceeds ${MAX_PROJECT_INPUT_BYTES} bytes.`);
+  }
   const decoder = new TextDecoder("utf-8", { fatal: true });
   try {
     return files.map(({ path, bytes }) => ({ path, contents: decoder.decode(bytes) }));

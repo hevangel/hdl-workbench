@@ -107,8 +107,9 @@ button { color: inherit; }
 .tree-indent-two { width: 20px; flex-basis: 20px; }
 .sv-icon { display: inline-grid; width: 17px; height: 16px; flex: 0 0 17px; place-items: center; border: 1px solid #4a7387; border-radius: 3px; color: #8fc4d4; background: #172832; font-family: var(--mono); font-size: 7px; font-weight: 500; }
 .dirty-dot, .tab-dirty { width: 6px; height: 6px; margin-left: auto; border-radius: 50%; background: var(--amber); }
-.sidebar-footer { display: flex; min-height: 39px; align-items: center; gap: 8px; margin-top: auto; border-top: 1px solid var(--border-soft); padding: 0 15px; color: #707b8c; font-size: 10px; }
+.sidebar-footer { display: flex; min-height: 45px; flex-wrap: wrap; align-content: center; align-items: center; gap: 4px 8px; margin-top: auto; border-top: 1px solid var(--border-soft); padding: 5px 15px; color: #707b8c; font-size: 10px; line-height: 1.4; }
 .storage-icon { color: #6fae9b; font-size: 14px; }
+.storage-estimate { flex-basis: 100%; padding-left: 22px; color: #8993a1; font-size: 9px; }
 
 .editor-workspace { display: grid; min-width: 0; flex: 1; grid-template-rows: 38px 30px minmax(180px, 1fr) 220px 25px; background: var(--bg); }
 .workspace-notice { position: fixed; z-index: 5; top: 123px; right: 15px; display: flex; max-width: min(720px, calc(100vw - 275px)); align-items: center; justify-content: space-between; gap: 14px; border: 1px solid #385d52; border-radius: 6px; padding: 9px 12px; color: #c1d8ce; background: #172720f5; box-shadow: 0 8px 24px #0006; font-size: 11px; }

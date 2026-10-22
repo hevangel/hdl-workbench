@@ -3,7 +3,7 @@ import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, t
 import { EditorSurface } from "./editor/EditorSurface.js";
 import { createMockServices } from "./mockServices.js";
 import { useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
-import type { PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
+import type { BrowserStorageStatus, PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
 import { exportProjectZip } from "./workspace/projectArchive.js";
 import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
 import type { BrowserIdeController } from "./controller/BrowserIdeController.js";
@@ -31,6 +31,13 @@ function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
 export function App({ workspace, simulation = demoServices.simulation, controller, projectManager, onSurferAdapterChange }: AppProps) {
   const [workspaceService, setWorkspaceService] = useState<WorkspaceAdapter>(() => workspace ?? controller?.workspace ?? projectManager?.getWorkspace() ?? demoServices.workspace);
   const [activeProject, setActiveProject] = useState<WorkspaceProject>(() => projectManager?.activeProject ?? {
@@ -40,6 +47,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     createdAt: 0,
   });
   const [projects, setProjects] = useState<WorkspaceProject[]>([]);
+  const [storageStatus, setStorageStatus] = useState<BrowserStorageStatus | null>(() => projectManager?.storageStatus ?? null);
   const [files, setFiles] = useState<EditorFile[]>([]);
   const filesRef = useRef(files);
   filesRef.current = files;
@@ -234,6 +242,40 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     });
     return unsubscribe;
   }, [updateFile, workspaceService]);
+
+  useEffect(() => {
+    if (!projectManager) {
+      setStorageStatus(null);
+      return;
+    }
+    setStorageStatus(projectManager.storageStatus);
+    let cancelled = false;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshEstimate = async () => {
+      try {
+        const estimate = await navigator.storage?.estimate();
+        if (cancelled || !estimate) return;
+        setStorageStatus((current) => ({
+          ...(current ?? projectManager.storageStatus),
+          usageBytes: estimate.usage,
+          quotaBytes: estimate.quota,
+        }));
+      } catch {
+        // Storage estimates are advisory and may be unavailable.
+      }
+    };
+    const scheduleEstimate = () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => { void refreshEstimate(); }, 250);
+    };
+    void refreshEstimate();
+    const unsubscribe = workspaceService.subscribeChanges(scheduleEstimate);
+    return () => {
+      cancelled = true;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      unsubscribe();
+    };
+  }, [projectManager, workspaceService]);
 
   useEffect(() => {
     if (!projectManager || loadedSessionProject.current !== activeProject.id) return;
@@ -673,9 +715,17 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               </button>
             ))}
           </div>
-          <div className="sidebar-footer"><span className="storage-icon">▱</span><span>{projectManager
-            ? projectManager.storageStatus.persistent ? "Persistent storage requested and granted" : "Browser may clear stored data"
-            : "In-memory demo workspace"}</span></div>
+          <div className="sidebar-footer">
+            <span className="storage-icon">▱</span>
+            <span>{projectManager
+              ? storageStatus?.persistent ? "Persistent storage requested and granted" : "Browser may clear stored data"
+              : "In-memory demo workspace"}</span>
+            {storageStatus && <span className="storage-estimate" title="Origin-wide estimate from navigator.storage.estimate()">
+              {storageStatus.usageBytes === undefined
+                ? "Origin storage estimate unavailable"
+                : `Origin storage estimate: ${formatBytes(storageStatus.usageBytes)} used${storageStatus.quotaBytes === undefined ? "" : ` of ${formatBytes(storageStatus.quotaBytes)} quota`}`}
+            </span>}
+          </div>
         </aside>
 
         <main className="editor-workspace">

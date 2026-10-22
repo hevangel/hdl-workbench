@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+Changes to Xezim Studio are recorded here.
 
-- Add the `xezim-ide/1` protocol package with runtime Zod validation, JSON Schema output, workspace and controller interfaces, compile/run contracts, diagnostics, waveform metadata, RPC envelopes, pairing messages, capability status, and provenance helpers.
-- Define decimal-string simulation ticks and exact `BigInt` comparison helpers.
-- Add a responsive Monaco editor shell backed by explicitly labeled mock services, draft-state UI, busy controls, diagnostics, and persisted layout preference.
+## Unreleased — v1 hardening
+
+- Added authenticated MCP-to-browser execution and persisted VCD viewing in the integrated browser workflow.
+- Added revision-serialized project writes, snapshot consistency checks, project input bounds, waveform retention bounds, and origin storage estimates.
+- Added Chromium and Firefox browser acceptance jobs and native Xezim compatibility suites to CI.
+- Added reproducible Xezim WASM build and local demo commands. The browser simulator remains the pinned Xezim WASM Worker; the native simulator is not a browser fallback.
+- Documented v1 upgrade expectations, unsupported browser capabilities, release evidence, and the Surfer EUPL-1.2 notice location.

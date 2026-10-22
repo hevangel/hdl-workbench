@@ -3,10 +3,21 @@ import { WaveformArtifactSchema, type WaveformArtifact } from "@xezim-ide/protoc
 const STORE_DIRECTORY = "xezim-studio-waveforms";
 const ARTIFACTS_DIRECTORY = "artifacts";
 const MAX_RETAINED_ARTIFACTS = 8;
+const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
+const MAX_RETAINED_BYTES = 128 * 1024 * 1024;
 
 interface StoredArtifact {
   artifact: WaveformArtifact;
   createdAt: number;
+}
+
+export class WaveformStorageError extends Error {
+  readonly code = "QUOTA_EXCEEDED";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "WaveformStorageError";
+  }
 }
 
 function safeArtifactId(value: string): string {
@@ -37,11 +48,22 @@ export class OpfsWaveformStore {
     if (!parsed.complete || parsed.format !== "vcd") throw new Error("Only complete VCD artifacts can be stored.");
     const bytes = new TextEncoder().encode(vcd);
     if (bytes.byteLength !== parsed.sizeBytes) throw new Error("VCD byte count does not match its artifact metadata.");
+    if (bytes.byteLength > MAX_ARTIFACT_BYTES) throw new Error(`VCD artifact exceeds the ${MAX_ARTIFACT_BYTES} byte storage limit.`);
     const directory = await this.directory();
-    await writeFile(directory, `${parsed.id}.vcd`, new Blob([bytes], { type: "text/vnd.vcd" }));
-    const stored: StoredArtifact = { artifact: parsed, createdAt: Date.now() };
-    await writeFile(directory, `${parsed.id}.json`, JSON.stringify(stored));
-    await this.prune(directory, parsed.id);
+    await this.prune(directory, parsed.id, bytes.byteLength);
+    try {
+      await writeFile(directory, `${parsed.id}.vcd`, new Blob([bytes], { type: "text/vnd.vcd" }));
+      const stored: StoredArtifact = { artifact: parsed, createdAt: Date.now() };
+      await writeFile(directory, `${parsed.id}.json`, JSON.stringify(stored));
+      await this.prune(directory, parsed.id);
+    } catch (error) {
+      await directory.removeEntry(`${parsed.id}.json`).catch(() => undefined);
+      await directory.removeEntry(`${parsed.id}.vcd`).catch(() => undefined);
+      if (typeof error === "object" && error !== null && "name" in error && error.name === "QuotaExceededError") {
+        throw new WaveformStorageError("Browser storage is full. Export source files or remove old projects before saving this waveform.");
+      }
+      throw error;
+    }
   }
 
   async get(id: string): Promise<WaveformArtifact> {
@@ -82,28 +104,52 @@ export class OpfsWaveformStore {
     return this.directoryPromise;
   }
 
-  private async prune(directory: FileSystemDirectoryHandle, newestId: string): Promise<void> {
-    const records: Array<{ id: string; createdAt: number }> = [];
+  private async prune(directory: FileSystemDirectoryHandle, newestId: string, reservedBytes = 0): Promise<void> {
+    const records: Array<{ id: string; createdAt: number; sizeBytes: number }> = [];
+    const validIds = new Set<string>();
     for await (const [name, handle] of directory.entries()) {
       if (!name.endsWith(".json") || handle.kind !== "file") continue;
       try {
         const raw = await (handle as FileSystemFileHandle).getFile();
         const parsed = JSON.parse(await raw.text()) as StoredArtifact;
         const artifact = WaveformArtifactSchema.safeParse(parsed.artifact);
-        if (artifact.success) records.push({ id: artifact.data.id, createdAt: parsed.createdAt });
+        if (artifact.success && Number.isFinite(parsed.createdAt)) {
+          records.push({ id: artifact.data.id, createdAt: parsed.createdAt, sizeBytes: artifact.data.sizeBytes });
+          validIds.add(artifact.data.id);
+        }
       } catch {
         // Ignore unreadable metadata; it cannot resolve to a waveform.
       }
     }
     records.sort((a, b) => b.createdAt - a.createdAt);
-    const keep = new Set(records.slice(0, MAX_RETAINED_ARTIFACTS).map(({ id }) => id));
-    keep.add(newestId);
+    const keep = new Set([newestId]);
+    let retainedCount = 1;
+    let retainedBytes = reservedBytes;
+    for (const record of records) {
+      const { id } = record;
+      if (id === newestId) {
+        if (reservedBytes === 0) retainedBytes += record.sizeBytes;
+        continue;
+      }
+      if (retainedCount < MAX_RETAINED_ARTIFACTS && retainedBytes + record.sizeBytes <= MAX_RETAINED_BYTES) {
+        keep.add(id);
+        retainedCount += 1;
+        retainedBytes += record.sizeBytes;
+      }
+    }
     for (const { id } of records) {
       if (keep.has(id)) continue;
-      this.objectUrls.get(id) && URL.revokeObjectURL(this.objectUrls.get(id)!);
+      const url = this.objectUrls.get(id);
+      if (url) URL.revokeObjectURL(url);
       this.objectUrls.delete(id);
       await directory.removeEntry(`${id}.json`).catch(() => undefined);
       await directory.removeEntry(`${id}.vcd`).catch(() => undefined);
+    }
+    for await (const [name] of directory.entries()) {
+      if (name.endsWith(".vcd")) {
+        const id = name.slice(0, -4);
+        if (!validIds.has(id) && id !== newestId) await directory.removeEntry(name).catch(() => undefined);
+      }
     }
   }
 }

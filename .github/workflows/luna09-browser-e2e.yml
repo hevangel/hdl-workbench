@@ -1,4 +1,4 @@
-name: LUNA-09 browser integration
+name: Xezim browser and native CI
 
 on:
   pull_request:
@@ -10,9 +10,13 @@ permissions:
   contents: read
 
 jobs:
-  chromium-e2e:
+  browser-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
     steps:
       - uses: actions/checkout@v6
 
@@ -48,10 +52,28 @@ jobs:
           pnpm build
           pnpm test
 
-      - name: Install Playwright Chromium and system dependencies
-        run: pnpm --filter @xezim-ide/mcp-bridge exec playwright install --with-deps chromium
+      - name: Install Playwright browser and system dependencies
+        run: pnpm --filter @xezim-ide/mcp-bridge exec playwright install --with-deps ${{ matrix.browser }}
 
       - name: Run browser integration acceptance test
         run: pnpm test:e2e
         env:
           CI: true
+          PLAYWRIGHT_PROJECT: ${{ matrix.browser }}
+
+  native-xezim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang
+
+      - name: Run native Xezim compatibility suites
+        run: |
+          cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1
+          cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1
+          cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1

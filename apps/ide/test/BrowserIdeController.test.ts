@@ -108,6 +108,19 @@ describe("BrowserIdeController one-shot execution", () => {
     expect(worker).not.toHaveBeenCalled();
   });
 
+  it("enforces Xezim's project-input byte limit before posting data to the Worker", async () => {
+    const services = createMockServices();
+    const largePath = ProjectPathSchema.parse("large.sv");
+    await services.workspace.writeFile(largePath, new Uint8Array(16 * 1024 * 1024), null);
+    const workspace = stableWorkspace(services);
+    const worker = vi.fn();
+    const controller = new BrowserIdeController(workspace, { runProjectWorker: worker });
+    const snapshot = await workspace.snapshot();
+
+    await expect(controller.execute(request({ snapshotId: snapshot.snapshotId }))).rejects.toMatchObject({ code: "RESOURCE_LIMIT" });
+    expect(worker).not.toHaveBeenCalled();
+  });
+
   it("rejects fractional-nanosecond stops rather than rounding the simulation time", async () => {
     const services = createMockServices();
     const worker = vi.fn();

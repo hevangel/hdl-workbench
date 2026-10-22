@@ -119,6 +119,7 @@ describe("IDE shell", () => {
     ));
     render(<App workspace={services.workspace} simulation={services.simulation} projectManager={projectManager} />);
 
+    expect(screen.getByText("Origin storage estimate: 0 B used of 1.0 KiB quota")).toBeInTheDocument();
     const editor = await screen.findByRole("textbox", { name: "SystemVerilog editor" });
     const marker = "// quota failure keeps this draft";
     fireEvent.change(editor, { target: { value: `${(editor as HTMLTextAreaElement).value}\n${marker}` } });
