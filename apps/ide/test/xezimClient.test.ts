@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { runXezimWorker } from "../src/workers/xezimClient";
+import { runXezimProjectWorker, runXezimWorker } from "../src/workers/xezimClient";
 import type { WorkerRequest, WorkerResponse } from "../src/workers/xezimProtocol";
 
 class FakeWorker {
@@ -55,6 +55,37 @@ describe("Xezim Worker client", () => {
     worker.respond({ ...completedResult, id: id! });
 
     await expect(pending).resolves.toEqual({ ...completedResult, id });
+    expect(worker.terminated).toBe(true);
+  });
+
+  it("posts a project snapshot request and returns its VCD metadata", async () => {
+    const worker = new FakeWorker();
+    const pending = runXezimProjectWorker(
+      {
+        files: [{ path: "rtl/top.sv", contents: "module top; endmodule" }],
+        snapshotId: "sha256:revision",
+        topModule: "top",
+        maxTimeNs: 20,
+        maxVcdBytes: 1024,
+      },
+      { createWorker: () => worker as unknown as Worker },
+    );
+    const id = worker.posted?.id;
+    expect(worker.posted).toMatchObject({ type: "compileAndRunProject", snapshotId: "sha256:revision" });
+    worker.respond({
+      id: id!,
+      ok: true,
+      result: {
+        ...completedResult.result,
+        snapshotId: "sha256:revision",
+        waveform: { format: "vcd", sizeBytes: 80, complete: true, timescale: "1ps" },
+        vcd: "$enddefinitions $end",
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      ok: true,
+      result: { snapshotId: "sha256:revision", waveform: { sizeBytes: 80 }, vcd: "$enddefinitions $end" },
+    });
     expect(worker.terminated).toBe(true);
   });
 

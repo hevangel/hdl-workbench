@@ -8318,6 +8318,8 @@ pub struct Simulator {
     wave: bool,
     vcd_file: Option<String>,
     vcd_writer: Option<super::vcd_sink::VcdSink>,
+    /// Optional in-memory VCD destination installed by browser embedders.
+    vcd_writer_override: Option<super::vcd_sink::DumpWriter>,
     /// Per-traced-signal table: (signal_table index, output id code). Built
     /// once at dump start; the per-cycle loop walks just this vector instead
     /// of iterating the full id_to_name (36M entries on c910) and hashing
@@ -9256,6 +9258,9 @@ pub struct Simulator {
     /// `$display` output written since the stdout sink was last synced, so a
     /// VPI callback's own output can be ordered after it cheaply.
     stdout_unsynced: bool,
+    /// Browser/project VFS runs capture simulator output into `output` and
+    /// must not write it to the process stdout handle.
+    suppress_stdout_sink: bool,
     /// Self-pointer, installed once at the top of `simulate()`. The
     /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
     /// callback dispatcher, but it expands in contexts that already hold
@@ -9270,6 +9275,9 @@ pub struct Simulator {
     /// value (0x8000_0000+). FD STDOUT/STDERR/STDIN and MCD bit 0 are never
     /// inserted — they are handled inline at write time.
     file_handles: HashMap<i32, sv_file::SvFile>,
+    /// Present only for an embedder that explicitly installs a project VFS.
+    /// None preserves native path-based file behavior.
+    virtual_files: Option<sv_file::VirtualFileSystem>,
     /// Some handle holds buffered `$fwrite` output (see `flush_file_writes`).
     file_writes_pending: bool,
     /// §21.3.5 (measured): `$feof` is a STICKY flag set when a read

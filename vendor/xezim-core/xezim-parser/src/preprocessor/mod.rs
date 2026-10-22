@@ -21,6 +21,13 @@ pub struct MacroDef {
 
 pub struct Preprocessor {
     defines: HashMap<String, MacroDef>,
+    /// Project files supplied by an embedding host. Keys are normalized
+    /// relative paths; these files take part in normal include search before
+    /// the host filesystem is consulted.
+    virtual_files: HashMap<PathBuf, Vec<u8>>,
+    /// When true, an absent virtual include is a hard miss; never fall through
+    /// to the process working directory or native filesystem.
+    virtual_files_only: bool,
     /// Directories to search for `include files (in order).
     /// The directory of the current source file is always searched first.
     include_dirs: Vec<PathBuf>,
@@ -92,6 +99,23 @@ pub struct Preprocessor {
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
+
+/// Canonicalize a project-relative path without allowing it to escape the
+/// workspace. Kept platform-neutral so browser VFS keys behave the same on
+/// Windows and Unix hosts.
+fn virtual_path_key(path: &Path) -> Option<PathBuf> {
+    let mut key = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => key.push(part),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!key.as_os_str().is_empty()).then_some(key)
+}
 
 #[derive(Clone, Copy)]
 struct IfdefState {
@@ -318,6 +342,8 @@ impl Preprocessor {
         Self::seed_predefined(&mut defines);
         Self {
             defines,
+            virtual_files: HashMap::new(),
+            virtual_files_only: false,
             include_dirs: Vec::new(),
             include_depth: 0,
             current_file: String::new(),
@@ -681,6 +707,30 @@ impl Preprocessor {
         if !self.include_dirs.contains(&dir) {
             self.include_dirs.push(dir);
         }
+    }
+
+    /// Add a project-relative include file without requiring it to exist on
+    /// the host filesystem. Absolute paths and parent traversal are rejected.
+    pub fn add_virtual_file(&mut self, path: &Path, contents: Vec<u8>) -> Result<(), String> {
+        let key = virtual_path_key(path).ok_or_else(|| {
+            format!(
+                "virtual include path must be project-relative: {}",
+                path.display()
+            )
+        })?;
+        self.virtual_files.insert(key, contents);
+        Ok(())
+    }
+
+    /// Make include resolution exclusively use files supplied by the host.
+    pub fn set_virtual_files_only(&mut self, enabled: bool) {
+        self.virtual_files_only = enabled;
+    }
+
+    fn virtual_file(&self, path: &Path) -> Option<&[u8]> {
+        self.virtual_files
+            .get(&virtual_path_key(path)?)
+            .map(Vec::as_slice)
     }
 
     pub fn with_defines(defines: HashMap<String, String>) -> Self {
@@ -1297,7 +1347,21 @@ impl Preprocessor {
                         {
                             // Lossy decode — tolerate stray non-UTF-8 bytes in
                             // included RTL (replace with U+FFFD, don't fail).
-                            match std::fs::read(&resolved).map(|b| {
+                            let bytes = if self.virtual_files_only {
+                                self.virtual_file(&resolved)
+                                    .map(|b| Ok(b.to_vec()))
+                                    .unwrap_or_else(|| {
+                                        Err(std::io::Error::new(
+                                            std::io::ErrorKind::NotFound,
+                                            "not present in virtual project files",
+                                        ))
+                                    })
+                            } else {
+                                self.virtual_file(&resolved)
+                                    .map(|b| Ok(b.to_vec()))
+                                    .unwrap_or_else(|| std::fs::read(&resolved))
+                            };
+                            match bytes.map(|b| {
                                 String::from_utf8(b).unwrap_or_else(|e| {
                                     String::from_utf8_lossy(e.as_bytes()).into_owned()
                                 })
@@ -1996,6 +2060,9 @@ impl Preprocessor {
     /// lacks declarations the design calls then elaborates with no clue why.
     /// Warn once per include name.
     fn warn_shadowed_include(&self, filename: &str, chosen: &Path, source_dir: Option<&Path>) {
+        if self.virtual_files_only {
+            return;
+        }
         // One report per include name for the whole run: each source file
         // gets its own preprocessor, and the same header is included by many.
         static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
@@ -2009,7 +2076,10 @@ impl Preprocessor {
                 return;
             }
         }
-        let chosen_bytes = std::fs::read(chosen).ok();
+        let chosen_bytes = self
+            .virtual_file(chosen)
+            .map(ToOwned::to_owned)
+            .or_else(|| std::fs::read(chosen).ok());
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(d) = source_dir {
             dirs.push(d.to_path_buf());
@@ -2017,10 +2087,15 @@ impl Preprocessor {
         dirs.extend(self.include_dirs.iter().cloned());
         for dir in dirs {
             let other = dir.join(filename);
-            if !other.exists() || same_file(&other, chosen) {
+            if (!other.exists() && self.virtual_file(&other).is_none()) || same_file(&other, chosen)
+            {
                 continue;
             }
-            if std::fs::read(&other).ok() == chosen_bytes {
+            let other_bytes = self
+                .virtual_file(&other)
+                .map(ToOwned::to_owned)
+                .or_else(|| std::fs::read(&other).ok());
+            if other_bytes == chosen_bytes {
                 continue;
             }
             WARNED
@@ -2041,9 +2116,28 @@ impl Preprocessor {
     fn resolve_include_first(&self, filename: &str, source_dir: Option<&Path>) -> Option<PathBuf> {
         let inc_path = Path::new(filename);
 
+        if self.virtual_files_only {
+            if inc_path.is_absolute() {
+                return None;
+            }
+            if let Some(dir) = source_dir {
+                let candidate = dir.join(inc_path);
+                if self.virtual_file(&candidate).is_some() {
+                    return Some(candidate);
+                }
+            }
+            for dir in &self.include_dirs {
+                let candidate = dir.join(inc_path);
+                if self.virtual_file(&candidate).is_some() {
+                    return Some(candidate);
+                }
+            }
+            return None;
+        }
+
         // If the include path is absolute, use it directly
         if inc_path.is_absolute() {
-            if inc_path.exists() {
+            if inc_path.exists() || self.virtual_file(inc_path).is_some() {
                 return Some(inc_path.to_path_buf());
             }
             return None;
@@ -2052,7 +2146,7 @@ impl Preprocessor {
         // Search relative to the current source file's directory first
         if let Some(dir) = source_dir {
             let candidate = dir.join(inc_path);
-            if candidate.exists() {
+            if candidate.exists() || self.virtual_file(&candidate).is_some() {
                 return Some(candidate);
             }
         }
@@ -2060,7 +2154,7 @@ impl Preprocessor {
         // Search include directories
         for dir in &self.include_dirs {
             let candidate = dir.join(inc_path);
-            if candidate.exists() {
+            if candidate.exists() || self.virtual_file(&candidate).is_some() {
                 return Some(candidate);
             }
         }
@@ -2068,7 +2162,7 @@ impl Preprocessor {
         // Fallback: try relative to current working directory
         if let Ok(cwd) = std::env::current_dir() {
             let candidate = cwd.join(inc_path);
-            if candidate.exists() {
+            if candidate.exists() || self.virtual_file(&candidate).is_some() {
                 return Some(candidate);
             }
         }

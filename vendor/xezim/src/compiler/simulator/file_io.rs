@@ -29,6 +29,9 @@ impl Simulator {
 
     #[inline]
     pub(super) fn stdout_write(&mut self, s: &str) {
+        if self.suppress_stdout_sink {
+            return;
+        }
         self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
@@ -43,6 +46,9 @@ impl Simulator {
 
     #[inline]
     pub(super) fn stdout_writeln(&mut self, s: &str) {
+        if self.suppress_stdout_sink {
+            return;
+        }
         self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
@@ -602,26 +608,41 @@ impl Simulator {
     /// `vpi_mcd_open`.
     pub(super) fn open_file_path(&mut self, path: &str, mcd_mode: bool, mode: &str) -> Value {
         self.flush_file_writes();
-        let mut opts = OpenOptions::new();
-        let has_plus = mode.contains('+');
-        if mode.contains('r') {
-            opts.read(true);
-        }
-        if mode.contains('w') {
-            opts.write(true).create(true).truncate(true);
-        }
-        if mode.contains('a') {
-            opts.append(true).create(true);
-        }
-        if has_plus {
-            opts.read(true).write(true);
-        }
-        if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
-            opts.read(true);
-        }
-        let mut file = match opts.open(path) {
-            Ok(f) => sv_file::SvFile::new(f, path),
-            Err(_) => return Value::zero(32),
+        let mut file = if let Some(fs) = &self.virtual_files {
+            match sv_file::SvFile::new_virtual(fs.clone(), path, mode) {
+                Ok(file) => file,
+                Err(error) => {
+                    let message = format!(
+                        "XEZIM_WEB_FILE_ERROR: $fopen cannot access project file '{}': {}",
+                        path, error
+                    );
+                    self.compile_errors.push(message.clone());
+                    self.record_output(message);
+                    return Value::zero(32);
+                }
+            }
+        } else {
+            let mut opts = OpenOptions::new();
+            let has_plus = mode.contains('+');
+            if mode.contains('r') {
+                opts.read(true);
+            }
+            if mode.contains('w') {
+                opts.write(true).create(true).truncate(true);
+            }
+            if mode.contains('a') {
+                opts.append(true).create(true);
+            }
+            if has_plus {
+                opts.read(true).write(true);
+            }
+            if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
+                opts.read(true);
+            }
+            match opts.open(path) {
+                Ok(f) => sv_file::SvFile::new(f, path),
+                Err(_) => return Value::zero(32),
+            }
         };
         // A second handle on an open file: both write through, so their
         // writes land in program order.
@@ -1160,16 +1181,32 @@ impl Simulator {
         let step: i64 = if addr <= end_addr { 1 } else { -1 };
         let min_idx = lo.min(hi);
         let max_idx = lo.max(hi);
-        let content = match std::fs::read_to_string(&path) {
+        let virtual_provider = self.virtual_files.is_some();
+        let content = match self
+            .virtual_files
+            .as_ref()
+            .map(|fs| fs.read_to_string(&path))
+            .unwrap_or_else(|| std::fs::read_to_string(&path))
+        {
             Ok(c) => c,
             Err(e) => {
                 // §21.4: the memory is left unchanged; say why, as the
                 // reference simulator does, instead of loading nothing
                 // silently.
-                let m = format!(
-                    "[xezim][warning] {}: cannot open file \"{}\": {}",
-                    task, path, e
-                );
+                let m = if virtual_provider {
+                    format!(
+                        "XEZIM_WEB_FILE_ERROR: {} cannot open project file \"{}\": {}",
+                        task, path, e
+                    )
+                } else {
+                    format!(
+                        "[xezim][warning] {}: cannot open file \"{}\": {}",
+                        task, path, e
+                    )
+                };
+                if virtual_provider {
+                    self.compile_errors.push(m.clone());
+                }
                 self.record_output(m.clone());
                 self.stdout_writeln(&m);
                 return Value::zero(32);
@@ -1312,7 +1349,18 @@ impl Simulator {
             }
             addr += step;
         }
-        let _ = std::fs::write(&path, out);
+        if let Some(fs) = &self.virtual_files {
+            if let Err(error) = fs.write(&path, out.into_bytes()) {
+                let message = format!(
+                    "XEZIM_WEB_FILE_ERROR: {} cannot write project file '{}': {}",
+                    tn, path, error
+                );
+                self.compile_errors.push(message.clone());
+                self.record_output(message);
+            }
+        } else {
+            let _ = std::fs::write(&path, out);
+        }
         Value::zero(32)
     }
 

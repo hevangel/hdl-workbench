@@ -393,6 +393,12 @@ impl Simulator {
 
     /// `$date` content. The header used to carry no date at all.
     pub(super) fn vcd_date_string() -> String {
+        #[cfg(target_arch = "wasm32")]
+        let secs = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        #[cfg(not(target_arch = "wasm32"))]
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -435,32 +441,33 @@ impl Simulator {
             .vcd_file
             .clone()
             .unwrap_or_else(|| "dump.vcd".to_string());
-        let file = match std::fs::File::create(&filename) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Warning: cannot create VCD file '{}': {}", filename, e);
-                return;
-            }
-        };
-        // A '.zst'/'.zstd' filename suffix zstd-compresses the byte stream
-        // (same convention as the XTrace dump).
-        let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
-            Some(3)
+        let mut w = if let Some(writer) = self.vcd_writer_override.take() {
+            super::vcd_sink::VcdSink::inline(writer)
         } else {
-            None
-        };
-        let mut w = match super::vcd_sink::VcdSink::open_file(
-            file,
-            self.dump_writer_threaded(),
-            zstd_level,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "Warning: cannot create VCD writer for '{}': {}",
-                    filename, e
-                );
-                return;
+            let file = match std::fs::File::create(&filename) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Warning: cannot create VCD file '{}': {}", filename, e);
+                    return;
+                }
+            };
+            // A '.zst'/'.zstd' filename suffix zstd-compresses the byte stream
+            // (same convention as the XTrace dump).
+            let zstd_level = if filename.ends_with(".zst") || filename.ends_with(".zstd") {
+                Some(3)
+            } else {
+                None
+            };
+            match super::vcd_sink::VcdSink::open_file(file, self.dump_writer_threaded(), zstd_level)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "Warning: cannot create VCD writer for '{}': {}",
+                        filename, e
+                    );
+                    return;
+                }
             }
         };
 

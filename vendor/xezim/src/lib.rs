@@ -1012,7 +1012,72 @@ pub fn simulate_multi_inline(
         None,
         None,
         false,
+        false,
+        None,
+        None,
+        None,
     )
+}
+
+/// Compile and simulate a named browser/project snapshot on the calling
+/// thread. `sources` is the ordered set of SV compilation units;
+/// `virtual_files` contains those files plus include and runtime data files.
+/// All paths are project-relative and are rejected if they are absolute or
+/// escape through `..`. The ordinary native entry points remain filesystem
+/// backed unless callers explicitly select this API.
+pub fn simulate_project_inline(
+    sources: &[(String, String)],
+    virtual_files: &[(String, Vec<u8>)],
+    max_time: u64,
+    top_module_name: Option<&str>,
+    max_project_bytes: usize,
+    vcd_writer: Box<dyn std::io::Write + Send>,
+) -> Result<compiler::Simulator, String> {
+    let source_texts: Vec<String> = sources.iter().map(|(_, text)| text.clone()).collect();
+    let source_paths: Vec<String> = sources.iter().map(|(path, _)| path.clone()).collect();
+    let rewritten_sources: Vec<String> = source_texts
+        .iter()
+        .map(|source| intra_delay::rewrite_intra_assignment_delays(source))
+        .collect();
+    let pre = xezim_core::preprocess_design_with_virtual_files(
+        &rewritten_sources,
+        &source_paths,
+        &[],
+        &[],
+        virtual_files,
+    )?;
+    if !pre.errors.is_empty() {
+        return Err(pre.errors.join("\n"));
+    }
+    let sim = simulate_multi_inner(
+        &source_texts,
+        max_time,
+        top_module_name,
+        &[],
+        &source_paths,
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        true,
+        Some((virtual_files.to_vec(), max_project_bytes)),
+        Some(vcd_writer),
+        Some(pre),
+    )?;
+    Ok(sim)
 }
 
 /// Public entry point: runs the whole compile+simulate on a worker thread
@@ -1072,6 +1137,10 @@ pub fn simulate_multi(
             write_profile,
             profile_input,
             collapse_islands,
+            false,
+            None,
+            None,
+            None,
         );
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -1104,6 +1173,10 @@ pub fn simulate_multi(
                 write_profile,
                 profile_input,
                 collapse_islands,
+                false,
+                None,
+                None,
+                None,
             );
         }
         // `Simulator` is not auto-`Send`: it carries raw pointers into its OWN
@@ -1143,6 +1216,10 @@ pub fn simulate_multi(
                         write_profile,
                         profile_input,
                         collapse_islands,
+                        false,
+                        None,
+                        None,
+                        None,
                     ))
                 })
                 .expect("spawn simulation worker")
@@ -1177,6 +1254,10 @@ fn simulate_multi_inner(
     write_profile: Option<&str>,
     profile_input: Option<&str>,
     collapse_islands: bool,
+    force_wave: bool,
+    virtual_files: Option<(Vec<(String, Vec<u8>)>, usize)>,
+    vcd_writer: Option<Box<dyn std::io::Write + Send>>,
+    preprocessed: Option<xezim_core::PreprocessedSources>,
 ) -> Result<compiler::Simulator, String> {
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
@@ -1191,8 +1272,11 @@ fn simulate_multi_inner(
         .collect();
     // The driver's own preprocessing pass (main.rs), reusable when the
     // rewrite above left every source untouched.
-    let mut pre = take_preprocessed(raw_sources, source_paths, include_dirs, defines)
-        .filter(|_| sources.as_slice() == raw_sources);
+    let mut pre = match preprocessed {
+        Some(pre) => Some(pre),
+        None => take_preprocessed(raw_sources, source_paths, include_dirs, defines)
+            .filter(|_| sources.as_slice() == raw_sources),
+    };
     let cache = design_cache_config();
     if cache.is_some() && pre.is_none() {
         // One pass serves both the cache key and (on a miss) elaboration.
@@ -1333,6 +1417,14 @@ fn simulate_multi_inner(
 
     let mut sim = compiler::Simulator::new(elab, max_time);
     rss_trace("simulator constructed");
+    let project_vfs_enabled = virtual_files.is_some();
+    if let Some((files, max_bytes)) = virtual_files {
+        sim.set_virtual_files(files, max_bytes)?;
+    }
+    sim.set_stdout_capture_only(project_vfs_enabled);
+    if let Some(writer) = vcd_writer {
+        sim.set_vcd_writer(writer)?;
+    }
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
         sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
     }
@@ -1369,6 +1461,9 @@ fn simulate_multi_inner(
         // the design), like every other delay.
         let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim.tick_s, select);
         sim.sdf_annotation = Some(annotation);
+    }
+    if force_wave {
+        sim.enable_wave_support();
     }
     sim.compile();
     rss_trace("compiled");

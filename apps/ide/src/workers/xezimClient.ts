@@ -1,4 +1,9 @@
-import type { WorkerRequest, WorkerResponse } from "./xezimProtocol";
+import type {
+  CompileAndRunProjectRequest,
+  CompileAndRunRequest,
+  WorkerRequest,
+  WorkerResponse,
+} from "./xezimProtocol";
 
 export interface XezimWorkerOptions {
   timeoutMs?: number;
@@ -9,8 +14,22 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_TIMEOUT_MS = 300_000;
 
 export function runXezimWorker(
-  input: Omit<WorkerRequest, "type" | "id">,
+  input: Omit<CompileAndRunRequest, "type" | "id">,
   options: XezimWorkerOptions = {},
+): Promise<WorkerResponse> {
+  return launchWorker((id) => ({ ...input, type: "compileAndRun", id }), options);
+}
+
+export function runXezimProjectWorker(
+  input: Omit<CompileAndRunProjectRequest, "type" | "id">,
+  options: XezimWorkerOptions = {},
+): Promise<WorkerResponse> {
+  return launchWorker((id) => ({ ...input, type: "compileAndRunProject", id }), options);
+}
+
+function launchWorker(
+  buildRequest: (id: string) => WorkerRequest,
+  options: XezimWorkerOptions,
 ): Promise<WorkerResponse> {
   const timeoutMs = Math.min(Math.max(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 1), MAX_TIMEOUT_MS);
   const worker = options.createWorker?.() ?? new Worker(new URL("./xezim.worker.ts", import.meta.url), { type: "module" });
@@ -40,6 +59,6 @@ export function runXezimWorker(
     worker.onmessageerror = () => {
       finish({ id, ok: false, error: { code: "INTERNAL_ERROR", message: "Xezim worker returned an unreadable message." } });
     };
-    worker.postMessage({ ...input, type: "compileAndRun", id } satisfies WorkerRequest);
+    worker.postMessage(buildRequest(id));
   });
 }

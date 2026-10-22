@@ -1026,7 +1026,44 @@ pub fn preprocess_design(
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
 ) -> PreprocessedSources {
+    preprocess_design_inner(sources, source_files, include_dirs, defines, &[], false)
+        .expect("empty virtual file map is valid")
+}
+
+/// Preprocess a design while resolving `include` directives from a
+/// project-relative in-memory file map before consulting the host filesystem.
+/// This is the parser entry point used by browser and other virtual-workspace
+/// embedders; the ordinary `preprocess_design` API retains native behavior.
+pub fn preprocess_design_with_virtual_files(
+    sources: &[String],
+    source_files: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+    virtual_files: &[(String, Vec<u8>)],
+) -> Result<PreprocessedSources, String> {
+    preprocess_design_inner(
+        sources,
+        source_files,
+        include_dirs,
+        defines,
+        virtual_files,
+        true,
+    )
+}
+
+fn preprocess_design_inner(
+    sources: &[String],
+    source_files: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+    virtual_files: &[(String, Vec<u8>)],
+    virtual_files_only: bool,
+) -> Result<PreprocessedSources, String> {
     let mut pp = new_design_preprocessor(include_dirs, defines);
+    pp.set_virtual_files_only(virtual_files_only);
+    for (path, contents) in virtual_files {
+        pp.add_virtual_file(std::path::Path::new(path), contents.clone())?;
+    }
     let mut texts = Vec::with_capacity(sources.len());
     let mut line_maps = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
@@ -1035,7 +1072,7 @@ pub fn preprocess_design(
         texts.push(pp.preprocess_file(source, source_path.as_deref()));
         line_maps.push(pp.take_line_map());
     }
-    PreprocessedSources {
+    Ok(PreprocessedSources {
         sources: sources.to_vec(),
         source_files: source_files.to_vec(),
         include_dirs: include_dirs.to_vec(),
@@ -1048,7 +1085,7 @@ pub fn preprocess_design(
         module_ts_own_file: pp.module_ts_own_file.clone(),
         default_nettype_none: sv_parser::default_nettype_none_seen(),
         unconnected_drive: sv_parser::unconnected_drive_snapshot(),
-    }
+    })
 }
 
 impl PreprocessedSources {

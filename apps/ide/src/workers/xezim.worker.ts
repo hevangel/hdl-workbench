@@ -9,12 +9,23 @@ interface WorkerScope {
 const workerScope = globalThis as unknown as WorkerScope;
 
 const MAX_SOURCE_BYTES = 4 * 1024 * 1024;
+const MAX_PROJECT_BYTES = 16 * 1024 * 1024;
+const MAX_PROJECT_FILES = 4096;
+const MAX_VCD_BYTES = 64 * 1024 * 1024;
 const MAX_TIME_NS = 10_000_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 
 type XezimModule = {
   default: () => Promise<unknown>;
   compileAndRun: (source: string, topModule: string, maxTimeNs: bigint, maxOutputBytes: number) => string;
+  compileAndRunProject: (
+    filesJson: string,
+    snapshotId: string,
+    topModule: string,
+    maxTimeNs: bigint,
+    maxOutputBytes: number,
+    maxVcdBytes: number,
+  ) => string;
 };
 
 let modulePromise: Promise<XezimModule> | undefined;
@@ -35,16 +46,9 @@ function fail(id: string, code: string, message: string): WorkerResponse {
 
 workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const request = event.data;
-  if (request?.type !== "compileAndRun" || typeof request.id !== "string") return;
+  if ((request?.type !== "compileAndRun" && request?.type !== "compileAndRunProject")
+    || typeof request.id !== "string") return;
   try {
-    if (typeof request.source !== "string") {
-      workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "Source must be a string."));
-      return;
-    }
-    if (new TextEncoder().encode(request.source).byteLength > MAX_SOURCE_BYTES) {
-      workerScope.postMessage(fail(request.id, "RESOURCE_LIMIT", "Source exceeds the 4 MiB browser limit."));
-      return;
-    }
     if (typeof request.topModule !== "string" || !request.topModule || request.topModule.length > 512) {
       workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "A top module of at most 512 characters is required."));
       return;
@@ -59,12 +63,63 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       return;
     }
     const wasm = await loadXezim();
-    const json = wasm.compileAndRun(
-      request.source,
-      request.topModule,
-      BigInt(request.maxTimeNs),
-      Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
-    );
+    let json: string;
+    if (request.type === "compileAndRun") {
+      if (typeof request.source !== "string") {
+        workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "Source must be a string."));
+        return;
+      }
+      if (new TextEncoder().encode(request.source).byteLength > MAX_SOURCE_BYTES) {
+        workerScope.postMessage(fail(request.id, "RESOURCE_LIMIT", "Source exceeds the 4 MiB browser limit."));
+        return;
+      }
+      json = wasm.compileAndRun(
+        request.source,
+        request.topModule,
+        BigInt(request.maxTimeNs),
+        Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+      );
+    } else {
+      if (!Array.isArray(request.files) || request.files.length === 0 || request.files.length > MAX_PROJECT_FILES) {
+        workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "Project must contain 1 to 4096 files."));
+        return;
+      }
+      if (typeof request.snapshotId !== "string" || !request.snapshotId || request.snapshotId.length > 256) {
+        workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "A snapshot ID of at most 256 characters is required."));
+        return;
+      }
+      if (request.maxVcdBytes !== undefined
+        && (!Number.isSafeInteger(request.maxVcdBytes) || request.maxVcdBytes < 0)) {
+        workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "VCD limit must be a nonnegative integer."));
+        return;
+      }
+      const encoder = new TextEncoder();
+      let totalBytes = 0;
+      for (const file of request.files) {
+        if (!file || typeof file.path !== "string" || typeof file.contents !== "string") {
+          workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "Each project file needs a path and UTF-8 contents."));
+          return;
+        }
+        const path = file.path.replaceAll("\\", "/");
+        if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path) || path.split("/").includes("..")) {
+          workerScope.postMessage(fail(request.id, "INVALID_PATH", `Project path is not relative: ${file.path}`));
+          return;
+        }
+        totalBytes += encoder.encode(file.path).byteLength + encoder.encode(file.contents).byteLength;
+        if (totalBytes > MAX_PROJECT_BYTES) {
+          workerScope.postMessage(fail(request.id, "RESOURCE_LIMIT", "Project files exceed the 16 MiB browser limit."));
+          return;
+        }
+      }
+      json = wasm.compileAndRunProject(
+        JSON.stringify(request.files),
+        request.snapshotId,
+        request.topModule,
+        BigInt(request.maxTimeNs),
+        Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+        Math.min(request.maxVcdBytes ?? MAX_VCD_BYTES, MAX_VCD_BYTES),
+      );
+    }
     const result = JSON.parse(json) as WorkerResponse extends { ok: true; result: infer T } ? T : never;
     workerScope.postMessage({ id: request.id, ok: true, result } satisfies WorkerResponse);
   } catch (error) {

@@ -1380,6 +1380,16 @@ impl Simulator {
     /// command's exit status as an `int`.
     pub(super) fn system_impl(&mut self, args: &[Expression]) -> i32 {
         self.flush_file_writes();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = args;
+            return self.deny_system_task();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.virtual_files.is_some() {
+            return self.deny_system_task();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         match args.first() {
             None => 1, // system(NULL): a shell is available
             Some(a) => {
@@ -1394,6 +1404,17 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    fn deny_system_task(&mut self) -> i32 {
+        const MESSAGE: &str =
+            "XEZIM_WEB_UNSUPPORTED_TASK: $system is disabled in browser and project VFS runs";
+        if !self.warned_system_tasks.contains(MESSAGE) {
+            self.warned_system_tasks.insert(MESSAGE.to_string());
+            self.compile_errors.push(MESSAGE.to_string());
+            self.record_output(MESSAGE.to_string());
+        }
+        -1
     }
 
     /// §20.17.2 `$stacktrace` text. Content is implementation-defined; xezim

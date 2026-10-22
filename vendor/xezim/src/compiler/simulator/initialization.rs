@@ -4264,6 +4264,7 @@ impl Simulator {
             wave: wave_enabled(),
             vcd_file: None,
             vcd_writer: None,
+            vcd_writer_override: None,
             vcd_trace: Vec::new(),
             dump_dirty: Vec::new(),
             dump_dirty_mark: Vec::new(),
@@ -4608,8 +4609,10 @@ impl Simulator {
             vpi_cb_mask: 0,
             vpi_slot_started: u64::MAX,
             stdout_unsynced: false,
+            suppress_stdout_sink: false,
             vpi_self_ptr: std::ptr::null_mut(),
             file_handles: HashMap::default(),
+            virtual_files: None,
             file_writes_pending: false,
             file_eof: HashSet::default(),
             ungetc_buf: HashMap::default(),
@@ -4885,6 +4888,53 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// Install an explicit project VFS. Native simulators remain filesystem
+    /// backed unless an embedder opts into this API.
+    pub fn set_virtual_files(
+        &mut self,
+        files: Vec<(String, Vec<u8>)>,
+        max_bytes: usize,
+    ) -> Result<(), String> {
+        self.virtual_files = Some(super::sv_file::VirtualFileSystem::new(files, max_bytes)?);
+        Ok(())
+    }
+
+    /// Return files created or modified through the installed project VFS.
+    pub fn virtual_file_outputs(&self) -> Vec<(String, Vec<u8>)> {
+        self.virtual_files
+            .as_ref()
+            .map_or_else(Vec::new, |fs| fs.snapshot())
+    }
+
+    pub fn enable_wave_support(&mut self) {
+        self.wave = true;
+    }
+
+    pub fn set_stdout_capture_only(&mut self, enabled: bool) {
+        self.suppress_stdout_sink = enabled;
+    }
+
+    /// Whether a virtual file write exceeded its configured workspace budget.
+    pub fn virtual_file_limit_exceeded(&self) -> bool {
+        self.virtual_files
+            .as_ref()
+            .is_some_and(|fs| fs.limit_exceeded())
+    }
+
+    /// Route `$dumpvars` into an embedder-provided writer. The normal native
+    /// `$dumpfile` behavior is unchanged when this is not called.
+    pub fn set_vcd_writer(&mut self, writer: Box<dyn std::io::Write + Send>) -> Result<(), String> {
+        if self.vcd_writer.is_some() || self.vcd_writer_override.is_some() {
+            return Err("VCD writer must be installed before dumping starts".into());
+        }
+        // The inline dump is an explicit request even when no CLI `--wave`
+        // flag exists. This is set before `compile()` so waveform-sensitive
+        // lowering sees the same state as a native dump run.
+        self.wave = true;
+        self.vcd_writer_override = Some(writer);
+        Ok(())
     }
 
     /// Reuse the runtime-neutral combinational worklist associated with an
