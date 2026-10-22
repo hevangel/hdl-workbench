@@ -21,6 +21,7 @@ export default defineConfig({
       input: {
         app: "index.html",
         "worker-harness": "worker-harness.html",
+        "memory-harness": "memory-harness.html",
       },
     },
   },

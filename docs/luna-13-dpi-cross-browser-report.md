@@ -39,7 +39,8 @@ $env:XEZIM_CHROME_EXECUTABLE = 'C:\Program Files\Google\Chrome\Application\chrom
 pnpm --filter @xezim-ide/mcp-bridge test:e2e
 ```
 
-Result: 6 passed in 40.9 seconds across Chrome and Firefox. The command builds
+Result: 6 passed in 40.9 seconds across Chrome and Firefox against the Vite
+development server. The command builds
 the MCP bridge, starts the local Vite server, and runs the MCP/Surfer reload,
 memory ceiling/recovery, and DPI compiler scenarios in each browser.
 

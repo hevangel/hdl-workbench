@@ -4,6 +4,8 @@ import { defineConfig } from "@playwright/test";
 
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(packageRoot, "../..");
+const externalBaseURL = process.env.XEZIM_PLAYWRIGHT_BASE_URL;
+const baseURL = externalBaseURL ?? "http://127.0.0.1:5174";
 const browserProjects = [
   {
     name: "chromium",
@@ -30,8 +32,8 @@ export default defineConfig({
   workers: 1,
   reporter: "line",
   projects,
-  use: { baseURL: "http://127.0.0.1:5174" },
-  webServer: {
+  use: { baseURL },
+  webServer: externalBaseURL ? undefined : {
     command: "pnpm exec vite --host 127.0.0.1 --port 5174 --strictPort",
     cwd: path.join(repositoryRoot, "apps/ide"),
     url: "http://127.0.0.1:5174",

@@ -18,6 +18,7 @@ const projectFixtureFiles = [
   "rtl/includes/nested.svh",
   "rom.hex",
 ];
+const browserOrigin = new URL(process.env.XEZIM_PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:5174").origin;
 
 function parseToolResult(result) {
   if (result.isError) {
@@ -51,7 +52,7 @@ test("MCP edit -> Xezim WASM counter and ROM runs -> Surfer VCD -> workspace sur
   }
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [bridgeEntry, "--project-root", projectRoot, "--port", "0", "--allowed-origins", "http://127.0.0.1:5174", "--request-timeout-ms", "60000"],
+    args: [bridgeEntry, "--project-root", projectRoot, "--port", "0", "--allowed-origins", browserOrigin, "--request-timeout-ms", "60000"],
     cwd: packageRoot,
     stderr: "pipe",
   });
