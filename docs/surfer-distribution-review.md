@@ -2,7 +2,7 @@
 
 Date: 2026-10-22
 
-Status: technical inventory complete; release approval remains open.
+Status: technical inventory and visible Surfer notice complete; qualified release review remains open.
 
 This document records the shipped asset and the applicable text of the upstream license. It does not decide whether the combined Xezim Studio application is a derivative work or approve a distribution model.
 
@@ -23,11 +23,11 @@ The European Commission's [EUPL guidance](https://interoperable-europe.ec.europa
 ## Current release-channel gaps
 
 - The license text and provenance are in the repository's static Surfer asset directory. Source files are in this repository, and the pinned upstream source is linked above.
-- I found no in-app link that presents Surfer's license, upstream source, and Xezim Studio's modification notice to users. The public deployment URL and the continued public availability of the corresponding source repository have not been specified.
-- The local patch is described in repository documentation, but the shipped viewer does not visibly identify the modification date. The required presentation at the distribution channel should be confirmed before release.
+- The Surfer panel now presents the pinned version, EUPL-1.2, the local modification date, and links to the license and source/provenance note. Unit and browser acceptance checks cover those links and text.
+- The public deployment URL and the continued public availability of the corresponding source repository have not been specified. The release process must keep the license and source/provenance URLs available for as long as the viewer is distributed or communicated.
 - The runtime bundle contains generated WASM and JavaScript. A release should point recipients to the pinned upstream source and preserve access to the local HTML modification and exact build provenance for as long as the bundle is served.
 
-These are release checks, not findings that distribution is prohibited. Before external distribution, choose the deployment/package model, surface the required license and source information in that channel, and obtain a qualified review of the bundled viewer and the combined application's license position.
+These are release checks, not findings that distribution is prohibited. Before external distribution, choose the deployment/package model and obtain a qualified review of the bundled viewer and the combined application's license position.
 
 ## Reproducible provenance checks
 

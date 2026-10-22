@@ -120,6 +120,18 @@ test("MCP edit -> Xezim WASM counter and ROM runs -> Surfer VCD -> workspace sur
       arguments: { artifact_id: run.waveform.id, signal_paths: ["counter.count"], cursor: { ticks: "25" } },
     }));
     await expect(page.getByRole("tab", { name: "WAVEFORMS" })).toHaveAttribute("aria-selected", "true");
+    const surferNotice = page.getByLabel("Surfer license and source information");
+    await expect(surferNotice).toContainText("EUPL-1.2 · modified by Xezim Studio on 2026-10-22");
+    await expect(surferNotice.getByRole("link", { name: "License" })).toHaveAttribute("href", "/surfer/LICENSE-EUPL-1.2.txt");
+    await expect(surferNotice.getByRole("link", { name: "Pinned source and changes" })).toHaveAttribute("href", "/surfer/UPSTREAM.md");
+    const [licenseResponse, sourceResponse] = await Promise.all([
+      page.request.get("/surfer/LICENSE-EUPL-1.2.txt"),
+      page.request.get("/surfer/UPSTREAM.md"),
+    ]);
+    expect(licenseResponse.ok()).toBe(true);
+    expect(await licenseResponse.text()).toContain("EUROPEAN UNION PUBLIC LICENCE v. 1.2");
+    expect(sourceResponse.ok()).toBe(true);
+    expect(await sourceResponse.text()).toContain("bd749b1f786c1c62cd67893ca71346cbe6983915");
     const surfer = page.frameLocator("#surferFrame");
     await expect(surfer.locator("canvas")).toHaveCount(1);
 

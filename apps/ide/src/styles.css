@@ -167,6 +167,10 @@ button { color: inherit; }
 .surfer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
 .surfer-message { max-width: 28%; overflow: hidden; color: #edb0a8; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .surfer-frame { display: block; width: 100%; min-height: 0; flex: 1; border: 0; background: #fff; }
+.surfer-attribution { display: flex; min-height: 25px; flex: 0 0 auto; align-items: center; gap: 12px; border-top: 1px solid var(--border-soft); padding: 0 9px; color: #8995a4; background: #11151c; font-size: 9px; }
+.surfer-attribution span { overflow: hidden; margin-right: auto; text-overflow: ellipsis; white-space: nowrap; }
+.surfer-attribution a { color: #9bbdb2; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; }
+.surfer-attribution a:hover { color: #d9f5ec; }
 .status-bar { display: flex; align-items: center; gap: 20px; border-top: 1px solid #27312f; padding: 0 12px; color: #91a39e; background: #16211f; font-family: var(--mono); font-size: 9px; }
 .status-bar span:first-child { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; }
 .status-dot.green { width: 6px; height: 6px; background: #71cfaa; box-shadow: 0 0 7px #71cfaa66; }
@@ -192,6 +196,7 @@ button { color: inherit; }
   .surfer-toolbar { gap: 4px; padding: 0 5px; }
   .surfer-toolbar button { padding: 0 5px; font-size: 8px; }
   .surfer-message { display: none; }
+  .surfer-attribution { gap: 8px; padding: 0 5px; font-size: 8px; }
 }
 
 @media (max-width: 620px) {

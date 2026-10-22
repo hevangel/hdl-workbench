@@ -86,6 +86,11 @@ export function SurferWaveformPanel({ onAdapterChange, resolveWaveformUrl }: Sur
         referrerPolicy="no-referrer"
         allow="fullscreen"
       />
+      <div className="surfer-attribution" aria-label="Surfer license and source information">
+        <span>Surfer v{PINNED_SURFER_VERSION} · EUPL-1.2 · modified by Xezim Studio on 2026-10-22</span>
+        <a href="/surfer/LICENSE-EUPL-1.2.txt" target="_blank" rel="noreferrer">License</a>
+        <a href="/surfer/UPSTREAM.md" target="_blank" rel="noreferrer">Pinned source and changes</a>
+      </div>
     </section>
   );
 }

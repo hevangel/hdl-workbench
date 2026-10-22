@@ -38,11 +38,12 @@ pnpm demo
 | Xezim WASM build and browser Worker | Pass on LUNA-03 | `docs/luna-03-wasm-report.md`; debug and release builds plus real Chromium counter and failure recovery. |
 | Multi-file ROM, `$readmemh`, `$fopen`, NBA and four-state fixture | Pass on LUNA-04 and current end-to-end | `apps/ide/src/workers/xezimHarness.ts`; current `pnpm test:e2e` checks the ROM and NBA output through MCP in both browsers. |
 | Surfer fixture VCD and integration messages | Pass on LUNA-00B/LUNA-05 | `docs/surfer-integration-report.md`; pinned browser API and real VCD fixture. |
+| Surfer license/source notice and served assets | Pass in Chromium and Firefox | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna09.spec.mjs --project=chromium --project=firefox`; verifies visible dated attribution, EUPL text, and pinned source metadata. |
 | End-to-end MCP edit → Xezim WASM → OPFS VCD → Surfer → reload | Pass in Chromium `156.0.8078.4` | `pnpm test:e2e`; ROM plus counter run. |
 | End-to-end in Firefox | Pass in Firefox `157.0` | `pnpm test:e2e` runs both configured browser projects. |
 | `pnpm typecheck` | Pass | All four workspace packages. |
 | `pnpm build` | Pass; existing Monaco bundle size warning | All workspace packages and generated protocol JSON schema. |
-| `pnpm test` | Pass with local loopback permission; 62 tests | Protocol 20, IDE 29, MCP bridge 7, wave-index 6. |
+| `pnpm test` | Pass with local loopback permission; 63 tests | Protocol 20, IDE 30, MCP bridge 7, wave-index 6. |
 | Capped `pnpm build:browser` equivalent | Pass in the pinned Linux builder | `cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown`, then `wasm-bindgen --target web --out-dir apps/ide/public/wasm crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm`; see `docs/luna-10-memory-report.md`. |
 | Concurrent same-revision bridge writes | Covered by regression test | `pnpm test`; exactly one concurrent write succeeds. |
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
@@ -53,8 +54,8 @@ pnpm demo
 | Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
 | Native Xezim suite on current branch | Pass in Linux builder | Complete `cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1`; includes the 705-test integration target, 4 UPF tests, and doctests. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 7 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1`. |
-| Official CI workflow | Pending GitHub execution | `.github/workflows/luna09-browser-e2e.yml`. |
-| License/distribution review | Technical inventory complete; release-channel notice and qualified review pending | See [Surfer distribution review](surfer-distribution-review.md) for the EUPL requirements, exact bundle changes, checksums, and remaining release-channel decisions. |
+| Official CI workflow | Pending; GitHub access blocked in the current validation environment | `.github/workflows/luna09-browser-e2e.yml`; `gh auth status` reports an invalid token and `gh run list` could not resolve `api.github.com`. |
+| License/distribution review | Visible Surfer notice and technical inventory pass; release-channel source-hosting confirmation and qualified review pending | See [Surfer distribution review](surfer-distribution-review.md) for the EUPL requirements, exact bundle changes, checksums, and remaining release-channel decisions. |
 
 ## Implemented bounds and remaining memory risk
 
@@ -75,6 +76,6 @@ pnpm demo
 
 ## Next release gates
 
-1. Run the workflow on GitHub and retain its logs as release evidence; local Linux-builder results are documented, but the hosted CI run is still pending.
+1. Push this branch or open its PR after GitHub authentication/network access is restored, then run `.github/workflows/luna09-browser-e2e.yml` and retain the hosted logs; local Linux-builder results are documented, but hosted CI remains pending.
 2. Define the minimum supported browser/device and measure total process memory and stress limits there; keep large designs out of v1 claims until measured.
-3. Choose the release format, present Surfer's license/source/modification information in that channel, and obtain qualified review of the Surfer bundle and combined application. The [technical inventory](surfer-distribution-review.md) is complete; this release gate is not.
+3. Choose the release format, keep the linked license and source/provenance available in that channel, and obtain qualified review of the Surfer bundle and combined application. The [technical inventory and panel notice](surfer-distribution-review.md) are complete; this release gate is not.
