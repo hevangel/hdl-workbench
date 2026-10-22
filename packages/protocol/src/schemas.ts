@@ -137,6 +137,7 @@ export const ErrorCodeSchema = z.enum([
   "NOT_FOUND",
   "TIMEOUT",
   "RESOURCE_LIMIT",
+  "DPI_COMPILATION_FAILED",
   "INVALID_REQUEST",
   "INTERNAL_ERROR",
 ]);
@@ -196,7 +197,14 @@ export const PairingResultSchema = z.strictObject({
   expiresAt: z.string().datetime({ offset: true }),
 });
 
-export const CapabilityNameSchema = z.enum(["browser_simulation", "waveform_load", "waveform_add_signals", "waveform_cursor"]);
+export const CapabilityNameSchema = z.enum([
+  "browser_simulation",
+  "browser_dpi_scalar_int32",
+  "browser_c_cpp_compile",
+  "waveform_load",
+  "waveform_add_signals",
+  "waveform_cursor",
+]);
 export const CapabilitySchema = z.strictObject({
   name: CapabilityNameSchema,
   available: z.boolean(),

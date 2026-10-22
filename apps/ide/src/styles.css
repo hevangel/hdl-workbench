@@ -173,6 +173,8 @@ button { color: inherit; }
 .surfer-attribution a:hover { color: #d9f5ec; }
 .status-bar { display: flex; align-items: center; gap: 20px; border-top: 1px solid #27312f; padding: 0 12px; color: #91a39e; background: #16211f; font-family: var(--mono); font-size: 9px; }
 .status-bar span:first-child { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; }
+.status-bar a { color: #9bbdb2; text-decoration: underline; text-underline-offset: 2px; }
+.status-bar a:hover { color: #d9f5ec; }
 .status-dot.green { width: 6px; height: 6px; background: #71cfaa; box-shadow: 0 0 7px #71cfaa66; }
 
 .dialog-backdrop { position: fixed; z-index: 10; inset: 0; display: grid; place-items: center; padding: 20px; background: #05070bb3; backdrop-filter: blur(3px); }

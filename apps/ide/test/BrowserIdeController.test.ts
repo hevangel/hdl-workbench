@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectPathSchema, type ExecuteRequest } from "@xezim-ide/protocol";
 import { BrowserControllerError, BrowserIdeController } from "../src/controller/BrowserIdeController.js";
 import { createMockServices } from "../src/mockServices.js";
+import type { DpiCompilerResponse } from "../src/workers/dpiCompilerProtocol.js";
 import type { WorkerResponse } from "../src/workers/xezimProtocol.js";
 import type { OpfsWaveformStore } from "../src/controller/OpfsWaveformStore.js";
 
@@ -118,6 +119,101 @@ describe("BrowserIdeController one-shot execution", () => {
     const snapshot = await workspace.snapshot();
 
     await expect(controller.execute(request({ snapshotId: snapshot.snapshotId }))).rejects.toMatchObject({ code: "RESOURCE_LIMIT" });
+    expect(worker).not.toHaveBeenCalled();
+  });
+
+  it("routes precompiled Wasm DPI modules separately from UTF-8 project files", async () => {
+    const services = createMockServices();
+    const moduleBytes = Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0]);
+    await services.workspace.writeFile(ProjectPathSchema.parse("dpi/add.wasm"), moduleBytes, null);
+    const workspace = stableWorkspace(services);
+    const worker = vi.fn(async (input): Promise<WorkerResponse> => ({
+      id: "worker-dpi",
+      ok: true,
+      result: {
+        schemaVersion: 1,
+        status: "completed",
+        maxTimeNs: "1000",
+        lastTimeTicks: "1000",
+        finished: false,
+        sawFatal: false,
+        stdout: "",
+        diagnostics: [],
+        snapshotId: input.snapshotId,
+        waveform: { format: "vcd", sizeBytes: 0, complete: false, timescale: "1 ns" },
+      },
+    }));
+    const controller = new BrowserIdeController(workspace, { runProjectWorker: worker });
+    await controller.execute(request());
+
+    const posted = worker.mock.calls[0]?.[0];
+    expect(posted).toBeDefined();
+    if (!posted) throw new Error("The DPI project was not sent to the Worker.");
+    expect(posted.files).toEqual(expect.arrayContaining([expect.objectContaining({ path: "rtl/counter.sv" })]));
+    expect(posted.dpiModules).toHaveLength(1);
+    expect(posted.dpiModules?.[0]?.path).toBe("dpi/add.wasm");
+    expect([...new Uint8Array(posted.dpiModules?.[0]?.bytes ?? new ArrayBuffer(0))]).toEqual([...moduleBytes]);
+  });
+
+  it("compiles C++ sources in a separate Worker and loads the resulting Wasm module", async () => {
+    const services = createMockServices();
+    await services.workspace.writeFile(ProjectPathSchema.parse("dpi/reference.cpp"), new TextEncoder().encode("extern \"C\" int add(int a, int b) { return a + b; }"), null);
+    const workspace = stableWorkspace(services);
+    const compiledBytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]).buffer;
+    const compileWorker = vi.fn(async (files): Promise<DpiCompilerResponse> => ({
+      id: "compiler-1",
+      ok: true,
+      modules: [{ path: "dpi/reference.cpp", bytes: compiledBytes }],
+      output: "",
+    }));
+    const worker = vi.fn(async (input): Promise<WorkerResponse> => ({
+      id: "worker-dpi",
+      ok: true,
+      result: {
+        schemaVersion: 1,
+        status: "completed",
+        maxTimeNs: "1000",
+        lastTimeTicks: "1000",
+        finished: false,
+        sawFatal: false,
+        stdout: "",
+        diagnostics: [],
+        snapshotId: input.snapshotId,
+        waveform: { format: "vcd", sizeBytes: 0, complete: false, timescale: "1 ns" },
+      },
+    }));
+    const controller = new BrowserIdeController(workspace, {
+      runProjectWorker: worker,
+      compileDpiProjectWorker: compileWorker,
+    });
+
+    await controller.execute(request());
+    expect(compileWorker).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ path: "dpi/reference.cpp" })]),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
+    expect(worker.mock.calls[0]?.[0].dpiModules?.[0]).toEqual({ path: "dpi/reference.cpp.compiled.wasm", bytes: compiledBytes });
+  });
+
+  it("reports C/C++ compilation errors without starting Xezim", async () => {
+    const services = createMockServices();
+    await services.workspace.writeFile(ProjectPathSchema.parse("dpi/reference.c"), new TextEncoder().encode("int add(int a, int b) { return a + b; }"), null);
+    const workspace = stableWorkspace(services);
+    const compileWorker = vi.fn(async (): Promise<DpiCompilerResponse> => ({
+      id: "compiler-1",
+      ok: false,
+      error: { code: "DPI_COMPILATION_FAILED", message: "undefined symbol in C source" },
+    }));
+    const worker = vi.fn();
+    const controller = new BrowserIdeController(workspace, {
+      runProjectWorker: worker,
+      compileDpiProjectWorker: compileWorker,
+    });
+
+    await expect(controller.execute(request())).rejects.toMatchObject({
+      code: "DPI_COMPILATION_FAILED",
+      message: "undefined symbol in C source",
+    });
     expect(worker).not.toHaveBeenCalled();
   });
 

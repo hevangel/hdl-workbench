@@ -16,6 +16,9 @@ importers:
       '@xezim-ide/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      browsercc:
+        specifier: 0.1.1
+        version: 0.1.1
       monaco-editor:
         specifier: 0.57.0
         version: 0.57.0
@@ -728,6 +731,9 @@ packages:
 
   bidi-js@1.1.0:
     resolution: {integrity: sha512-fX1Onk0tdVPC7obPWB5EbJ1z7NVhLq4m2xZLq2YXBkxzMXIGRpNMU88n0EPgWseKl12J7zXs7qrDxPK4sRs2fg==}
+
+  browsercc@0.1.1:
+    resolution: {integrity: sha512-zKSm2b10XjqRBPkY67rS5FK+YgcXd5CH2GRVwyK2+f7EOQRmHR0IN2lQCvJZQfTytSFbwFmlIpZaxSMFcE+jxw==}
 
   bundle-name@4.1.1:
     resolution: {integrity: sha512-DdH81/zPLVS11EUgWq3tEu/xn+EzljlMYooDNdzWEnFha3R3NBMpMV1UqYIpjYHV/SgpFKMIX1Oh7o06SjM/oA==}
@@ -1945,6 +1951,8 @@ snapshots:
   bidi-js@1.1.0:
     dependencies:
       require-from-string: 2.0.2
+
+  browsercc@0.1.1: {}
 
   bundle-name@4.1.1:
     dependencies:

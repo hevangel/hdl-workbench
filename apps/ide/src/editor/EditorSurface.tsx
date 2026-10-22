@@ -22,6 +22,13 @@ export function EditorSurface({ path, value, diagnostics, onChange, readOnly = f
     setMonacoApi(monaco);
   };
 
+  const language = path?.toLowerCase().endsWith(".c") ? "c"
+    : path?.toLowerCase().endsWith(".cc") || path?.toLowerCase().endsWith(".cpp") || path?.toLowerCase().endsWith(".cxx") ? "cpp"
+      : path?.toLowerCase().endsWith(".h") ? "c"
+      : path?.toLowerCase().endsWith(".hpp") || path?.toLowerCase().endsWith(".hh") || path?.toLowerCase().endsWith(".hxx") ? "cpp"
+        : path?.toLowerCase().endsWith(".inc") ? "c"
+          : "systemverilog";
+
   useEffect(() => {
     const model = editorRef.current?.getModel();
     if (!model || !monacoApi) return;
@@ -37,14 +44,14 @@ export function EditorSurface({ path, value, diagnostics, onChange, readOnly = f
     <div className="editor-canvas" data-testid="editor-surface">
       <Editor
         height="100%"
-        language="systemverilog"
+        language={language}
         theme="xezim-studio-dark"
         path={path}
         value={value}
         onChange={(nextValue) => onChange(nextValue ?? "")}
         onMount={handleMount}
         options={{
-          ariaLabel: "SystemVerilog editor",
+          ariaLabel: `${language === "systemverilog" ? "SystemVerilog" : language === "c" ? "C" : "C++"} editor`,
           automaticLayout: true,
           readOnly,
           fontFamily: "'Cascadia Code', 'SFMono-Regular', Consolas, monospace",

@@ -2,6 +2,7 @@ export interface CompileAndRunRequest {
   type: "compileAndRun";
   id: string;
   source: string;
+  dpiModules?: DpiWasmModuleInput[];
   topModule: string;
   maxTimeNs: number;
   maxOutputBytes?: number;
@@ -12,10 +13,16 @@ export interface ProjectFileInput {
   contents: string;
 }
 
+export interface DpiWasmModuleInput {
+  path: string;
+  bytes: ArrayBuffer;
+}
+
 export interface CompileAndRunProjectRequest {
   type: "compileAndRunProject";
   id: string;
   files: ProjectFileInput[];
+  dpiModules?: DpiWasmModuleInput[];
   snapshotId: string;
   topModule: string;
   maxTimeNs: number;

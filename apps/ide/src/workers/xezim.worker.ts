@@ -1,4 +1,5 @@
 import type { WorkerRequest, WorkerResponse } from "./xezimProtocol";
+import { DpiWasmModuleError, installDpiWasmModules } from "./dpiWasmModules.js";
 
 interface WorkerScope {
   location: Location;
@@ -76,12 +77,17 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         workerScope.postMessage(fail(request.id, "RESOURCE_LIMIT", "Source exceeds the 4 MiB browser limit."));
         return;
       }
-      json = wasm.compileAndRun(
-        request.source,
-        request.topModule,
-        BigInt(request.maxTimeNs),
-        Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
-      );
+      const uninstallDpiDispatcher = await installDpiWasmModules(request.dpiModules ?? []);
+      try {
+        json = wasm.compileAndRun(
+          request.source,
+          request.topModule,
+          BigInt(request.maxTimeNs),
+          Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+        );
+      } finally {
+        uninstallDpiDispatcher();
+      }
     } else {
       if (!Array.isArray(request.files) || request.files.length === 0 || request.files.length > MAX_PROJECT_FILES) {
         workerScope.postMessage(fail(request.id, "INVALID_REQUEST", "Project must contain 1 to 4096 files."));
@@ -114,18 +120,27 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
           return;
         }
       }
-      json = wasm.compileAndRunProject(
-        JSON.stringify(request.files),
-        request.snapshotId,
-        request.topModule,
-        BigInt(request.maxTimeNs),
-        Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
-        Math.min(request.maxVcdBytes ?? MAX_VCD_BYTES, MAX_VCD_BYTES),
-      );
+      const uninstallDpiDispatcher = await installDpiWasmModules(request.dpiModules ?? []);
+      try {
+        json = wasm.compileAndRunProject(
+          JSON.stringify(request.files),
+          request.snapshotId,
+          request.topModule,
+          BigInt(request.maxTimeNs),
+          Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
+          Math.min(request.maxVcdBytes ?? MAX_VCD_BYTES, MAX_VCD_BYTES),
+        );
+      } finally {
+        uninstallDpiDispatcher();
+      }
     }
     const result = JSON.parse(json) as WorkerResponse extends { ok: true; result: infer T } ? T : never;
     workerScope.postMessage({ id: request.id, ok: true, result } satisfies WorkerResponse);
   } catch (error) {
+    if (error instanceof DpiWasmModuleError) {
+      workerScope.postMessage(fail(request.id, error.code, error.message.slice(0, 4096)));
+      return;
+    }
     const wasmMemoryBytes = wasmMemory?.buffer.byteLength ?? 0;
     // Rust's allocator can trap before memory.grow reaches its declared maximum
     // when the next allocation cannot fit in the remaining address space.

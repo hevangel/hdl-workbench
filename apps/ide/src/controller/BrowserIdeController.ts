@@ -29,7 +29,9 @@ import {
   type WorkspaceAdapter,
 } from "@xezim-ide/protocol";
 import { runXezimProjectWorker } from "../workers/xezimClient.js";
-import type { ProjectFileInput } from "../workers/xezimProtocol.js";
+import { compileDpiProjectInBrowser } from "../workers/dpiCompilerClient.js";
+import type { DpiCompilerFile } from "../workers/dpiCompilerProtocol.js";
+import type { DpiWasmModuleInput, ProjectFileInput } from "../workers/xezimProtocol.js";
 import { OpfsWaveformStore } from "./OpfsWaveformStore.js";
 
 const MAX_PROJECT_INPUT_BYTES = 16 * 1024 * 1024;
@@ -47,6 +49,7 @@ export interface BrowserIdeControllerOptions {
   requestTimeoutMs?: number;
   artifactStore?: OpfsWaveformStore;
   runProjectWorker?: typeof runXezimProjectWorker;
+  compileDpiProjectWorker?: typeof compileDpiProjectInBrowser;
   onWaveformShown?: () => void;
 }
 
@@ -95,7 +98,11 @@ function bridgeSnapshotId(files: Array<{ path: string; revision: string }>): Pro
   });
 }
 
-function toWorkerFiles(files: Array<{ path: string; bytes: Uint8Array }>): ProjectFileInput[] {
+function toWorkerProject(files: Array<{ path: string; bytes: Uint8Array }>): {
+  files: ProjectFileInput[];
+  dpiModules: DpiWasmModuleInput[];
+  dpiCompilerFiles: DpiCompilerFile[];
+} {
   if (files.length === 0 || files.length > MAX_PROJECT_FILES) {
     throw new BrowserControllerError("RESOURCE_LIMIT", `Xezim accepts between 1 and ${MAX_PROJECT_FILES} project files.`);
   }
@@ -106,8 +113,26 @@ function toWorkerFiles(files: Array<{ path: string; bytes: Uint8Array }>): Proje
   }
   const decoder = new TextDecoder("utf-8", { fatal: true });
   try {
-    return files.map(({ path, bytes }) => ({ path, contents: decoder.decode(bytes) }));
-  } catch {
+    const textFiles: ProjectFileInput[] = [];
+    const dpiModules: DpiWasmModuleInput[] = [];
+    const dpiCompilerFiles: DpiCompilerFile[] = [];
+    for (const { path, bytes } of files) {
+      const extension = path.split("/").at(-1)?.split(".").at(-1)?.toLowerCase();
+      if (extension === "wasm") {
+        const copy = new ArrayBuffer(bytes.byteLength);
+        new Uint8Array(copy).set(bytes);
+        dpiModules.push({ path, bytes: copy });
+      } else {
+        const contents = decoder.decode(bytes);
+        textFiles.push({ path, contents });
+        if (["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "inc"].includes(extension ?? "")) {
+          dpiCompilerFiles.push({ path, contents });
+        }
+      }
+    }
+    return { files: textFiles, dpiModules, dpiCompilerFiles };
+  } catch (error) {
+    if (error instanceof BrowserControllerError) throw error;
     throw new BrowserControllerError("UNSUPPORTED_CAPABILITY", "The current browser Xezim API accepts UTF-8 text project files only.");
   }
 }
@@ -168,6 +193,20 @@ export class BrowserIdeController implements IdeController {
             ? "The generated Xezim WASM assets are unavailable. Build the pinned xezim-web target; no native simulator fallback is configured."
             : "Xezim uses its verified one-shot compile-and-run Worker API; separate compile and run handles are unavailable.",
         },
+        {
+          name: "browser_dpi_scalar_int32",
+          available: !simulatorUnavailable,
+          reason: simulatorUnavailable
+            ? "The Xezim WASM assets are unavailable."
+            : "The browser profile accepts standalone import-free Wasm modules and DPI functions with an int result and input int arguments.",
+        },
+        {
+          name: "browser_c_cpp_compile",
+          available: !simulatorUnavailable,
+          reason: simulatorUnavailable
+            ? "The Xezim WASM assets are unavailable."
+            : "Pinned Clang/LLD WebAssembly compiler runs in a separate Worker. C/C++ modules must be self-contained, import-free, and use scalar int DPI signatures.",
+        },
         { name: "waveform_load", available: this.surfer !== null, ...(this.surfer ? {} : { reason: "Open the Waveforms panel to initialize the pinned Surfer viewer." }) },
         { name: "waveform_add_signals", available: this.surfer !== null, ...(this.surfer ? {} : { reason: "Open the Waveforms panel to initialize the pinned Surfer viewer." }) },
         { name: "waveform_cursor", available: this.surfer !== null, ...(this.surfer ? {} : { reason: "Open the Waveforms panel to initialize the pinned Surfer viewer." }) },
@@ -216,18 +255,44 @@ export class BrowserIdeController implements IdeController {
       throw new BrowserControllerError("REVISION_CONFLICT", "The browser workspace no longer matches the requested project snapshot. Synchronize and retry.", true);
     }
     const timeNs = maxTimeInNanoseconds(request.until, request.until.timescale);
-    const sources = toWorkerFiles(snapshot.files);
+    const workerProject = toWorkerProject(snapshot.files);
     const currentRunId = runId();
+    const wallDeadline = Date.now() + request.workBudget.maxWallTimeMs;
+    const remainingWallTime = () => Math.max(1, Math.min(
+      this.options.requestTimeoutMs ?? request.workBudget.maxWallTimeMs,
+      wallDeadline - Date.now(),
+    ));
+    const dpiModules = [...workerProject.dpiModules];
+    if (workerProject.dpiCompilerFiles.some(({ path }) => ["c", "cc", "cpp", "cxx"].includes(path.split("/").at(-1)?.split(".").at(-1)?.toLowerCase() ?? ""))) {
+      const compiled = await (this.options.compileDpiProjectWorker ?? compileDpiProjectInBrowser)(
+        workerProject.dpiCompilerFiles,
+        { timeoutMs: remainingWallTime() },
+      );
+      if (!compiled.ok) {
+        if (compiled.error.code === "TIMEOUT") {
+          throw new BrowserControllerError("TIMEOUT", compiled.error.message, true);
+        }
+        if (compiled.error.code === "RESOURCE_LIMIT") {
+          throw new BrowserControllerError("RESOURCE_LIMIT", compiled.error.message);
+        }
+        if (compiled.error.code === "INVALID_PATH" || compiled.error.code === "INVALID_REQUEST") {
+          throw new BrowserControllerError(compiled.error.code, compiled.error.message);
+        }
+        throw new BrowserControllerError("DPI_COMPILATION_FAILED", compiled.error.message);
+      }
+      dpiModules.push(...compiled.modules.map(({ path, bytes }) => ({ path: `${path}.compiled.wasm`, bytes })));
+    }
     let response;
     try {
       response = await (this.options.runProjectWorker ?? runXezimProjectWorker)({
-        files: sources,
+        files: workerProject.files,
+        ...(dpiModules.length ? { dpiModules } : {}),
         snapshotId: request.snapshotId,
         topModule: request.topModule,
         maxTimeNs: timeNs,
         maxOutputBytes: request.workBudget.maxOutputBytes,
         maxVcdBytes: request.workBudget.maxVcdBytes,
-      }, { timeoutMs: this.options.requestTimeoutMs ?? request.workBudget.maxWallTimeMs });
+      }, { timeoutMs: remainingWallTime() });
     } catch (error) {
       throw new BrowserControllerError("INTERNAL_ERROR", error instanceof Error ? error.message : "The Xezim Worker request failed.");
     }

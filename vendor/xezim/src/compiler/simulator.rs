@@ -4914,7 +4914,11 @@ struct DpiBinding {
 }
 
 #[cfg(target_arch = "wasm32")]
-struct DpiBinding;
+struct DpiBinding {
+    /// Exact C symbol name used by the imported DPI prototype. The browser
+    /// host resolves this in the preloaded, standalone Wasm function registry.
+    c_name: String,
+}
 
 /// Width of a spec fragment naming a DIMENSIONED vector type —
 /// `bit[7:0]`, `logic signed[3:0][7:0]` — as `data_type_to_spec_fragment`

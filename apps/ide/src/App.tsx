@@ -31,6 +31,14 @@ function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
+function fileKindLabel(path: string): string {
+  const extension = fileName(path).split(".").at(-1)?.toLowerCase();
+  if (extension === "c") return "C";
+  if (["cc", "cpp", "cxx", "hh", "hpp", "hxx"].includes(extension ?? "")) return "C++";
+  if (["h", "inc"].includes(extension ?? "")) return "H";
+  return "SV";
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -709,7 +717,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
                 disabled={busy}
               >
                 <span className="tree-indent tree-indent-two" />
-                <span className="sv-icon">SV</span>
+                <span className="sv-icon" aria-label={fileKindLabel(file.path)}>{fileKindLabel(file.path)}</span>
                 <span>{fileName(file.path)}</span>
                 {file.saveState !== "saved" && <span className="dirty-dot" aria-label="Unsaved changes" />}
               </button>
@@ -740,7 +748,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
             {openTabs.map((path) => (
               <div className={`editor-tab ${activePath === path ? "active" : ""}`} role="presentation" key={path}>
                 <button type="button" role="tab" aria-selected={activePath === path} onClick={() => setActivePath(path)} disabled={busy}>
-                  <span className="sv-icon">SV</span>{fileName(path)}
+                  <span className="sv-icon" aria-label={fileKindLabel(path)}>{fileKindLabel(path)}</span>{fileName(path)}
                   {files.find((file) => file.path === path)?.saveState !== "saved" && <span className="tab-dirty" />}
                 </button>
                 <button className="tab-close" type="button" aria-label={`Close ${fileName(path)}`} onClick={() => closeFile(path)} disabled={busy}>×</button>
@@ -786,7 +794,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
             </div>
           </section>
 
-          <footer className="status-bar"><span><i className="status-dot green" /> {bridgeState === "connected" ? "Local bridge project · editor read-only" : activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
+          <footer className="status-bar"><span><i className="status-dot green" /> {bridgeState === "connected" ? "Local bridge project · editor read-only" : activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><a href="/licenses/THIRD_PARTY.md" target="_blank" rel="noreferrer">Third-party notices</a><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
         </main>
       </div>
 

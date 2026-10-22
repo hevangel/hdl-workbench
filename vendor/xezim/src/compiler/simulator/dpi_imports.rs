@@ -81,11 +81,8 @@ impl Simulator {
 
     #[cfg(target_arch = "wasm32")]
     pub(super) fn bind_all_dpi_imports(&mut self) {
-        for sv_name in self.module.dpi_imports.keys() {
-            self.compile_errors.push(format!(
-                "DPI import '{}' is unavailable in the wasm32 browser profile",
-                sv_name
-            ));
+        for (sv_name, spec) in self.module.dpi_imports.clone() {
+            self.try_bind_dpi(&sv_name, &spec);
         }
     }
 
@@ -762,12 +759,41 @@ impl Simulator {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub(super) fn try_bind_dpi(&mut self, sv_name: &str, _spec: &DpiImportSpec) {
-        self.dpi_unsupported.insert(sv_name.to_string());
-        self.compile_errors.push(format!(
-            "DPI import '{}' is unavailable in the wasm32 browser profile",
-            sv_name
-        ));
+    pub(super) fn try_bind_dpi(&mut self, sv_name: &str, spec: &DpiImportSpec) {
+        // The first browser ABI deliberately accepts only imported functions
+        // with an `int` result and positional `input int` arguments. A
+        // standalone Wasm module has no libffi-style type reflection, so
+        // accepting more here would turn ABI mismatches into traps or corrupt
+        // values. Native binding and its richer ABI remain unchanged.
+        let supported = match &spec.proto {
+            crate::ast::decl::DPIProto::Function(function) => {
+                let result = self.dpi_resolve_typedef(&function.return_type);
+                matches!(result, DataType::IntegerAtom { kind: IntegerAtomType::Int, .. })
+                    && function.ports.iter().all(|port| {
+                        port.direction == PortDirection::Input
+                            && port.dimensions.is_empty()
+                            && matches!(
+                                self.dpi_resolve_typedef(&port.data_type),
+                                DataType::IntegerAtom { kind: IntegerAtomType::Int, .. }
+                            )
+                    })
+            }
+            crate::ast::decl::DPIProto::Task(_) => false,
+        };
+        if !supported {
+            self.dpi_unsupported.insert(sv_name.to_string());
+            self.compile_errors.push(format!(
+                "DPI import '{}' has an unsupported browser prototype; this profile accepts only functions with an int result and input int arguments",
+                sv_name
+            ));
+            return;
+        }
+        self.dpi_bindings.insert(
+            sv_name.to_string(),
+            DpiBinding {
+                c_name: spec.c_name.clone(),
+            },
+        );
     }
 
     /// §35.5.6.1 / H.7.4: the svLogic code of a scalar 4-state value —
@@ -1881,21 +1907,85 @@ impl Simulator {
     pub(super) fn exec_dpi_import_call_in(
         &mut self,
         sv_name: &str,
-        _args: &[Expression],
+        args: &[Expression],
         _via: Option<&str>,
     ) -> Option<Value> {
-        if !self.module.dpi_imports.contains_key(sv_name) {
-            return None;
+        let spec = self.module.dpi_imports.get(sv_name)?.clone();
+        if !self.dpi_bindings.contains_key(sv_name) && !self.dpi_unsupported.contains(sv_name) {
+            self.try_bind_dpi(sv_name, &spec);
         }
-        let message = format!(
-            "DPI import '{}' cannot execute in the wasm32 browser profile",
-            sv_name
-        );
-        self.emit_severity_text("Fatal", &message);
-        self.saw_fatal = true;
-        self.finished = true;
-        self.fatal_finish_number = Some(1);
-        Some(Value::zero(32))
+        if self.dpi_unsupported.contains(sv_name) {
+            return Some(Value::zero(32));
+        }
+        let binding = self.dpi_bindings.get(sv_name)?.c_name.clone();
+        let bound_args = Self::dpi_bind_call_args(&spec.proto, args);
+        let args = bound_args.as_deref().unwrap_or(args);
+
+        let call_result = (|| -> Result<i32, String> {
+            use js_sys::wasm_bindgen::{JsCast, JsValue};
+
+            let global = js_sys::global();
+            let hook = js_sys::Reflect::get(
+                &global,
+                &JsValue::from_str("__xezimDpiCall"),
+            )
+            .map_err(|_| "the browser DPI dispatcher could not be read".to_string())?;
+            let function = hook
+                .dyn_into::<js_sys::Function>()
+                .map_err(|_| "the browser DPI dispatcher is not installed".to_string())?;
+            let values = js_sys::Array::new();
+            for expression in args {
+                let value = self
+                    .dpi_int_actual(expression)
+                    .to_i64()
+                    .ok_or_else(|| "a DPI `int` argument contains X or Z".to_string())?
+                    as i32;
+                values.push(&JsValue::from_f64(value as f64));
+            }
+            let result = function
+                .call2(
+                    &global,
+                    &JsValue::from_str(&binding),
+                    &values,
+                )
+                .map_err(|error| {
+                    error.as_string().or_else(|| {
+                        js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+                            .ok()
+                            .and_then(|message| message.as_string())
+                    }).unwrap_or_else(|| "the Wasm DPI function trapped".to_string())
+                })?;
+            let number = result
+                .as_f64()
+                .ok_or_else(|| "the Wasm DPI function did not return an integer".to_string())?;
+            if !number.is_finite()
+                || number.fract() != 0.0
+                || number < i32::MIN as f64
+                || number > i32::MAX as f64
+            {
+                return Err("the Wasm DPI function returned a value outside signed int32".into());
+            }
+            Ok(number as i32)
+        })();
+
+        match call_result {
+            Ok(result) => {
+                let mut value = Value::from_u64(result as u32 as u64, 32);
+                value.is_signed = true;
+                Some(value)
+            }
+            Err(reason) => {
+                let message = format!(
+                    "DPI import '{}' (C symbol '{}') failed in the wasm32 browser profile: {}",
+                    sv_name, binding, reason
+                );
+                self.emit_severity_text("Fatal", &message);
+                self.saw_fatal = true;
+                self.finished = true;
+                self.fatal_finish_number = Some(1);
+                Some(Value::zero(32))
+            }
+        }
     }
 
     pub fn run(&mut self) {

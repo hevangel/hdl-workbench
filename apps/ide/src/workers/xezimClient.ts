@@ -59,6 +59,8 @@ function launchWorker(
     worker.onmessageerror = () => {
       finish({ id, ok: false, error: { code: "INTERNAL_ERROR", message: "Xezim worker returned an unreadable message." } });
     };
-    worker.postMessage(buildRequest(id));
+    const request = buildRequest(id);
+    const transfers = request.dpiModules?.map(({ bytes }) => bytes) ?? [];
+    worker.postMessage(request, transfers);
   });
 }
