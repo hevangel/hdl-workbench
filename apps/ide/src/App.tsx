@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Diagnostic, ProjectPath, SimulationService, WorkspaceAdapter } from "@xezim-ide/protocol";
+import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type WorkspaceAdapter } from "@xezim-ide/protocol";
 import { EditorSurface } from "./editor/EditorSurface.js";
 import { createMockServices } from "./mockServices.js";
 import { useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
+import type { PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
+import { exportProjectZip } from "./workspace/projectArchive.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
 interface EditorFile {
@@ -14,6 +16,7 @@ interface EditorFile {
 interface AppProps {
   workspace?: WorkspaceAdapter;
   simulation?: SimulationService;
+  projectManager?: PersistentWorkspaceManager;
 }
 
 const demoServices = createMockServices();
@@ -22,7 +25,15 @@ function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
-export function App({ workspace = demoServices.workspace, simulation = demoServices.simulation }: AppProps) {
+export function App({ workspace, simulation = demoServices.simulation, projectManager }: AppProps) {
+  const [workspaceService, setWorkspaceService] = useState<WorkspaceAdapter>(() => workspace ?? projectManager?.getWorkspace() ?? demoServices.workspace);
+  const [activeProject, setActiveProject] = useState<WorkspaceProject>(() => projectManager?.activeProject ?? {
+    id: "demo-project" as ProjectId,
+    name: "counter-lab",
+    authority: "browser-only",
+    createdAt: 0,
+  });
+  const [projects, setProjects] = useState<WorkspaceProject[]>([]);
   const [files, setFiles] = useState<EditorFile[]>([]);
   const filesRef = useRef(files);
   filesRef.current = files;
@@ -33,8 +44,13 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
   const [log, setLog] = useState("Mock services are active. No HDL simulation is performed.");
   const [busy, setBusy] = useState(false);
   const [pendingClose, setPendingClose] = useState<ProjectPath | null>(null);
+  const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
+  const [workspaceMessage, setWorkspaceMessage] = useState("");
+  const [fileActionsOpen, setFileActionsOpen] = useState(false);
+  const projectArchiveInput = useRef<HTMLInputElement>(null);
   const [layout, setLayout] = useLayoutPreferences();
   const revisionByPath = useRef(new Map<ProjectPath, string>());
+  const loadedSessionProject = useRef<ProjectId | null>(null);
   const saveTimers = useRef(new Map<ProjectPath, ReturnType<typeof setTimeout>>());
   const saveQueues = useRef(new Map<ProjectPath, Promise<void>>());
 
@@ -42,12 +58,36 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
   const sortedFiles = useMemo(() => [...files].sort((left, right) => left.path.localeCompare(right.path)), [files]);
   const folders = [...new Set(sortedFiles.map((file) => file.path.split("/").slice(0, -1).join("/")).filter(Boolean))].sort();
 
+  const updateFile = useCallback((path: ProjectPath, update: (file: EditorFile) => EditorFile) => {
+    setFiles((current) => current.map((file) => file.path === path ? update(file) : file));
+  }, []);
+
+  useEffect(() => {
+    if (workspace) setWorkspaceService(workspace);
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!projectManager) return;
+    let cancelled = false;
+    void projectManager.listProjects().then((items) => {
+      if (!cancelled) setProjects(items);
+    }).catch((error: unknown) => {
+      if (!cancelled) setWorkspaceMessage(error instanceof Error ? error.message : "Could not list browser projects.");
+    });
+    return () => { cancelled = true; };
+  }, [projectManager]);
+
   useEffect(() => {
     let cancelled = false;
+    loadedSessionProject.current = null;
+    setFiles([]);
+    setDiagnostics([]);
+    setConflictPath(null);
+    setWorkspaceMessage("");
     const loadWorkspace = async () => {
-      const entries = await workspace.listFiles();
+      const entries = await workspaceService.listFiles();
       const loaded = await Promise.all(entries.map(async (entry) => {
-        const result = await workspace.readFile(entry.path);
+        const result = await workspaceService.readFile(entry.path);
         return {
           path: entry.path,
           revision: result.revision,
@@ -58,21 +98,70 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
       if (cancelled) return;
       revisionByPath.current = new Map(loaded.map((file) => [file.path, file.revision]));
       setFiles(loaded);
-      const firstPath = loaded[0]?.path ?? null;
-      setOpenTabs(firstPath ? [firstPath] : []);
-      setActivePath(firstPath);
+      const available = new Set(loaded.map((file) => file.path));
+      const session = await projectManager?.loadEditorState(activeProject.id).catch(() => null);
+      if (cancelled) return;
+      const restoredTabs = session?.openTabs.filter((path) => available.has(path)) ?? [];
+      const nextTabs = restoredTabs.length > 0 ? restoredTabs : loaded[0] ? [loaded[0].path] : [];
+      const nextActive = session?.activePath && available.has(session.activePath)
+        ? session.activePath
+        : nextTabs[0] ?? null;
+      setOpenTabs(nextTabs);
+      setActivePath(nextActive);
+      setTopModule(session?.topModule || "counter_tb");
+      loadedSessionProject.current = activeProject.id;
     };
-    void loadWorkspace().catch(() => setLog("Workspace load failed. Check storage and retry."));
+    void loadWorkspace().catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : "Workspace load failed. Check browser storage and retry.";
+      setWorkspaceMessage(message);
+      setLog(message);
+    });
     return () => {
       cancelled = true;
       for (const timer of saveTimers.current.values()) clearTimeout(timer);
       saveTimers.current.clear();
     };
-  }, [workspace]);
+  }, [activeProject.id, projectManager, workspaceService]);
 
-  const updateFile = useCallback((path: ProjectPath, update: (file: EditorFile) => EditorFile) => {
-    setFiles((current) => current.map((file) => file.path === path ? update(file) : file));
-  }, []);
+  useEffect(() => {
+    const unsubscribe = workspaceService.subscribeChanges((change) => {
+      const current = filesRef.current.find((file) => file.path === change.path);
+      if (current && current.saveState !== "saved") {
+        updateFile(change.path, (file) => ({ ...file, saveState: "save-failed" }));
+        setConflictPath(change.path);
+        setWorkspaceMessage(`Another tab changed ${change.path}. Your editor draft is still here; choose reload or replace the stored copy.`);
+        return;
+      }
+      if (change.operation === "delete") {
+        revisionByPath.current.delete(change.path);
+        setFiles((currentFiles) => currentFiles.filter((file) => file.path !== change.path));
+        setOpenTabs((currentTabs) => currentTabs.filter((path) => path !== change.path));
+        setActivePath((currentPath) => currentPath === change.path ? null : currentPath);
+        return;
+      }
+      void workspaceService.readFile(change.path).then((latest) => {
+        revisionByPath.current.set(change.path, latest.revision);
+        const latestContent = new TextDecoder().decode(latest.bytes);
+        setFiles((currentFiles) => {
+          const found = currentFiles.some((file) => file.path === change.path);
+          return found
+            ? currentFiles.map((file) => file.path === change.path ? { ...file, content: latestContent, revision: latest.revision, saveState: "saved" } : file)
+            : [...currentFiles, { path: change.path, content: latestContent, revision: latest.revision, saveState: "saved" }];
+        });
+      }).catch((error: unknown) => setWorkspaceMessage(error instanceof Error ? error.message : "A file changed in another tab and could not be reloaded."));
+    });
+    return unsubscribe;
+  }, [updateFile, workspaceService]);
+
+  useEffect(() => {
+    if (!projectManager || loadedSessionProject.current !== activeProject.id) return;
+    const timer = setTimeout(() => {
+      void projectManager.saveEditorState(activeProject.id, { openTabs, activePath, topModule }).catch((error: unknown) => {
+        setWorkspaceMessage(error instanceof Error ? error.message : "Could not save editor settings.");
+      });
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [activePath, activeProject.id, openTabs, projectManager, topModule]);
 
   const saveDraft = useCallback((path: ProjectPath, content: string): Promise<void> => {
     const previous = saveQueues.current.get(path);
@@ -81,19 +170,28 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
       updateFile(path, (file) => ({ ...file, saveState: "saving" }));
       try {
         const expectedRevision = revisionByPath.current.get(path) ?? null;
-        const saved = await workspace.writeFile(path, new TextEncoder().encode(content), expectedRevision);
+        const saved = await workspaceService.writeFile(path, new TextEncoder().encode(content), expectedRevision);
         revisionByPath.current.set(path, saved.revision);
-        updateFile(path, (file) => ({ ...file, revision: saved.revision, saveState: "saved" }));
-      } catch {
+        updateFile(path, (file) => ({
+          ...file,
+          revision: saved.revision,
+          saveState: file.content === content ? "saved" : "dirty",
+        }));
+        setWorkspaceMessage("");
+      } catch (error) {
         updateFile(path, (file) => ({ ...file, saveState: "save-failed" }));
-        throw new Error("Save failed. The workspace may have changed in another tab.");
+        const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+        const message = error instanceof Error ? error.message : "The browser could not save this file.";
+        if (code === "REVISION_CONFLICT") setConflictPath(path);
+        setWorkspaceMessage(message);
+        throw error;
       }
     })();
     saveQueues.current.set(path, task);
     return task.finally(() => {
       if (saveQueues.current.get(path) === task) saveQueues.current.delete(path);
     });
-  }, [updateFile, workspace]);
+  }, [updateFile, workspaceService]);
 
   const scheduleSave = useCallback((path: ProjectPath, content: string) => {
     const previous = saveTimers.current.get(path);
@@ -115,6 +213,171 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
     if (current?.saveState === "saved" && !saveQueues.current.has(path)) return;
     await saveDraft(path, content);
   }, [saveDraft]);
+
+  const saveProject = async (): Promise<boolean> => {
+    setWorkspaceMessage("");
+    try {
+      await Promise.all(filesRef.current.filter((file) => file.saveState !== "saved").map((file) => flushSave(file.path, file.content)));
+      setWorkspaceMessage("All project files are saved in this browser.");
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const switchProject = async (projectId: string) => {
+    if (!projectManager || projectId === activeProject.id) return;
+    if (!await saveProject()) return;
+    setBusy(true);
+    try {
+      const selected = await projectManager.selectProject(projectId as ProjectId);
+      setActiveProject(selected);
+      setWorkspaceService(projectManager.getWorkspace(selected.id));
+      setDiagnostics([]);
+      const latestProjects = await projectManager.listProjects();
+      setProjects(latestProjects);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not switch browser projects.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportProject = () => {
+    try {
+      const archive = exportProjectZip(filesRef.current.map((file) => ({
+        path: file.path,
+        bytes: new TextEncoder().encode(file.content),
+      })));
+      const url = URL.createObjectURL(new Blob([Uint8Array.from(archive).buffer], { type: "application/zip" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${activeProject.name}.zip`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setWorkspaceMessage("Project archive exported, including the current editor contents.");
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not export this project.");
+    }
+  };
+
+  const importProject = async (file?: File) => {
+    if (!file || !projectManager) return;
+    if (!await saveProject()) return;
+    setBusy(true);
+    try {
+      const imported = await projectManager.importProject(file, file.name.replace(/\.zip$/i, ""));
+      const latestProjects = await projectManager.listProjects();
+      setProjects(latestProjects);
+      const selected = await projectManager.selectProject(imported.id);
+      setActiveProject(selected);
+      setWorkspaceService(projectManager.getWorkspace(selected.id));
+      setDiagnostics([]);
+      setWorkspaceMessage(`Imported ${file.name} as ${imported.name}.`);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not import this project archive.");
+    } finally {
+      setBusy(false);
+      if (projectArchiveInput.current) projectArchiveInput.current.value = "";
+    }
+  };
+
+  const renameActiveFile = async () => {
+    if (!projectManager || !activeFile) return;
+    const proposed = window.prompt("New project-relative file path", activeFile.path);
+    if (!proposed || proposed === activeFile.path) return;
+    const parsed = ProjectPathSchema.safeParse(proposed);
+    if (!parsed.success) {
+      setWorkspaceMessage("File paths must be normalized project-relative paths without traversal segments.");
+      return;
+    }
+    if (!await saveProject()) return;
+    setBusy(true);
+    try {
+      const revision = revisionByPath.current.get(activeFile.path);
+      if (!revision) throw new Error("The current file revision is unavailable; reload the project before renaming it.");
+      const nextRevision = await projectManager.renameFile(activeProject.id, activeFile.path, parsed.data, revision);
+      const oldPath = activeFile.path;
+      revisionByPath.current.delete(oldPath);
+      revisionByPath.current.set(parsed.data, nextRevision);
+      setFiles((current) => current.map((file) => file.path === oldPath ? { ...file, path: parsed.data, revision: nextRevision, saveState: "saved" } : file));
+      setOpenTabs((current) => current.map((path) => path === oldPath ? parsed.data : path));
+      setActivePath((current) => current === oldPath ? parsed.data : current);
+      setWorkspaceMessage(`Renamed ${oldPath} to ${parsed.data}.`);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not rename this file.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteActiveFile = async () => {
+    if (!activeFile) return;
+    const file = activeFile;
+    if (!window.confirm(`Delete ${file.path} from ${activeProject.name}? Any editor draft for this file will be discarded.`)) return;
+    setBusy(true);
+    try {
+      const revision = revisionByPath.current.get(file.path);
+      if (!revision) throw new Error("The current file revision is unavailable; reload the project before deleting it.");
+      await workspaceService.deleteFile(file.path, revision);
+      revisionByPath.current.delete(file.path);
+      setFiles((current) => current.filter((candidate) => candidate.path !== file.path));
+      setOpenTabs((current) => current.filter((path) => path !== file.path));
+      setActivePath((current) => current === file.path ? openTabs.find((path) => path !== file.path) ?? null : current);
+      setWorkspaceMessage(`Deleted ${file.path}.`);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not delete this file.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resolveConflict = async (action: "reload" | "replace") => {
+    if (!conflictPath) return;
+    const path = conflictPath;
+    const pendingSave = saveTimers.current.get(path);
+    if (pendingSave) {
+      clearTimeout(pendingSave);
+      saveTimers.current.delete(path);
+    }
+    try {
+      if (action === "reload") {
+        try {
+          const latest = await workspaceService.readFile(path);
+          revisionByPath.current.set(path, latest.revision);
+          setFiles((current) => current.map((file) => file.path === path
+            ? { ...file, content: new TextDecoder().decode(latest.bytes), revision: latest.revision, saveState: "saved" }
+            : file));
+        } catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+          if (code !== "NOT_FOUND") throw error;
+          revisionByPath.current.delete(path);
+          setFiles((current) => current.filter((file) => file.path !== path));
+          setOpenTabs((current) => current.filter((tab) => tab !== path));
+          setActivePath((current) => current === path ? null : current);
+        }
+        setWorkspaceMessage(`Reloaded ${path} from browser storage.`);
+      } else {
+        if (!window.confirm(`Replace the other tab's stored version of ${path} with your editor draft?`)) return;
+        let expectedRevision: string | null = null;
+        try {
+          expectedRevision = (await workspaceService.readFile(path)).revision;
+        } catch (error) {
+          const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+          if (code !== "NOT_FOUND") throw error;
+        }
+        if (expectedRevision === null) revisionByPath.current.delete(path);
+        else revisionByPath.current.set(path, expectedRevision);
+        const draft = filesRef.current.find((file) => file.path === path)?.content;
+        if (draft === undefined) throw new Error("The editor draft no longer exists.");
+        await saveDraft(path, draft);
+        setWorkspaceMessage(`Stored your draft for ${path}.`);
+      }
+      setConflictPath(null);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not resolve the workspace conflict.");
+    }
+  };
 
   const handleEdit = (value: string) => {
     if (!activeFile) return;
@@ -165,9 +428,9 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
     setLog("Saving current draft and freezing a project snapshot…");
     try {
       if (activeFile) await flushSave(activeFile.path, activeFile.content);
-      const snapshot = await workspace.snapshot();
+      const snapshot = await workspaceService.snapshot();
       const compile = await simulation.compile({
-        projectId: "demo-project",
+        projectId: activeProject.id,
         snapshotId: snapshot.snapshotId,
         topModule: topModule.trim(),
         includeDirs: ["rtl", "tb"],
@@ -229,9 +492,32 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
             title="Toggle file explorer"
             onClick={() => setLayout({ explorerCollapsed: !layout.explorerCollapsed })}
           >▤</button>
-          <div className="breadcrumb"><span>Projects</span><span className="crumb-separator">/</span><strong>counter-lab</strong><span className="branch-pill">LOCAL</span></div>
+          {projectManager ? (
+            <div className="project-controls">
+              <label className="sr-only" htmlFor="project-select">Project</label>
+              <select id="project-select" value={activeProject.id} onChange={(event) => void switchProject(event.target.value)} disabled={busy}>
+                {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
+              <span className="branch-pill">BROWSER ONLY</span>
+            </div>
+          ) : (
+            <div className="breadcrumb"><span>Projects</span><span className="crumb-separator">/</span><strong>counter-lab</strong><span className="branch-pill">LOCAL</span></div>
+          )}
         </div>
         <div className="run-controls">
+          {projectManager && <>
+            <button className="secondary-button toolbar-button" type="button" onClick={() => void saveProject()} disabled={busy}>Save</button>
+            <button className="secondary-button toolbar-button" type="button" onClick={() => projectArchiveInput.current?.click()} disabled={busy}>Import ZIP</button>
+            <button className="secondary-button toolbar-button" type="button" onClick={exportProject} disabled={busy || files.length === 0}>Export ZIP</button>
+            <input
+              ref={projectArchiveInput}
+              className="sr-only"
+              type="file"
+              accept=".zip,application/zip"
+              aria-label="Import project ZIP"
+              onChange={(event) => void importProject(event.currentTarget.files?.[0])}
+            />
+          </>}
           <label className="top-module-label" htmlFor="top-module">Top module</label>
           <input id="top-module" className="top-module-input" value={topModule} onChange={(event) => setTopModule(event.target.value)} disabled={busy} />
           <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim()}>
@@ -243,7 +529,21 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
       <div className="workspace-main">
         <aside className={`file-sidebar ${layout.explorerCollapsed ? "collapsed" : ""}`} aria-label="Project files">
           <div className="sidebar-heading"><span>EXPLORER</span><button type="button" className="subtle-icon" aria-label="More file actions">···</button></div>
-          <div className="project-root"><span className="chevron">⌄</span><span className="folder-icon">▰</span> counter-lab</div>
+          <div className="project-root"><span className="chevron">⌄</span><span className="folder-icon">▰</span> {activeProject.name}</div>
+          {projectManager && <div className="authority-row">
+            <label htmlFor="authority-mode">Authority</label>
+            <select id="authority-mode" value="browser-only" onChange={() => undefined}>
+              <option value="browser-only">Browser only</option>
+              <option value="connected" disabled>Connected (bridge not configured)</option>
+            </select>
+          </div>}
+          {projectManager && <div className="file-actions">
+            <button type="button" className="secondary-button toolbar-button" onClick={() => setFileActionsOpen((open) => !open)} aria-expanded={fileActionsOpen} aria-label="File actions" disabled={!activeFile || busy}>File actions</button>
+            {fileActionsOpen && <div className="file-actions-menu">
+              <button type="button" onClick={() => { setFileActionsOpen(false); void renameActiveFile(); }} disabled={!activeFile || busy}>Rename active file…</button>
+              <button type="button" onClick={() => { setFileActionsOpen(false); void deleteActiveFile(); }} disabled={!activeFile || busy}>Delete active file…</button>
+            </div>}
+          </div>}
           <div className="file-tree">
             {folders.map((folder) => <div className="folder-row" key={folder}><span className="tree-indent" /><span className="chevron">⌄</span><span className="folder-icon">▰</span>{folder}</div>)}
             {sortedFiles.map((file) => (
@@ -262,10 +562,19 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
               </button>
             ))}
           </div>
-          <div className="sidebar-footer"><span className="storage-icon">▱</span><span>In-memory demo workspace</span></div>
+          <div className="sidebar-footer"><span className="storage-icon">▱</span><span>{projectManager
+            ? projectManager.storageStatus.persistent ? "Persistent storage requested and granted" : "Browser may clear stored data"
+            : "In-memory demo workspace"}</span></div>
         </aside>
 
         <main className="editor-workspace">
+          {projectManager && (workspaceMessage || conflictPath) && <div className={`workspace-notice ${conflictPath ? "conflict" : ""}`} role={conflictPath ? "alert" : "status"}>
+            <span>{conflictPath ? `Storage conflict for ${conflictPath}. Your editor draft remains available.` : workspaceMessage}</span>
+            {conflictPath && <div className="workspace-notice-actions">
+              <button type="button" onClick={() => void resolveConflict("reload")}>Reload stored version</button>
+              <button type="button" onClick={() => void resolveConflict("replace")}>Replace stored version…</button>
+            </div>}
+          </div>}
           <div className="editor-tabs" role="tablist" aria-label="Open files">
             {openTabs.map((path) => (
               <div className={`editor-tab ${activePath === path ? "active" : ""}`} role="presentation" key={path}>
@@ -303,7 +612,7 @@ export function App({ workspace = demoServices.workspace, simulation = demoServi
             </div>
           </section>
 
-          <footer className="status-bar"><span><i className="status-dot green" /> Browser-only shell</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
+          <footer className="status-bar"><span><i className="status-dot green" /> {activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
         </main>
       </div>
 

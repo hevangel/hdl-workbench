@@ -13,7 +13,7 @@ import type {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-const initialFiles: Array<{ path: ProjectPath; content: string }> = [
+export const initialProjectFiles: Array<{ path: ProjectPath; content: string }> = [
   {
     path: "rtl/counter.sv",
     content: `module counter #(parameter WIDTH = 4) (
@@ -49,7 +49,7 @@ endmodule
 
 export function createMockServices(): { workspace: WorkspaceAdapter; simulation: SimulationService } {
   const fileStore = new Map<ProjectPath, { bytes: Uint8Array; revision: string }>(
-    initialFiles.map(({ path, content }, index) => [path, { bytes: encoder.encode(content), revision: `mock-rev-${index + 1}` }]),
+    initialProjectFiles.map(({ path, content }, index) => [path, { bytes: encoder.encode(content), revision: `mock-rev-${index + 1}` }]),
   );
   const snapshots = new Map<string, SnapshotFile[]>();
   const listeners = new Set<(change: { path: ProjectPath; revision: string | null; operation: "write" | "delete" }) => void>();

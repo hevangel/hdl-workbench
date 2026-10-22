@@ -1,19 +1,19 @@
 # ADR-002 — Application-facing interface freeze
 
-Date: 2026-10-21
+Date: 2026-10-22
 
-Status: Accepted after review of LUNA-00A and LUNA-00B
+Status: Frozen after review of the completed LUNA-00A and LUNA-00B feasibility results
 
 Related work: [ADR-001 runtime boundary](ADR-001-runtime-architecture.md), [Xezim report](wasm-portability-report.md), [Surfer report](surfer-integration-report.md)
 
 ## Context
 
-The two feasibility spikes found enough to settle the application boundaries, but neither backend passed its runtime gate:
+The application-facing contracts below were reviewed only after both feasibility results were complete:
 
-- Xezim and xezim-core are pinned, and source inspection found plausible single-thread and inline-VCD paths. The Rust toolchain was unavailable, so parser, core, and Xezim WASM checks did not reach compilation.
-- Surfer source is pinned and its wrapper documents `LoadUrl`. The artifact itself is not pinned, and no browser run verified VCD loading, signal addition, or cursor control. `InjectMessage` forwards an upstream internal API that is explicitly unstable; the proposed add-signal and cursor payloads remain unverified.
+- Xezim and xezim-core are pinned as a pair. The initial build gate found `getrandom` and `libffi-sys` target blockers; later target-gating and VFS/VCD work produced a WASM release and a real Firefox Worker counter/VCD pass. The full native Xezim suite passed with native filesystem behavior preserved. The combined worker API still does not implement every separate compile/run contract or a fixed memory/work ceiling.
+- Surfer v0.7.0 is pinned, built, licensed, and tested in a real same-origin browser harness. The test loaded a real VCD through HTTP and Blob URLs, added `top.count`, and moved the cursor to 25 ns. The WASM SHA-256 is `1341ad01c59f5169209239728417d14f430183abd92515f22bf07cd7c86937ae`. The inner `InjectMessage` API is explicitly unstable; zoom, WCP host exports, large-waveform performance, and production Chromium remain unverified.
 
-The application-facing contracts below can be fixed without depending on those implementation details. A frozen interface is not evidence that a backend capability is available.
+The application-facing contracts below can be fixed without depending on those implementation details. A frozen interface remains distinct from an implemented capability.
 
 ## Decision
 
@@ -112,10 +112,10 @@ The adapter is the only module allowed to know the viewer's private messages. Th
 
 ## Conformance gates and capability truthfulness
 
-The v1 application interfaces are frozen; backend conformance is not:
+The v1 application interfaces are frozen; capability availability follows the evidence:
 
-1. **Xezim (partial):** `sv-parser` passed on Rust 1.99.1. Baseline core and reduced Xezim checks fail in `getrandom` 0.2.17/0.3.4. A disposable browser-feature setup lets core compile, then Xezim fails in `libffi-sys` because Autoconf rejects `wasm32-unknown-unknown`. See the [build-gate follow-up](wasm-build-gate-followup.md). Target-gate native FFI and build-script code, preserve native defaults, then build the browser Worker counter fixture. Verify VCD output, output/work limits, and native regression behavior before exposing browser compile/run as available.
-2. **Surfer:** build from the pinned source or obtain an immutable asset, record its digest and license, then run a real-browser test that opens the VCD fixture, adds `top.count`, and positions the cursor at tick 25. Do not enable the corresponding adapter methods until the viewer passes.
-3. **Cross-cutting:** keep `readTransitions`, `getSignalNow`, cancellation, FST, and other future capabilities absent until each has an implementation and acceptance tests. Existing interfaces may return explicit `UNSUPPORTED_CAPABILITY` or `SIMULATOR_UNAVAILABLE` errors while a gate is open.
+1. **Xezim (bounded worker profile passed):** the pinned parser/core/Xezim checks, WASM release build, Firefox Worker counter/VCD test, and complete native suite passed after the portability patches. See the [build-gate follow-up](wasm-build-gate-followup.md) for the original blockers and [LUNA-04 report](luna-04-virtual-files-report.md) for final commands/results. The application still has a combined compile/run entry point rather than complete `SimulationService` mapping; its stdout limit truncates the returned result after collection, and no fixed WASM memory ceiling is enforced. Keep those limits visible and do not claim broader support.
+2. **Surfer (load/signal/cursor passed for one pinned build):** the LUNA-00B browser test passed VCD loading, `top.count`, and cursor tick 25 for both same-origin HTTP and Blob URLs on Camoufox Firefox. Keep the inner `InjectMessage` payloads inside a versioned adapter because upstream marks them unstable. Zoom, WCP host exports, large-waveform performance, and production Chromium have not passed acceptance tests.
+3. **Cross-cutting:** keep `readTransitions`, `getSignalNow`, cancellation, FST, and other future capabilities absent until each has an implementation and acceptance tests. Existing interfaces may return explicit `UNSUPPORTED_CAPABILITY` or `SIMULATOR_UNAVAILABLE` errors when a capability is unavailable.
 
 If a pinned backend cannot meet these application-facing contracts, revise this ADR before adding backend-specific behavior to controllers, UI, or MCP tools.

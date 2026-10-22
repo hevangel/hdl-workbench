@@ -1,9 +1,10 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RunResult, SimulationService } from "@xezim-ide/protocol";
+import type { ProjectPath, RunResult, SimulationService } from "@xezim-ide/protocol";
 import { App } from "../src/App.js";
 import { createMockServices } from "../src/mockServices.js";
+import { WorkspaceStorageError, type PersistentWorkspaceManager } from "../src/workspace/opfsWorkspace.js";
 
 const { setModelMarkers } = vi.hoisted(() => ({ setModelMarkers: vi.fn() }));
 
@@ -98,6 +99,36 @@ describe("IDE shell", () => {
     fireEvent.change(editor, { target: { value: `${(editor as HTMLTextAreaElement).value}\n// autosave` } });
     expect(screen.getByText("Unsaved")).toBeInTheDocument();
     expect(await screen.findByText("Saved", {}, { timeout: 2_000 })).toBeInTheDocument();
+  });
+
+  it("shows quota errors without losing the draft and can save after storage recovers", async () => {
+    const services = createMockServices();
+    const activeProject = { id: "demo-project", name: "counter-lab", authority: "browser-only" as const, createdAt: 0 };
+    vi.spyOn(services.workspace, "subscribeChanges").mockReturnValue(() => undefined);
+    const projectManager = {
+      activeProject,
+      storageStatus: { persistent: false, persistentStorageSupported: true, usageBytes: 0, quotaBytes: 1024 },
+      getWorkspace: () => services.workspace,
+      listProjects: async () => [activeProject],
+      loadEditorState: async () => null,
+      saveEditorState: async () => undefined,
+    } as unknown as PersistentWorkspaceManager;
+    vi.spyOn(services.workspace, "writeFile").mockRejectedValueOnce(new WorkspaceStorageError(
+      "STORAGE_QUOTA_EXCEEDED",
+      "Browser storage is full. Export a project or remove files before saving more data.",
+    ));
+    render(<App workspace={services.workspace} simulation={services.simulation} projectManager={projectManager} />);
+
+    const editor = await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const marker = "// quota failure keeps this draft";
+    fireEvent.change(editor, { target: { value: `${(editor as HTMLTextAreaElement).value}\n${marker}` } });
+    expect(await screen.findByText(/Browser storage is full/, {}, { timeout: 2_000 })).toBeInTheDocument();
+    expect((editor as HTMLTextAreaElement).value).toContain(marker);
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("All project files are saved in this browser.")).toBeInTheDocument();
+    const saved = await services.workspace.readFile("rtl/counter.sv" as ProjectPath);
+    expect(new TextDecoder().decode(saved.bytes)).toContain(marker);
   });
 
   it("disables run controls while a mock run is in flight", async () => {

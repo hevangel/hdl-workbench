@@ -78,7 +78,7 @@ The native VFS wrapper test and browser harness check the same expected counter 
 
 ## Recommended next tasks
 
-1. Finish LUNA-00B's pinned Surfer WASM build and browser acceptance. Its current report has a pinned source revision but no immutable WASM asset or verified host message payloads, so keep the Surfer adapter contract provisional.
-2. Build LUNA-05 only after the pinned viewer loads the fixture and proves signal-add and cursor messages in a browser.
-3. Add a focused native file/VCD compatibility regression for the unchanged default entry points alongside the passing full upstream suite.
-4. Add memory/work-budget enforcement and map this combined worker operation onto the frozen protocol without advertising unimplemented historical queries or cancellation.
+1. Implement LUNA-05 around the pinned Surfer bundle and the proven load, signal-add, and cursor operations. Keep the tested unstable inner messages behind a versioned adapter; verify zoom and a production Chromium browser before enabling them.
+2. Complete the LUNA-06 persistence acceptance against a supported production browser, including physical quota/out-of-space behavior and normal page-entry startup.
+3. Add memory/work-budget enforcement and map this combined worker operation onto the frozen protocol without advertising unimplemented historical queries or cancellation.
+4. Keep the passing full native Xezim suite as a compatibility gate for all future browser-only changes.

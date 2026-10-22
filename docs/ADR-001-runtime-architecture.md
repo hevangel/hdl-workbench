@@ -1,29 +1,31 @@
 # ADR-001 — Browser simulation runtime boundary
 
-Date: 2026-10-21
+Date: 2026-10-22
 
-Status: Accepted for the product boundary; runtime conformance gates remain open
+Status: Accepted after LUNA-00A and LUNA-00B feasibility review; product integration remains partial
 
-Related work: [ADR-002 interface freeze](ADR-002-interface-contracts.md), [LUNA-00A report](wasm-portability-report.md), [LUNA-00B report](surfer-integration-report.md)
+Related work: [ADR-002 interface freeze](ADR-002-interface-contracts.md), [Xezim portability report](wasm-portability-report.md), [Xezim build-gate follow-up](wasm-build-gate-followup.md), [Surfer feasibility report](surfer-integration-report.md), [LUNA-04 implementation report](luna-04-virtual-files-report.md)
 
 ## Context
 
-The product requires simulation to execute Xezim WebAssembly in a dedicated browser Worker. Native Xezim can serve as a differential-test oracle, but a native process cannot substitute for the browser simulator. LUNA-00A pins Xezim `22faa127a9cc0156bd23e0ab117f400c64231913` with xezim-core `d15cdc39e27a4c0a8a55f7e1d46369181307ead9`. The source inventory found native build and runtime boundaries, but Cargo and rustc were unavailable, so the WASM compile gate did not reach the compiler.
+The product requires simulation to execute Xezim WebAssembly in a dedicated browser Worker. Native Xezim can serve as a differential-test oracle, but a native process cannot substitute for the browser simulator. The reviewed upstream pair is Xezim `22faa127a9cc0156bd23e0ab117f400c64231913` and xezim-core/sv-parser `d15cdc39e27a4c0a8a55f7e1d46369181307ead9` (both 0.11.2).
 
-LUNA-00B pins Surfer source `bd749b1f786c1c62cd67893ca71346cbe6983915` (v0.7.0, EUPL-1.2). Its source documents `LoadUrl` and an unstable `InjectMessage` forwarding path. The versioned WASM artifact was unavailable, and no browser run verified waveform loading, signal addition, or cursor control.
+The initial feasibility checks exposed `getrandom` target-feature and `libffi-sys` build-script blockers. The later LUNA-03/LUNA-04 patch set target-gated native FFI, C shims, linker options, and platform-only code while retaining native defaults. The pinned parser/core/Xezim checks, release WASM build, real Firefox Worker counter/VCD fixture, and full native Xezim suite then passed. See the [LUNA-04 report](luna-04-virtual-files-report.md) for the reproducible commands, artifact digest, test counts, and current limits.
+
+LUNA-00B built Surfer v0.7.0 from `bd749b1f786c1c62cd67893ca71346cbe6983915` under EUPL-1.2. Its real browser test loaded a counter VCD through same-origin HTTP and Blob URLs, added `top.count`, and moved the cursor to 25 ns. The redistributed WASM SHA-256 is `1341ad01c59f5169209239728417d14f430183abd92515f22bf07cd7c86937ae`. Upstream marks the inner `InjectMessage` API unstable; keep it isolated behind a versioned adapter. The test did not verify zoom, WCP host exports, large-waveform performance, or production Chromium.
 
 ## Decision
 
-Keep the product boundary as Xezim WASM in a dedicated browser Worker, with no implicit native or JavaScript simulation fallback. Scope the first browser profile to bounded one-shot RTL simulation and VCD output. Keep native Xezim behavior as the default native profile.
+Keep the product boundary as Xezim WASM in a dedicated browser Worker, with no implicit native or JavaScript simulation fallback. The verified Xezim profile is bounded, one-shot RTL simulation with project-relative virtual files and bounded VCD output. Keep native Xezim behavior and filesystem-backed APIs as the default native profile.
 
-Freeze application-facing interface shapes only as described in ADR-002. Keep concrete wasm-bindgen signatures, Xezim internal file-provider APIs, Surfer message payloads, readiness wire protocol, and waveform URL transport behind their adapters until the feasibility gates pass.
+Freeze application-facing interface shapes only as described in ADR-002, after review of both feasibility results. Keep concrete wasm-bindgen signatures, Xezim internal file-provider APIs, Surfer inner messages, readiness wire protocol, and waveform URL transport behind their adapters. Do not expose an adapter capability merely because its interface is frozen.
 
-Do not claim browser support until the pinned Xezim source builds and a real browser Worker counter fixture passes. Do not claim Surfer signal/cursor control until the pinned and licensed viewer build passes a browser test for loading a VCD, adding a signal, and moving a cursor.
+The current worker operation combines compile and run. It does not yet conform to every separate compile/run operation in `SimulationService`; full protocol mapping, a fixed WASM memory ceiling, and complete work-budget enforcement remain open. Surfer load, signal addition, and cursor movement are proven only for the pinned test build and tested Firefox environment. Zoom and WCP remain unavailable until separately verified.
 
 ## Consequences
 
-- Native DPI/VPI, libffi/libloading, JIT/AOT, arbitrary host file access, FST/XTrace, profiling and pause/resume are outside the initial browser profile unless later feasibility tests prove otherwise.
-- Parser includes, `$readmem*`, `$fopen`, and logging need explicit supported behavior before the UI can advertise them.
-- Optional simulation operations such as cancellation, current-value lookup, and historical transition queries are not part of the v1 service contract. Add them only with implementations and acceptance tests.
-- The initial browser runtime must call an explicit single-thread entry point, route project files through a virtual-file provider, capture logs through a sink, and write VCD into a bounded in-memory sink. Existing Xezim APIs and native file behavior must remain available.
-- The application-facing contracts are frozen, but the backend feasibility and browser integration gates remain open. No feature is considered implemented by the interface definition alone.
+- Native DPI/VPI, libffi/libloading, JIT/AOT, arbitrary host file access, FST/XTrace, profiling, and pause/resume are outside the initial browser profile unless later feasibility tests prove otherwise.
+- Includes, `$readmem*`, `$fopen`, and logging have explicit project-virtual-file behavior only for the documented and tested subset. Unsupported tasks must return deliberate diagnostics.
+- The browser runtime uses an explicit single-thread entry point, a virtual-file provider, an injected output sink, and a bounded in-memory VCD writer. Native file behavior remains available and covered by the upstream suite.
+- Optional simulation operations such as cancellation, current-value lookup, historical transition queries, and unverified viewer controls are not supported by this decision. Add them only with implementations and acceptance tests.
+- The interface freeze records boundaries; it does not claim that the complete IDE, MCP bridge, or every adapter is implemented.

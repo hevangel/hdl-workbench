@@ -1,5 +1,7 @@
 # LUNA-00A — Xezim WASM portability report
 
+> Historical first-pass report. The initial checks stopped because Rust was missing; the later compiler follow-up and LUNA-03/LUNA-04 work supersede the original gate status below. The final pinned WASM/Worker and native-compatibility results are summarized in [LUNA-04](luna-04-virtual-files-report.md) and [ADR-001](ADR-001-runtime-architecture.md).
+
 Date: 2026-10-21
 Branch: codex/luna-00a-wasm-feasibility
 Worktree: C:/Users/hevan/AppData/Local/Temp/xezim-studio-luna/luna-00a
@@ -88,12 +90,14 @@ xezim-core/xezim-parser is a Rust library with only optional serde/serde_json de
 5. Reuse VcdSink::inline with an in-memory writer that enforces a byte limit. Adapt waveform setup to accept that writer, while retaining native file output. Capture simulator messages through an injected sink.
 6. Re-run the parser → core with defaults off → reduced Xezim sequence on a Rust 1.92+ host. Only after compile results, add a real browser Worker counter test and compare native versus WASM output. Keep native regression tests in the same patch set.
 
-## Gate status and next tasks
+## Final gate status after LUNA-03/LUNA-04
 
-- **Confirmed:** exact Xezim/core pins; parser is a source-string Rust library; core exposes an inline VCD sink; source-level native boundaries are located.
-- **Not confirmed:** parser/core/xezim wasm compilation, browser Worker execution, VCD bytes, or native regression status.
-- **Next:** rerun the three commands in the reproduction section on a Rust-enabled host and save full compiler output. If parser passes, tackle the build script and native feature boundaries before deep filesystem changes.
-- **Interface freeze:** do not freeze SimulationService, waveform transport, or Surfer message adapter from this report alone. LUNA-00B is still outstanding, and this compile gate did not run.
+- **Confirmed:** the exact Xezim/core pins; the parser, core, and Xezim WASM build path after target-gating native features; release WASM and wasm-bindgen output; a real browser Worker counter and VCD fixture; and the complete native Xezim suite with the default filesystem-backed behavior preserved.
+- **Historical blockers:** the initial no-toolchain check and the later baseline `getrandom`/`libffi-sys` build failures are recorded above and in [the build-gate follow-up](wasm-build-gate-followup.md). They drove the minimal target-gating patch strategy; they are no longer current build blockers for the tested bounded profile.
+- **Still open:** the combined compile/run wrapper is not a full `SimulationService` mapping; no fixed WASM memory ceiling is enforced; the output cap truncates the returned string after collection; and untested tasks/large workloads remain unsupported.
+- **Interface freeze:** application-facing contracts were frozen only after reviewing both the completed Xezim and Surfer feasibility results; see [ADR-002](ADR-002-interface-contracts.md). The Surfer adapter still enables only individually verified operations.
+
+Use the reproduction commands and results in [LUNA-04](luna-04-virtual-files-report.md) for the final build and native/browser acceptance evidence.
 
 
 ## Pinned source links
