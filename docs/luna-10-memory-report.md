@@ -45,6 +45,24 @@ The test loads the built WASM artifact in a real browser, measures a SystemVeril
 
 Both commands passed on Chromium `156.0.8078.4` and Firefox `157.0`.
 
+## Real Codex CLI and browser smoke
+
+With a logged-in Codex CLI, built WASM assets, installed Playwright browsers, and local-loopback access, run:
+
+```powershell
+pnpm --filter @xezim-ide/mcp-bridge smoke:codex
+```
+
+The command uses `codex exec --ephemeral` with a read-only shell and per-invocation MCP configuration. It launches the IDE in Chromium, pairs the browser from the actual `get_connection_status` response, asks Codex to update a temporary project file, and verifies the resulting Xezim simulation output. It does not persist Codex settings or source files. This passed with Codex CLI `0.163.0` and Chromium `156.0.8078.4`.
+
+The bridge's pinned MCP Inspector test also passed independently:
+
+```powershell
+pnpm --filter @xezim-ide/mcp-bridge test:inspector
+```
+
+Its package script uses a no-space test-name pattern so PowerShell and POSIX shells select the test consistently.
+
 ## Measurements
 
 The measured high-water values are `WebAssembly.Memory.buffer.byteLength` after simulation. A one-shot source declares a 32-bit RAM, writes one word, and finishes. The browser memory allocator grows in steps, so these are workload-specific figures, not a conversion factor for arbitrary designs.

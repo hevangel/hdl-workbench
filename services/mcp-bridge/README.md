@@ -47,3 +47,13 @@ pnpm --filter @xezim-ide/mcp-bridge test:inspector
 ```
 
 The tests exercise stdio MCP tool discovery/calls, the pinned Inspector CLI, WebSocket pairing, origin and token rejection, pairing expiry, project path traversal, symlink escapes, revision conflicts, snapshot synchronization, browser disconnects, request timeouts, and deterministic simulation busy errors.
+
+## Codex CLI and browser smoke
+
+With the browser WASM assets built and an authenticated Codex CLI available, run:
+
+```powershell
+pnpm --filter @xezim-ide/mcp-bridge smoke:codex
+```
+
+This starts the IDE and Chromium, gives Codex an ephemeral MCP server configuration, and uses a temporary HDL project to verify browser pairing, an MCP source edit, and a real Xezim WASM simulation. The Codex shell is read-only, the project is removed after the run, and no global Codex MCP configuration is changed. This check makes a Codex model call and requires local-loopback access; it is not part of CI. Set `XEZIM_CODEX_CLI` to select a non-default CLI executable.

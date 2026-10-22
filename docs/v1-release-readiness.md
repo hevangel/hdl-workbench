@@ -48,11 +48,12 @@ pnpm demo
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
 | Full Chromium + Firefox E2E on current branch | Pass; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. |
 | WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
+| Official MCP Inspector CLI | Pass; targeted Inspector test ran | `pnpm --filter @xezim-ide/mcp-bridge test:inspector`; see `docs/luna-10-memory-report.md`. |
+| Codex CLI ↔ browser pairing, edit, and run | Pass with Codex CLI `0.163.0` and Chromium `156.0.8078.4` | `pnpm --filter @xezim-ide/mcp-bridge smoke:codex`; ephemeral CLI config, temporary project, real Xezim WASM simulation. |
 | Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
 | Native Xezim suite on current branch | Pass in Linux builder | Complete `cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1`; includes the 705-test integration target, 4 UPF tests, and doctests. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 7 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1`. |
 | Official CI workflow | Pending GitHub execution | `.github/workflows/luna09-browser-e2e.yml`. |
-| Real Codex MCP manual smoke test | Pending | Local Playwright test uses the official MCP client SDK through stdio and the authenticated browser bridge. |
 | License/distribution review | Pending before external release | Surfer notice is retained; distribution model still requires review. |
 
 ## Implemented bounds and remaining memory risk
@@ -76,5 +77,4 @@ pnpm demo
 
 1. Run the workflow on GitHub and retain its logs as release evidence; local Linux-builder results are documented, but the hosted CI run is still pending.
 2. Define the minimum supported browser/device and measure total process memory and stress limits there; keep large designs out of v1 claims until measured.
-3. Complete a manual Codex MCP pairing/edit/run smoke test.
-4. Review the Surfer EUPL distribution obligations for the intended release format.
+3. Review the Surfer EUPL distribution obligations for the intended release format.
