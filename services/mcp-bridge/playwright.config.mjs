@@ -10,6 +10,7 @@ const browserProjects = [
     use: {
       browserName: "chromium",
       launchOptions: {
+        ...(process.env.XEZIM_CHROME_EXECUTABLE ? { executablePath: process.env.XEZIM_CHROME_EXECUTABLE } : {}),
         args: ["--enable-webgl", "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
       },
     },

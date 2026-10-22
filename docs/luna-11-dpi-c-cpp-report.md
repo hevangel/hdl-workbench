@@ -43,7 +43,7 @@ error and a successful compile/simulation after that error.
   before HTTP compression. The unused 19.4 MB C++ PCH is excluded from the app
   bundle. A compiler-inclusive process profile on the selected workstation is
   recorded in [`luna-12-dpi-memory-report.md`](luna-12-dpi-memory-report.md);
-  it does not qualify lower-resource devices or another browser engine.
+  it does not qualify lower-resource devices or Firefox process memory.
 
 ## Pins and notices
 
@@ -94,6 +94,10 @@ node apps/ide/scripts/wasm-browser-acceptance.mjs
 Verified on Windows with Headless Chrome 156.0.8078.47. The harness passed the
 existing counter, project/VCD, negative compile/recovery, C compile, C++ compile,
 direct export, and SystemVerilog DPI callback checks.
+
+The same real worker harness now runs under both configured Playwright browser
+projects. The cross-browser test and full-suite results are recorded in
+[`luna-13-dpi-cross-browser-report.md`](luna-13-dpi-cross-browser-report.md).
 
 ## Native compatibility check
 
