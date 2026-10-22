@@ -9,9 +9,10 @@ interface EditorSurfaceProps {
   value: string;
   diagnostics: Diagnostic[];
   onChange(value: string): void;
+  readOnly?: boolean;
 }
 
-export function EditorSurface({ path, value, diagnostics, onChange }: EditorSurfaceProps) {
+export function EditorSurface({ path, value, diagnostics, onChange, readOnly = false }: EditorSurfaceProps) {
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const [monacoApi, setMonacoApi] = useState<typeof Monaco | null>(null);
 
@@ -45,6 +46,7 @@ export function EditorSurface({ path, value, diagnostics, onChange }: EditorSurf
         options={{
           ariaLabel: "SystemVerilog editor",
           automaticLayout: true,
+          readOnly,
           fontFamily: "'Cascadia Code', 'SFMono-Regular', Consolas, monospace",
           fontSize: 14,
           lineHeight: 22,

@@ -86,6 +86,21 @@ export const RunRequestSchema = z.strictObject({
   vcdScopes: z.array(z.string().min(1).max(1024)).max(4096).optional(),
 });
 
+// Xezim's current browser binding compiles and simulates in one bounded Worker
+// call. This additive operation makes that boundary explicit without inventing
+// a compile handle that the Worker cannot produce.
+export const ExecuteRequestSchema = z.strictObject({
+  projectId: ProjectIdSchema,
+  snapshotId: SnapshotIdSchema,
+  topModule: z.string().min(1).max(512),
+  until: z.strictObject({ ticks: DecimalTicksSchema, timescale: TimescaleSchema }),
+  workBudget: z.strictObject({
+    maxWallTimeMs: z.number().int().positive().max(300_000),
+    maxOutputBytes: z.number().int().nonnegative().max(16 * 1024 * 1024),
+    maxVcdBytes: z.number().int().nonnegative().max(64 * 1024 * 1024),
+  }),
+});
+
 export const WaveformArtifactSchema = z.strictObject({
   id: ArtifactIdSchema,
   runId: RunIdSchema,
@@ -157,6 +172,7 @@ export const RpcRequestSchema = z.discriminatedUnion("op", [
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("workspace.delete_file"), projectId: ProjectIdSchema, params: DeleteFileParamsSchema }),
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.compile"), projectId: ProjectIdSchema, params: CompileRequestSchema }),
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.run"), projectId: ProjectIdSchema, params: RunRequestSchema }),
+  z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.execute"), projectId: ProjectIdSchema, params: ExecuteRequestSchema }),
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.get_diagnostics"), projectId: ProjectIdSchema, params: GetDiagnosticsParamsSchema }),
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.list_runs"), projectId: ProjectIdSchema, params: ListRunsParamsSchema }),
   z.strictObject({ protocol: ProtocolVersionSchema, id: RequestIdSchema, op: z.literal("simulation.get_log"), projectId: ProjectIdSchema, params: GetLogParamsSchema }),
@@ -200,6 +216,7 @@ export const RpcResultSchemas = {
   "workspace.delete_file": z.strictObject({ deleted: z.literal(true) }),
   "simulation.compile": CompileResultSchema,
   "simulation.run": RunResultSchema,
+  "simulation.execute": RunResultSchema,
   "simulation.get_diagnostics": z.strictObject({ diagnostics: z.array(DiagnosticSchema).max(100_000) }),
   "simulation.list_runs": z.strictObject({ runs: z.array(RunResultSchema).max(100), nextCursor: z.string().min(1).max(512).optional() }),
   "simulation.get_log": z.strictObject({ runId: RunIdSchema, stdout: z.string().max(1_048_576), stderr: z.string().max(1_048_576) }),
@@ -248,6 +265,7 @@ export const WireSchemas = {
   compileRequest: CompileRequestSchema,
   compileResult: CompileResultSchema,
   runRequest: RunRequestSchema,
+  executeRequest: ExecuteRequestSchema,
   runResult: RunResultSchema,
   waveformArtifact: WaveformArtifactSchema,
   rpcRequest: RpcRequestSchema,

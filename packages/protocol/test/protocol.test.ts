@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CompileRequestSchema,
+  ExecuteRequestSchema,
   PairingRequestSchema,
   ProjectPathSchema,
   RpcRequestSchema,
@@ -71,6 +72,19 @@ describe("protocol schemas", () => {
     expect(RunRequestSchema.safeParse(valid).success).toBe(true);
     expect(RunRequestSchema.safeParse({ ...valid, until: { ...valid.until, ticks: 25 } }).success).toBe(false);
     expect(RunRequestSchema.safeParse({ ...valid, until: { ...valid.until, ticks: "01" } }).success).toBe(false);
+  });
+
+  it("accepts one-shot execution without inventing a separate compile handle or step budget", () => {
+    const valid = {
+      projectId: "local-project",
+      snapshotId: "snap-0123456789abcdef0123456789abcdef",
+      topModule: "counter_tb",
+      until: { ticks: "1000", timescale },
+      workBudget: { maxWallTimeMs: 5000, maxOutputBytes: 1048576, maxVcdBytes: 64 * 1024 * 1024 },
+    };
+    expect(ExecuteRequestSchema.safeParse(valid).success).toBe(true);
+    expect(ExecuteRequestSchema.safeParse({ ...valid, compileId: "pretend-compile" }).success).toBe(false);
+    expect(ExecuteRequestSchema.safeParse({ ...valid, workBudget: { ...valid.workBudget, maxSteps: 1 } }).success).toBe(false);
   });
 });
 

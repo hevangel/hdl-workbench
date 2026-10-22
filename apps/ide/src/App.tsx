@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type SurferAdapter, type WorkspaceAdapter } from "@xezim-ide/protocol";
+import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type SurferAdapter, type WaveformArtifact, type WorkspaceAdapter } from "@xezim-ide/protocol";
 import { EditorSurface } from "./editor/EditorSurface.js";
 import { createMockServices } from "./mockServices.js";
 import { useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
 import type { PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
 import { exportProjectZip } from "./workspace/projectArchive.js";
 import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
+import type { BrowserIdeController } from "./controller/BrowserIdeController.js";
+import { McpBrowserClient, type BrowserBridgeState } from "./controller/McpBrowserClient.js";
+import { McpConnectionPanel } from "./controller/McpConnectionPanel.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
 interface EditorFile {
@@ -17,6 +20,7 @@ interface EditorFile {
 interface AppProps {
   workspace?: WorkspaceAdapter;
   simulation?: SimulationService;
+  controller?: BrowserIdeController;
   projectManager?: PersistentWorkspaceManager;
   onSurferAdapterChange?: (adapter: SurferAdapter | null) => void;
 }
@@ -27,8 +31,8 @@ function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
-export function App({ workspace, simulation = demoServices.simulation, projectManager, onSurferAdapterChange }: AppProps) {
-  const [workspaceService, setWorkspaceService] = useState<WorkspaceAdapter>(() => workspace ?? projectManager?.getWorkspace() ?? demoServices.workspace);
+export function App({ workspace, simulation = demoServices.simulation, controller, projectManager, onSurferAdapterChange }: AppProps) {
+  const [workspaceService, setWorkspaceService] = useState<WorkspaceAdapter>(() => workspace ?? controller?.workspace ?? projectManager?.getWorkspace() ?? demoServices.workspace);
   const [activeProject, setActiveProject] = useState<WorkspaceProject>(() => projectManager?.activeProject ?? {
     id: "demo-project" as ProjectId,
     name: "counter-lab",
@@ -49,6 +53,10 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
   const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
   const [workspaceMessage, setWorkspaceMessage] = useState("");
   const [fileActionsOpen, setFileActionsOpen] = useState(false);
+  const [bridgePanelOpen, setBridgePanelOpen] = useState(false);
+  const [bridgeState, setBridgeState] = useState<BrowserBridgeState>("disconnected");
+  const [bridgeMessage, setBridgeMessage] = useState("");
+  const bridgeClientRef = useRef<McpBrowserClient | null>(null);
   const [activePanel, setActivePanel] = useState<"problems" | "output" | "waveforms">("problems");
   const projectArchiveInput = useRef<HTMLInputElement>(null);
   const [layout, setLayout] = useLayoutPreferences();
@@ -65,9 +73,80 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
     setFiles((current) => current.map((file) => file.path === path ? update(file) : file));
   }, []);
 
+  const handleSurferAdapterChange = useCallback((adapter: SurferAdapter | null) => {
+    controller?.setSurferAdapter(adapter);
+    onSurferAdapterChange?.(adapter);
+  }, [controller, onSurferAdapterChange]);
+
+  const resolveWaveformUrl = useCallback((artifact: WaveformArtifact) => {
+    if (!controller) return Promise.reject(new Error("No browser waveform artifact store is configured."));
+    return controller.artifacts.objectUrl(artifact);
+  }, [controller]);
+
   useEffect(() => {
-    if (workspace) setWorkspaceService(workspace);
-  }, [workspace]);
+    const nextWorkspace = workspace ?? controller?.workspace;
+    if (nextWorkspace) setWorkspaceService(nextWorkspace);
+  }, [controller, workspace]);
+
+  useEffect(() => {
+    if (!controller) return;
+    const client = new McpBrowserClient(controller, {
+      onStateChange: (state, message) => {
+        setBridgeState(state);
+        setBridgeMessage(message ?? "");
+      },
+    });
+    bridgeClientRef.current = client;
+    controller.setOnWaveformShown(() => setActivePanel("waveforms"));
+    return () => {
+      client.disconnect();
+      bridgeClientRef.current = null;
+      controller.setOnWaveformShown(undefined);
+      controller.setSurferAdapter(null);
+    };
+  }, [controller]);
+
+  useEffect(() => {
+    if (!controller) return;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+    let generation = 0;
+    const refreshFromWorkspace = () => {
+      generation += 1;
+      const requestedGeneration = generation;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        void (async () => {
+          const entries = await controller.workspace.listFiles();
+          const refreshed = await Promise.all(entries.map(async (entry) => {
+            const file = await controller.workspace.readFile(entry.path);
+            return {
+              path: entry.path,
+              revision: file.revision,
+              content: new TextDecoder().decode(file.bytes),
+              saveState: "saved" as const,
+            };
+          }));
+          if (requestedGeneration !== generation) return;
+          const available = new Set(refreshed.map((file) => file.path));
+          revisionByPath.current = new Map(refreshed.map((file) => [file.path, file.revision]));
+          setFiles(refreshed);
+          setOpenTabs((current) => {
+            const retained = current.filter((path) => available.has(path));
+            return retained.length > 0 ? retained : refreshed[0] ? [refreshed[0].path] : [];
+          });
+          setActivePath((current) => current && available.has(current) ? current : refreshed[0]?.path ?? null);
+        })().catch((error: unknown) => {
+          setWorkspaceMessage(error instanceof Error ? error.message : "Could not refresh files from the connected project.");
+        });
+      }, 50);
+    };
+    controller.setOnWorkspaceChanged(refreshFromWorkspace);
+    return () => {
+      generation += 1;
+      if (refreshTimer) clearTimeout(refreshTimer);
+      controller.setOnWorkspaceChanged(undefined);
+    };
+  }, [controller]);
 
   useEffect(() => {
     if (!projectManager) return;
@@ -235,7 +314,9 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
     try {
       const selected = await projectManager.selectProject(projectId as ProjectId);
       setActiveProject(selected);
-      setWorkspaceService(projectManager.getWorkspace(selected.id));
+      const selectedWorkspace = projectManager.getWorkspace(selected.id);
+      controller?.setWorkspace(selectedWorkspace);
+      setWorkspaceService(selectedWorkspace);
       setDiagnostics([]);
       const latestProjects = await projectManager.listProjects();
       setProjects(latestProjects);
@@ -383,7 +464,7 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
   };
 
   const handleEdit = (value: string) => {
-    if (!activeFile) return;
+    if (!activeFile || bridgeState === "connected") return;
     const path = activeFile.path;
     updateFile(path, (file) => ({ ...file, content: value, saveState: "dirty" }));
     scheduleSave(path, value);
@@ -428,10 +509,26 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
   const run = async () => {
     if (busy || !topModule.trim()) return;
     setBusy(true);
-    setLog("Saving current draft and freezing a project snapshot…");
+    setLog(controller ? "Saving current draft and freezing a project snapshot for Xezim WASM…" : "Saving current draft and freezing a project snapshot…");
     try {
       if (activeFile) await flushSave(activeFile.path, activeFile.content);
       const snapshot = await workspaceService.snapshot();
+      if (controller) {
+        const result = await controller.execute({
+          projectId: activeProject.id,
+          snapshotId: snapshot.snapshotId,
+          topModule: topModule.trim(),
+          until: { ticks: "1000", timescale: { magnitude: "1", unit: "ns" } },
+          workBudget: { maxWallTimeMs: 5_000, maxOutputBytes: 1_048_576, maxVcdBytes: 64 * 1024 * 1024 },
+        });
+        setDiagnostics(result.diagnostics);
+        setLog([result.stdout, result.stderr].filter(Boolean).join("\n") || `Xezim WASM status: ${result.status}`);
+        if (result.waveform) {
+          setActivePanel("waveforms");
+          await controller.showWaveform({ artifactId: result.waveform.id });
+        }
+        return;
+      }
       const compile = await simulation.compile({
         projectId: activeProject.id,
         snapshotId: snapshot.snapshotId,
@@ -479,10 +576,21 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
             <div className="brand-caption">SystemVerilog workspace</div>
           </div>
         </div>
-        <div className="mock-badge" role="status"><span className="status-dot" /> MOCK SERVICES · NO HDL SIMULATION</div>
+        {controller
+          ? <div className={`runtime-badge ${controller.canExecute ? "wasm" : "unavailable"}`} role="status"><span className="status-dot" />{controller.canExecute ? "XEZIM WASM · BROWSER WORKER" : "XEZIM WASM ASSETS UNAVAILABLE"}</div>
+          : <div className="mock-badge" role="status"><span className="status-dot" /> MOCK SERVICES · NO HDL SIMULATION</div>}
         <div className="header-actions">
+          {controller && <button className="connect-agent-button" type="button" onClick={() => setBridgePanelOpen((open) => !open)} aria-expanded={bridgePanelOpen}>
+            {bridgeState === "connected" ? "Agent connected" : "Connect agent"}
+          </button>}
           <button className="icon-button" type="button" aria-label="Settings" title="Settings are not available in this preview">⚙</button>
           <div className="avatar" aria-label="Local workspace">LX</div>
+          {controller && bridgePanelOpen && bridgeClientRef.current && <McpConnectionPanel
+            client={bridgeClientRef.current}
+            state={bridgeState}
+            message={bridgeMessage}
+            onClose={() => setBridgePanelOpen(false)}
+          />}
         </div>
       </header>
 
@@ -509,8 +617,8 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
         </div>
         <div className="run-controls">
           {projectManager && <>
-            <button className="secondary-button toolbar-button" type="button" onClick={() => void saveProject()} disabled={busy}>Save</button>
-            <button className="secondary-button toolbar-button" type="button" onClick={() => projectArchiveInput.current?.click()} disabled={busy}>Import ZIP</button>
+            <button className="secondary-button toolbar-button" type="button" onClick={() => void saveProject()} disabled={busy || bridgeState === "connected"}>Save</button>
+            <button className="secondary-button toolbar-button" type="button" onClick={() => projectArchiveInput.current?.click()} disabled={busy || bridgeState === "connected"}>Import ZIP</button>
             <button className="secondary-button toolbar-button" type="button" onClick={exportProject} disabled={busy || files.length === 0}>Export ZIP</button>
             <input
               ref={projectArchiveInput}
@@ -523,7 +631,7 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
           </>}
           <label className="top-module-label" htmlFor="top-module">Top module</label>
           <input id="top-module" className="top-module-input" value={topModule} onChange={(event) => setTopModule(event.target.value)} disabled={busy} />
-          <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim()}>
+          <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim() || Boolean(controller && !controller.canExecute)} title={controller && !controller.canExecute ? "The Xezim WASM assets were not found; no native simulation fallback is configured." : undefined}>
             <span aria-hidden="true">{busy ? "◌" : "▶"}</span> {busy ? "Running…" : "Run"}
           </button>
         </div>
@@ -535,16 +643,16 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
           <div className="project-root"><span className="chevron">⌄</span><span className="folder-icon">▰</span> {activeProject.name}</div>
           {projectManager && <div className="authority-row">
             <label htmlFor="authority-mode">Authority</label>
-            <select id="authority-mode" value="browser-only" onChange={() => undefined}>
+            <select id="authority-mode" value={bridgeState === "connected" ? "connected" : "browser-only"} onChange={() => undefined}>
               <option value="browser-only">Browser only</option>
-              <option value="connected" disabled>Connected (bridge not configured)</option>
+              <option value="connected">Local MCP bridge project</option>
             </select>
           </div>}
           {projectManager && <div className="file-actions">
-            <button type="button" className="secondary-button toolbar-button" onClick={() => setFileActionsOpen((open) => !open)} aria-expanded={fileActionsOpen} aria-label="File actions" disabled={!activeFile || busy}>File actions</button>
+            <button type="button" className="secondary-button toolbar-button" onClick={() => setFileActionsOpen((open) => !open)} aria-expanded={fileActionsOpen} aria-label="File actions" disabled={!activeFile || busy || bridgeState === "connected"}>File actions</button>
             {fileActionsOpen && <div className="file-actions-menu">
-              <button type="button" onClick={() => { setFileActionsOpen(false); void renameActiveFile(); }} disabled={!activeFile || busy}>Rename active file…</button>
-              <button type="button" onClick={() => { setFileActionsOpen(false); void deleteActiveFile(); }} disabled={!activeFile || busy}>Delete active file…</button>
+              <button type="button" onClick={() => { setFileActionsOpen(false); void renameActiveFile(); }} disabled={!activeFile || busy || bridgeState === "connected"}>Rename active file…</button>
+              <button type="button" onClick={() => { setFileActionsOpen(false); void deleteActiveFile(); }} disabled={!activeFile || busy || bridgeState === "connected"}>Delete active file…</button>
             </div>}
           </div>}
           <div className="file-tree">
@@ -593,7 +701,7 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
 
           <div className="editor-breadcrumb"><span>⌂</span><span className="crumb-separator">/</span>{activePath?.split("/").map((segment, index, all) => <span key={`${segment}-${index}`} className={index === all.length - 1 ? "current-segment" : ""}>{index > 0 ? <span className="crumb-separator">/</span> : null}{segment}</span>)}</div>
           <div className="editor-region">
-            <EditorSurface path={activePath} value={activeFile?.content ?? ""} diagnostics={diagnostics} onChange={handleEdit} />
+            <EditorSurface path={activePath} value={activeFile?.content ?? ""} diagnostics={diagnostics} onChange={handleEdit} readOnly={bridgeState === "connected"} />
           </div>
 
           <section className="bottom-panel" aria-label="Diagnostics, output and waveform viewer">
@@ -602,12 +710,12 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
               <button type="button" role="tab" aria-selected={activePanel === "output"} className={`panel-tab ${activePanel === "output" ? "active" : ""}`} onClick={() => setActivePanel("output")}>OUTPUT</button>
               <button type="button" role="tab" aria-selected={activePanel === "waveforms"} className={`panel-tab ${activePanel === "waveforms" ? "active" : ""}`} onClick={() => setActivePanel("waveforms")}>WAVEFORMS</button>
               <span className="panel-spacer" />
-              {activePanel !== "waveforms" && <span className="panel-caption">Mock adapter response</span>}
+              {activePanel !== "waveforms" && <span className="panel-caption">{controller ? "Xezim WASM Worker" : "Mock adapter response"}</span>}
             </div>
             {activePanel === "problems" && <div className="panel-content">
               <section className="diagnostics-list" aria-label="Diagnostics">
                 {diagnostics.length === 0 ? (
-                  <div className="empty-panel"><span className="checkmark">✓</span> No diagnostics yet <span>Run the mock checks to see editor markers.</span></div>
+                  <div className="empty-panel"><span className="checkmark">✓</span> No diagnostics yet <span>{controller ? "Run Xezim in the browser Worker to see diagnostics." : "Run the mock checks to see editor markers."}</span></div>
                 ) : diagnostics.map((diagnostic, index) => (
                   <div className={`diagnostic-row ${diagnostic.severity}`} key={`${diagnostic.code}-${index}`}>
                     <span className="diagnostic-symbol">{diagnostic.severity === "error" ? "●" : "▲"}</span>
@@ -620,10 +728,15 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
               <pre className="output-preview" aria-label="Run output">{log}</pre>
             </div>}
             {activePanel === "output" && <pre className="output-full" aria-label="Run output">{log}</pre>}
-            {activePanel === "waveforms" && <div className="waveform-panel-content"><SurferWaveformPanel {...(onSurferAdapterChange ? { onAdapterChange: onSurferAdapterChange } : {})} /></div>}
+            <div className="waveform-panel-content" style={{ display: activePanel === "waveforms" ? "flex" : "none" }}>
+              <SurferWaveformPanel
+                onAdapterChange={handleSurferAdapterChange}
+                resolveWaveformUrl={resolveWaveformUrl}
+              />
+            </div>
           </section>
 
-          <footer className="status-bar"><span><i className="status-dot green" /> {activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
+          <footer className="status-bar"><span><i className="status-dot green" /> {bridgeState === "connected" ? "Local bridge project · editor read-only" : activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
         </main>
       </div>
 

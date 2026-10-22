@@ -8,6 +8,7 @@
   },
   "scripts": {
     "test": "pnpm -r --if-present test",
+    "test:e2e": "pnpm --filter @xezim-ide/mcp-bridge test:e2e",
     "typecheck": "pnpm -r --if-present typecheck",
     "build": "pnpm -r --if-present build && node scripts/export-json-schema.mjs"
   }

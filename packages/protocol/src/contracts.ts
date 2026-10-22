@@ -1,6 +1,7 @@
 import type {
   CompileRequestSchema,
   CompileResultSchema,
+  ExecuteRequestSchema,
   CompileIdSchema,
   DiagnosticSchema,
   ArtifactIdSchema,
@@ -36,6 +37,7 @@ export type Diagnostic = z.infer<typeof DiagnosticSchema>;
 export type CompileRequest = z.infer<typeof CompileRequestSchema>;
 export type CompileResult = z.infer<typeof CompileResultSchema>;
 export type RunRequest = z.infer<typeof RunRequestSchema>;
+export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 export type RunResult = z.infer<typeof RunResultSchema>;
 export type WaveformArtifact = z.infer<typeof WaveformArtifactSchema>;
 
@@ -82,6 +84,7 @@ export interface IdeController {
   deleteFile(path: ProjectPath, expectedRevision: Revision): Promise<void>;
   compile(input: CompileRequest): Promise<CompileResult>;
   run(input: RunRequest): Promise<RunResult>;
+  execute(input: ExecuteRequest): Promise<RunResult>;
   diagnostics(input: { compileId?: CompileId; runId?: RunId }): Promise<Diagnostic[]>;
   listRuns(projectId: ProjectId, limit: number): Promise<RunResult[]>;
   showWaveform(input: { artifactId: ArtifactId; signalPaths?: string[]; cursor?: WaveformTime }): Promise<void>;

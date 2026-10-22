@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "pnpm build && vitest run",
+    "test": "pnpm build && vitest run test",
+    "test:e2e": "pnpm build && playwright test --config=playwright.config.mjs",
     "test:inspector": "pnpm build && vitest run test/bridge.integration.test.ts -t 'official MCP Inspector CLI'"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.0",
     "@modelcontextprotocol/client": "2.3.1",
     "@modelcontextprotocol/inspector": "2.12.0",
     "@types/node": "24.10.0",

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "projectId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "topModule": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "until": {
+      "type": "object",
+      "properties": {
+        "ticks": {
+          "type": "string",
+          "maxLength": 40,
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "timescale": {
+          "type": "object",
+          "properties": {
+            "magnitude": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,2}$"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "s",
+                "ms",
+                "us",
+                "ns",
+                "ps",
+                "fs"
+              ]
+            }
+          },
+          "required": [
+            "magnitude",
+            "unit"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "ticks",
+        "timescale"
+      ],
+      "additionalProperties": false
+    },
+    "workBudget": {
+      "type": "object",
+      "properties": {
+        "maxWallTimeMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 300000
+        },
+        "maxOutputBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16777216
+        },
+        "maxVcdBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 67108864
+        }
+      },
+      "required": [
+        "maxWallTimeMs",
+        "maxOutputBytes",
+        "maxVcdBytes"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "projectId",
+    "snapshotId",
+    "topModule",
+    "until",
+    "workBudget"
+  ],
+  "additionalProperties": false
+}

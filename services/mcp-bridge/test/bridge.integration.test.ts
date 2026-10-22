@@ -161,7 +161,8 @@ class MockBrowser {
         result = { compileId: `compile-${this.compileCount}`, projectId: request.projectId, snapshotId: request.params.snapshotId, success: true, diagnostics: [] };
         break;
       }
-      case "simulation.run": {
+      case "simulation.run":
+      case "simulation.execute": {
         this.runCount += 1;
         this.runEntered.resolve();
         if (this.holdRun) return;
@@ -271,7 +272,7 @@ describe("LUNA-07 MCP bridge integration", () => {
     expect(Buffer.from(browser.files.get("top.sv") ?? []).toString("utf8")).toContain("logic ready");
     const run = parseText(await context.client.callTool({
       name: "run_simulation",
-      arguments: { compile_id: compile.compileId, until_ticks: "100", timescale: { magnitude: "1", unit: "ns" } },
+      arguments: { top_module: "top", until_ticks: "100", timescale: { magnitude: "1", unit: "ns" } },
     })) as { runId: string; status: string };
     expect(run).toMatchObject({ runId: "run-1", status: "completed" });
     expect(parseText(await context.client.callTool({ name: "get_diagnostics", arguments: { run_id: run.runId } }))).toEqual({ diagnostics: [] });
@@ -326,11 +327,11 @@ describe("LUNA-07 MCP bridge integration", () => {
     const context = await startBridge();
     const status = parseText(await context.client.callTool({ name: "get_connection_status", arguments: {} })) as Record<string, unknown>;
     const browser = await MockBrowser.connect(status);
-    const compile = parseText(await context.client.callTool({ name: "compile", arguments: { top_module: "top" } })) as { compileId: string };
     browser.holdRun = true;
-    const first = context.client.callTool({ name: "run_simulation", arguments: { compile_id: compile.compileId, until_ticks: "10", timescale: { magnitude: "1", unit: "ns" } } });
+    const runArguments = { top_module: "top", until_ticks: "10", timescale: { magnitude: "1", unit: "ns" } };
+    const first = context.client.callTool({ name: "run_simulation", arguments: runArguments });
     await browser.runEntered.promise;
-    const second = await context.client.callTool({ name: "run_simulation", arguments: { compile_id: compile.compileId, until_ticks: "10", timescale: { magnitude: "1", unit: "ns" } } });
+    const second = await context.client.callTool({ name: "run_simulation", arguments: runArguments });
     expect(second.isError).toBe(true);
     expect(await errorCode(second)).toBe("SIMULATION_BUSY");
     browser.socket.close();

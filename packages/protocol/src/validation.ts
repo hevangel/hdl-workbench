@@ -15,7 +15,7 @@ export function validateCompileResultForRequest(request: CompileRequest, result:
   }
 }
 
-export function validateRunResultForRequest(request: RunRequest, result: RunResult): void {
+export function validateRunResultForRequest(request: Pick<RunRequest, "projectId" | "snapshotId">, result: RunResult): void {
   if (result.projectId !== request.projectId || result.snapshotId !== request.snapshotId) {
     throw new ContractValidationError("Run result provenance does not match the requested project snapshot.");
   }
@@ -26,7 +26,7 @@ export function validateRunResultForRequest(request: RunRequest, result: RunResu
 
 export function validateRpcRequestConsistency(request: RpcRequest): void {
   if (
-    (request.op === "simulation.compile" || request.op === "simulation.run") &&
+    (request.op === "simulation.compile" || request.op === "simulation.run" || request.op === "simulation.execute") &&
     request.projectId !== request.params.projectId
   ) {
     throw new ContractValidationError("RPC projectId does not match the project in the operation parameters.");
@@ -47,6 +47,8 @@ export function validateRpcResponseForRequest(request: RpcRequest, response: Rpc
   if (request.op === "simulation.compile") {
     validateCompileResultForRequest(request.params, parsed.data as CompileResult);
   } else if (request.op === "simulation.run") {
+    validateRunResultForRequest(request.params, parsed.data as RunResult);
+  } else if (request.op === "simulation.execute") {
     validateRunResultForRequest(request.params, parsed.data as RunResult);
   } else if (request.op === "workspace.read_file" && (parsed.data as unknown as { path: string }).path !== request.params.path) {
     throw new ContractValidationError("File response path does not match the requested path.");

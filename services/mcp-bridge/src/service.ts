@@ -2,10 +2,10 @@ import {
   CompileRequestSchema,
   CompileResultSchema,
   DiagnosticSchema,
+  ExecuteRequestSchema,
   PairingChallengeSchema,
   ProjectPathSchema,
   RpcResultSchemas,
-  RunRequestSchema,
   RunResultSchema,
   type CompileId,
   type CompileResult,
@@ -96,30 +96,23 @@ export class IdeMcpService {
   }
 
   async runSimulation(input: {
-    compileId: string;
+    topModule: string;
     untilTicks: string;
     timescale: { magnitude: string; unit: "s" | "ms" | "us" | "ns" | "ps" | "fs" };
-    workBudget?: { maxSteps: number; maxWallTimeMs: number; maxOutputBytes: number; maxVcdBytes: number };
-    vcdScopes?: string[];
+    workBudget?: { maxWallTimeMs: number; maxOutputBytes: number; maxVcdBytes: number };
   }): Promise<RunResult> {
     return this.withSimulation(async () => {
-      const compileResult = this.compileResults.get(input.compileId as CompileId);
-      if (!compileResult) throw new BridgeError("NOT_FOUND", "compile_id is unknown to this bridge");
-      if (!compileResult.success) throw new BridgeError("INVALID_REQUEST", "Cannot run a snapshot whose compile result failed");
       const snapshot = await this.files.snapshot();
-      if (snapshot.snapshotId !== compileResult.snapshotId) {
-        throw new BridgeError("REVISION_CONFLICT", "Project files changed after compile; compile the current revision before running", true);
-      }
-      const request = RunRequestSchema.parse({
+      await this.syncSnapshot(snapshot.files);
+      const request = ExecuteRequestSchema.parse({
         projectId: this.projectId,
-        snapshotId: compileResult.snapshotId,
-        compileId: compileResult.compileId,
+        snapshotId: snapshot.snapshotId,
+        topModule: input.topModule,
         until: { ticks: input.untilTicks, timescale: input.timescale },
-        workBudget: input.workBudget ?? { maxSteps: 1_000_000, maxWallTimeMs: 30_000, maxOutputBytes: 1_048_576, maxVcdBytes: 16 * 1024 * 1024 },
-        ...(input.vcdScopes === undefined ? {} : { vcdScopes: input.vcdScopes }),
+        workBudget: input.workBudget ?? { maxWallTimeMs: 30_000, maxOutputBytes: 1_048_576, maxVcdBytes: 16 * 1024 * 1024 },
       });
-      const result = RunResultSchema.parse(await this.success(makeRpcRequest({ op: "simulation.run", projectId: this.projectId, params: request })));
-      if (result.snapshotId !== compileResult.snapshotId || result.projectId !== this.projectId) {
+      const result = RunResultSchema.parse(await this.success(makeRpcRequest({ op: "simulation.execute", projectId: this.projectId, params: request })));
+      if (result.snapshotId !== snapshot.snapshotId || result.projectId !== this.projectId) {
         throw new BridgeError("INVALID_REQUEST", "Browser returned a run result for a different project snapshot");
       }
       this.runResults.set(result.runId, result);

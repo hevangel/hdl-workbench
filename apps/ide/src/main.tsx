@@ -4,8 +4,9 @@ import * as monaco from "monaco-editor/editor/editor.api.js";
 import { loader } from "@monaco-editor/react";
 import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
 import { App } from "./App.js";
-import { createMockServices, initialProjectFiles } from "./mockServices.js";
+import { initialProjectFiles } from "./mockServices.js";
 import { openPersistentWorkspace } from "./workspace/opfsWorkspace.js";
+import { BrowserIdeController } from "./controller/BrowserIdeController.js";
 import "./styles.css";
 
 // Keep the editor and its Worker self-hosted with the app. The default loader
@@ -22,14 +23,30 @@ const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("The IDE root element is missing.");
 
 const root = createRoot(rootElement);
-const demoSimulation = createMockServices().simulation;
+
+async function hasWasmAssets(): Promise<boolean> {
+  try {
+    const [moduleResponse, wasmResponse] = await Promise.all([
+      fetch("/wasm/xezim_web.js", { method: "HEAD", cache: "no-store" }),
+      fetch("/wasm/xezim_web_bg.wasm", { method: "HEAD", cache: "no-store" }),
+    ]);
+    return moduleResponse.ok
+      && wasmResponse.ok
+      && moduleResponse.headers.get("content-type")?.includes("javascript") === true
+      && wasmResponse.headers.get("content-type")?.includes("application/wasm") === true;
+  } catch {
+    return false;
+  }
+}
 
 async function startIde(): Promise<void> {
   try {
     const manager = await openPersistentWorkspace(initialProjectFiles);
+    const controller = new BrowserIdeController(manager.getWorkspace(), { simulatorAvailable: await hasWasmAssets() });
+    window.addEventListener("pagehide", () => controller.dispose(), { once: true });
     root.render(
       <StrictMode>
-        <App projectManager={manager} workspace={manager.getWorkspace()} simulation={demoSimulation} />
+        <App projectManager={manager} workspace={manager.getWorkspace()} controller={controller} />
       </StrictMode>,
     );
   } catch (error) {

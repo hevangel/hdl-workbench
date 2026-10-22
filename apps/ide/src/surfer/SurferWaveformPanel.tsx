@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { SurferAdapter } from "@xezim-ide/protocol";
-import { PINNED_SURFER_VERSION, SurferAdapterError, SurferIframeAdapter } from "./SurferIframeAdapter.js";
+import { PINNED_SURFER_VERSION, SurferAdapterError, SurferIframeAdapter, type WaveformUrlResolver } from "./SurferIframeAdapter.js";
 
 interface SurferWaveformPanelProps {
   onAdapterChange?: (adapter: SurferAdapter | null) => void;
+  resolveWaveformUrl?: WaveformUrlResolver;
 }
 
-export function SurferWaveformPanel({ onAdapterChange }: SurferWaveformPanelProps) {
+export function SurferWaveformPanel({ onAdapterChange, resolveWaveformUrl }: SurferWaveformPanelProps) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const adapterRef = useRef<SurferIframeAdapter | null>(null);
   const [ready, setReady] = useState(false);
@@ -19,6 +20,7 @@ export function SurferWaveformPanel({ onAdapterChange }: SurferWaveformPanelProp
     const iframe = iframeRef.current;
     if (!iframe) return;
     const adapter = new SurferIframeAdapter(iframe, {
+      ...(resolveWaveformUrl ? { resolveWaveformUrl } : {}),
       onReadyChange: (nextReady, error) => {
         setReady(nextReady);
         if (nextReady) setReadyGeneration((generation) => generation + 1);
@@ -27,8 +29,9 @@ export function SurferWaveformPanel({ onAdapterChange }: SurferWaveformPanelProp
       },
     });
     adapterRef.current = adapter;
-    onAdapterChange?.(adapter);
-    void adapter.ready().catch((error: unknown) => {
+    void adapter.ready().then(() => {
+      if (adapterRef.current === adapter) onAdapterChange?.(adapter);
+    }).catch((error: unknown) => {
       setMessage(error instanceof SurferAdapterError ? error.message : "Surfer could not be initialized.");
     });
     return () => {
@@ -36,7 +39,7 @@ export function SurferWaveformPanel({ onAdapterChange }: SurferWaveformPanelProp
       adapterRef.current = null;
       onAdapterChange?.(null);
     };
-  }, [onAdapterChange]);
+  }, [onAdapterChange, resolveWaveformUrl]);
 
   const perform = async (action: () => Promise<void>, after?: () => void) => {
     setPending(true);

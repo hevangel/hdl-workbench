@@ -50,28 +50,24 @@ export function createMcpServer(service: IdeMcpService): McpServer {
     ...(input.defines === undefined ? {} : { defines: input.defines }),
     ...(input.mode === undefined ? {} : { mode: input.mode }),
   }));
-  tool(server, "run_simulation", "Run the current compiled snapshot in the paired browser; no native simulator fallback is used.", z.strictObject({
-    compile_id: CompileIdSchema,
+  tool(server, "run_simulation", "Compile and run the current project snapshot in the paired browser's Xezim WASM Worker. This is one bounded operation because the browser binding does not expose separate compile and run handles; no native simulator fallback is used.", z.strictObject({
+    top_module: z.string().min(1).max(512),
     until_ticks: DecimalTicksSchema,
     timescale: TimescaleSchema,
     work_budget: z.strictObject({
-      max_steps: z.number().int().positive().max(100_000_000),
       max_wall_time_ms: z.number().int().positive().max(300_000),
       max_output_bytes: z.number().int().nonnegative().max(16 * 1024 * 1024),
-      max_vcd_bytes: z.number().int().nonnegative().max(256 * 1024 * 1024),
+      max_vcd_bytes: z.number().int().nonnegative().max(64 * 1024 * 1024),
     }).optional(),
-    vcd_scopes: z.array(z.string().min(1).max(1024)).max(4096).optional(),
   }), (input) => service.runSimulation({
-    compileId: input.compile_id,
+    topModule: input.top_module,
     untilTicks: input.until_ticks,
     timescale: input.timescale,
     ...(input.work_budget === undefined ? {} : { workBudget: {
-      maxSteps: input.work_budget.max_steps,
       maxWallTimeMs: input.work_budget.max_wall_time_ms,
       maxOutputBytes: input.work_budget.max_output_bytes,
       maxVcdBytes: input.work_budget.max_vcd_bytes,
     } }),
-    ...(input.vcd_scopes === undefined ? {} : { vcdScopes: input.vcd_scopes }),
   }));
   tool(server, "get_diagnostics", "Get diagnostics for a compile or simulation, or the diagnostics retained by this bridge.", z.strictObject({
     compile_id: CompileIdSchema.optional(),
