@@ -8,6 +8,7 @@ import {
   RunIdSchema,
   RunResultSchema,
   TimescaleSchema,
+  compareProjectPaths,
   type ArtifactId,
   type CompileId,
   type CompileRequest,
@@ -91,7 +92,10 @@ function parseTimescale(raw: string | null | undefined): { magnitude: string; un
 }
 
 function bridgeSnapshotId(files: Array<{ path: string; revision: string }>): Promise<string> {
-  const source = files.map((file) => `${file.path}\0${file.revision}\0`).join("");
+  const source = [...files]
+    .sort((left, right) => compareProjectPaths(left.path, right.path))
+    .map((file) => `${file.path}\0${file.revision}\0`)
+    .join("");
   return crypto.subtle.digest("SHA-256", new TextEncoder().encode(source)).then((hash) => {
     const hex = [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
     return `snap-${hex.slice(0, 32)}`;

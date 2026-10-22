@@ -11,6 +11,7 @@ import {
 } from "../src/schemas.js";
 import {
   ContractValidationError,
+  compareProjectPaths,
   compareTicks,
   isValidTimeRange,
   parseTicks,
@@ -89,6 +90,18 @@ describe("protocol schemas", () => {
 });
 
 describe("snapshot provenance and tick arithmetic", () => {
+  it("orders project paths identically across browser and Node locales", () => {
+    const paths = ["dpi_top.sv", "dpi/add_cpp.cpp", "dpi/add_cpp.hpp", "dpi/add.c", "dpi/add.h"];
+    expect(paths.sort(compareProjectPaths)).toEqual([
+      "dpi/add.c",
+      "dpi/add.h",
+      "dpi/add_cpp.cpp",
+      "dpi/add_cpp.hpp",
+      "dpi_top.sv",
+    ]);
+    expect(compareProjectPaths("dpi/add.c", "dpi/add.c")).toBe(0);
+  });
+
   it("rejects compile results produced from another snapshot", () => {
     const compileRequest = CompileRequestSchema.parse(request);
     expect(() => validateCompileResultForRequest(compileRequest, {

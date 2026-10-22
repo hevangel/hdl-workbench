@@ -9,6 +9,14 @@ export class ContractValidationError extends Error {
   }
 }
 
+/**
+ * Compare normalized project paths by UTF-16 code units so Node and browsers
+ * produce the same order regardless of the user's locale.
+ */
+export function compareProjectPaths(left: string, right: string): -1 | 0 | 1 {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export function validateCompileResultForRequest(request: CompileRequest, result: CompileResult): void {
   if (result.projectId !== request.projectId || result.snapshotId !== request.snapshotId) {
     throw new ContractValidationError("Compile result provenance does not match the requested project snapshot.");

@@ -6,6 +6,7 @@ import {
   ProjectFileSchema,
   ProjectPathSchema,
   RevisionSchema,
+  compareProjectPaths,
   type FileEntry,
   type ProjectPath,
   type Revision,
@@ -91,6 +92,7 @@ export class ProjectFiles {
       }
     };
     await visit(this.root, "");
+    files.sort((left, right) => compareProjectPaths(left.path, right.path));
     return files;
   }
 

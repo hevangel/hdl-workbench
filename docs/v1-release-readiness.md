@@ -1,7 +1,7 @@
 # v1 release readiness
 
 Date: 2026-10-22
-Branch: `codex/luna-14-production-e2e`
+Branch: `codex/luna-15-dpi-agent-flow`
 Status: feature, development and production browser integration, and selected-workstation memory checks pass; source publication, hosted-origin checks, and qualified release review remain open.
 
 ## Pins
@@ -43,14 +43,15 @@ pnpm demo
 | Frozen workspace install | Pass with pnpm `11.25.0`; all five workspace projects already up to date | `pnpm install --frozen-lockfile`. |
 | `pnpm typecheck` | Pass | All four workspace packages. |
 | `pnpm build` | Pass; existing Monaco bundle size warning | All workspace packages and generated protocol JSON schema. |
-| Production bundle E2E | Pass; all 6 browser cases across Chrome and Firefox in 35.9 seconds | `pnpm build`, serve `apps/ide/dist` with `vite preview`, then `pnpm --filter @xezim-ide/mcp-bridge test:e2e` with `XEZIM_PLAYWRIGHT_BASE_URL`; see `docs/luna-14-production-e2e-report.md`. |
-| `pnpm test` | Pass with local loopback permission; 71 tests | Protocol 20, IDE 38, MCP bridge 7, wave-index 6. |
+| Production bundle E2E | Pass; all 8 browser cases across Chromium and Firefox in 57.7 seconds, including real MCP project C/C++ DPI compilation and recovery | `pnpm build`, serve `apps/ide/dist` with `vite preview`, then `pnpm --filter @xezim-ide/mcp-bridge test:e2e` with `XEZIM_PLAYWRIGHT_BASE_URL`; see `docs/luna-15-dpi-agent-flow-report.md` and historical `docs/luna-14-production-e2e-report.md`. |
+| `pnpm test` | Pass with local loopback permission; 72 tests | Protocol 21, IDE 38, MCP bridge 7, wave-index 6. |
 | Capped `pnpm build:browser` equivalent | Pass in the pinned Linux builder | `cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown`, then `wasm-bindgen --target web --out-dir apps/ide/public/wasm crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm`; see `docs/luna-10-memory-report.md`. |
 | Concurrent same-revision bridge writes | Covered by regression test | `pnpm test`; exactly one concurrent write succeeds. |
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
 | Simulator console capture bound | Pass; captured during simulation, Unicode-safe, coalesced, and reported as a resource limit | `cargo test --manifest-path crates/xezim-web/Cargo.toml`; native `simulate_project_inline` keeps its unbounded default. |
 | LUNA-13 full development E2E in Chromium + Firefox | Pass; 6 cases across 2 browsers in 40.9 seconds | `pnpm --filter @xezim-ide/mcp-bridge test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling/recovery, and C/C++ DPI compilation. See `docs/luna-13-dpi-cross-browser-report.md`. |
 | Browser C/C++ compile and SystemVerilog DPI | Pass in Chrome `156.0.8078.47` and the Playwright Firefox project; C returns 30 and C++ returns 42 | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna11-dpi.spec.mjs --project=chromium --project=firefox`; see `docs/luna-11-dpi-c-cpp-report.md` and `docs/luna-13-dpi-cross-browser-report.md`. |
+| MCP disk project → browser C/C++ DPI → compiler error → recovery | Pass in Chromium and Firefox in development and production bundle; exact C/C++ outputs verified | `pnpm test:e2e`; see [`luna-15-dpi-agent-flow-report.md`](luna-15-dpi-agent-flow-report.md). |
 | Compiler-inclusive whole-browser process memory | Pass on selected Windows workstation with Chrome `156.0.8078.47`; during compile/DPI, peak sampled resident 1,160.7 MiB and private 1,426.9 MiB | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` with `XEZIM_CHROME_EXECUTABLE`; see `docs/luna-12-dpi-memory-report.md`. This does not establish a lower-resource minimum or Firefox compiler memory. |
 | WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
 | Whole-browser process memory on selected v1 baseline | Pass on the user-selected computer: Windows 10.0.26300, Ryzen 9 5950X, 63.9 GiB RAM, 32 logical CPUs; Chromium 156.0.8078.4 and Firefox 157.0 | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` and `-- firefox`; see `docs/luna-10-memory-report.md`. Does not qualify lower-resource devices or other OS/browser versions. |
@@ -82,6 +83,6 @@ pnpm demo
 
 ## Next release gates
 
-1. Publish this branch and open its PR, then run `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs. Automatic approval review rejected the attempted push because the remote destination and source payload were not explicitly authorized in trusted content; GitHub connector calls also returned “not available to the model.” The local branch is ready, but no remote branch or PR was created.
+1. Publish `codex/luna-15-dpi-agent-flow` and open its PR, then run `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs. Automatic approval review rejected the earlier push because the remote destination and source payload were not explicitly authorized in trusted content; GitHub connector calls also returned “not available to the model.” No remote branch or PR was created.
 2. For the chosen public hosted website, publish the versioned source/provenance, configure the hosting project, record its canonical origin, and verify the license, source note, modified HTML entrypoint, and upstream source remain public while the viewer is served. No hosting manifest or canonical origin is configured in this checkout.
 3. Obtain qualified review of the Surfer bundle, compiler toolchain assets, and combined application's license position. The [technical inventories](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md) are evidence for review, not legal approval.

@@ -2,6 +2,7 @@ import {
   FileEntrySchema,
   ProjectIdSchema,
   ProjectPathSchema,
+  compareProjectPaths,
   type FileChange,
   type FileEntry,
   type ProjectId,
@@ -345,7 +346,7 @@ export class OpfsWorkspace implements WorkspaceAdapter {
     try {
       return await withProjectLock(this.project.id, async () => {
         await this.recoverPending();
-        const records = (await recordsForProject(this.database, this.project.id)).sort((a, b) => a.path.localeCompare(b.path));
+        const records = (await recordsForProject(this.database, this.project.id)).sort((a, b) => compareProjectPaths(a.path, b.path));
         return records.map((record) => FileEntrySchema.parse({ path: record.path, revision: record.revision, sizeBytes: record.sizeBytes }));
       });
     } catch (error) {
@@ -441,7 +442,7 @@ export class OpfsWorkspace implements WorkspaceAdapter {
     try {
       return await withProjectLock(this.project.id, async () => {
         await this.recoverPending();
-        const records = (await recordsForProject(this.database, this.project.id)).sort((a, b) => a.path.localeCompare(b.path));
+        const records = (await recordsForProject(this.database, this.project.id)).sort((a, b) => compareProjectPaths(a.path, b.path));
         const files: SnapshotFile[] = [];
         let total = 0;
         for (const record of records) {
