@@ -2,7 +2,7 @@
 
 Date: 2026-10-22
 Branch: `codex/luna-10-hardening`
-Status: hardening implementation is in progress; this document records demonstrated checks and remaining release gates.
+Status: branch-local hardening and acceptance checks pass; external release gates remain.
 
 ## Pins
 
@@ -43,11 +43,14 @@ pnpm demo
 | `pnpm typecheck` | Pass | All four workspace packages. |
 | `pnpm build` | Pass; existing Monaco bundle size warning | All workspace packages and generated protocol JSON schema. |
 | `pnpm test` | Pass with local loopback permission; 62 tests | Protocol 20, IDE 29, MCP bridge 7, wave-index 6. |
-| `pnpm build:browser` | Not run to completion locally: Rust tools are not installed in this shell | Script checks Rust 1.99.1 and wasm-bindgen 0.2.129; generated WASM from prior acceptance run was used by the browser E2E. |
+| Capped `pnpm build:browser` equivalent | Pass in the pinned Linux builder | `cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown`, then `wasm-bindgen --target web --out-dir apps/ide/public/wasm crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm`; see `docs/luna-10-memory-report.md`. |
 | Concurrent same-revision bridge writes | Covered by regression test | `pnpm test`; exactly one concurrent write succeeds. |
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
-| Full Chromium + Firefox E2E on current branch | Pass; 2 projects, 17 seconds | `pnpm test:e2e`. |
-| Native Xezim suites on current branch | Not run locally: `rustc`/`cargo` are unavailable in this shell; CI job is configured | Workflow job `native-xezim` runs the three Cargo suites. |
+| Full Chromium + Firefox E2E on current branch | Pass; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. |
+| WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
+| Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
+| Native Xezim suite on current branch | Pass in Linux builder | Complete `cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1`; includes the 705-test integration target, 4 UPF tests, and doctests. |
+| Native xezim-web wrapper suite on current branch | Pass in Linux builder; 7 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1`. |
 | Official CI workflow | Pending GitHub execution | `.github/workflows/luna09-browser-e2e.yml`. |
 | Real Codex MCP manual smoke test | Pending | Local Playwright test uses the official MCP client SDK through stdio and the authenticated browser bridge. |
 | License/distribution review | Pending before external release | Surfer notice is retained; distribution model still requires review. |
@@ -59,7 +62,7 @@ pnpm demo
 - Waveform store: 64 MiB per VCD, at most 8 retained artifacts and 128 MiB aggregate. OPFS quota errors are surfaced.
 - Xezim simulation stop time: 10,000,000 integer nanoseconds. Worker wall-time termination: 300,000 ms maximum.
 - Browser origin storage usage and quota are shown when the Storage API provides them. Persistent storage is requested with a bounded wait and is not assumed granted.
-- No fixed WASM memory ceiling or per-event/instruction count is enforced. Xezim may allocate simulation state and output before post-run checks, so these byte caps do not prove a strict peak-memory bound. Stress measurements on a minimum-supported browser/device remain a release gate for large designs.
+- WASM linear memory is capped at 256 MiB by the target linker maximum; allocation traps near the ceiling map to `RESOURCE_LIMIT`. This does not bound total browser process memory or impose a per-event/instruction count. Stress measurements on a minimum-supported browser/device remain a release gate for large designs.
 
 ## Security and compatibility notes
 
@@ -71,7 +74,7 @@ pnpm demo
 
 ## Next release gates
 
-1. Confirm the native Cargo suite in CI or a Linux build environment.
-2. Run the workflow on GitHub and retain its logs as release evidence.
-3. Measure peak memory and stress limits on the minimum supported browser/device; keep large designs out of v1 claims until measured.
-4. Complete a manual Codex MCP pairing/edit/run smoke test and review the Surfer EUPL distribution obligations for the intended release format.
+1. Run the workflow on GitHub and retain its logs as release evidence; local Linux-builder results are documented, but the hosted CI run is still pending.
+2. Define the minimum supported browser/device and measure total process memory and stress limits there; keep large designs out of v1 claims until measured.
+3. Complete a manual Codex MCP pairing/edit/run smoke test.
+4. Review the Surfer EUPL distribution obligations for the intended release format.

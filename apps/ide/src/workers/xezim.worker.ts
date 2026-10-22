@@ -14,9 +14,10 @@ const MAX_PROJECT_FILES = 4096;
 const MAX_VCD_BYTES = 64 * 1024 * 1024;
 const MAX_TIME_NS = 10_000_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+const MAX_WASM_MEMORY_BYTES = 256 * 1024 * 1024;
 
 type XezimModule = {
-  default: () => Promise<unknown>;
+  default: () => Promise<{ memory: WebAssembly.Memory }>;
   compileAndRun: (source: string, topModule: string, maxTimeNs: bigint, maxOutputBytes: number) => string;
   compileAndRunProject: (
     filesJson: string,
@@ -29,12 +30,14 @@ type XezimModule = {
 };
 
 let modulePromise: Promise<XezimModule> | undefined;
+let wasmMemory: WebAssembly.Memory | undefined;
 
 function loadXezim(): Promise<XezimModule> {
   modulePromise ??= (async () => {
     const wasmModuleUrl = new URL("/wasm/xezim_web.js", workerScope.location.href);
     const wasm = (await import(/* @vite-ignore */ wasmModuleUrl.href)) as XezimModule;
-    await wasm.default();
+    const exports = await wasm.default();
+    wasmMemory = exports.memory;
     return wasm;
   })();
   return modulePromise;
@@ -123,10 +126,18 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     const result = JSON.parse(json) as WorkerResponse extends { ok: true; result: infer T } ? T : never;
     workerScope.postMessage({ id: request.id, ok: true, result } satisfies WorkerResponse);
   } catch (error) {
+    const wasmMemoryBytes = wasmMemory?.buffer.byteLength ?? 0;
+    // Rust's allocator can trap before memory.grow reaches its declared maximum
+    // when the next allocation cannot fit in the remaining address space.
+    const memoryLimitReached = wasmMemoryBytes >= MAX_WASM_MEMORY_BYTES
+      || (error instanceof WebAssembly.RuntimeError
+        && wasmMemoryBytes >= MAX_WASM_MEMORY_BYTES - 32 * 1024 * 1024);
     workerScope.postMessage(fail(
       request.id,
-      "INTERNAL_ERROR",
-      error instanceof Error ? error.message.slice(0, 4096) : "Xezim worker failed.",
+      memoryLimitReached ? "RESOURCE_LIMIT" : "INTERNAL_ERROR",
+      memoryLimitReached
+        ? `Simulation exceeded available capacity under the 256 MiB WebAssembly memory limit (${(wasmMemoryBytes / (1024 * 1024)).toFixed(1)} MiB allocated). Reduce the design or its initialized state.`
+        : error instanceof Error ? error.message.slice(0, 4096) : "Xezim worker failed.",
     ));
   }
 };

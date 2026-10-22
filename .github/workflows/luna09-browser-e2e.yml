@@ -42,7 +42,7 @@ jobs:
 
       - name: Build browser Xezim WASM assets
         run: |
-          cargo build --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown
+          cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown
           mkdir -p apps/ide/public/wasm
           wasm-bindgen --target web --out-dir apps/ide/public/wasm \
             crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm
