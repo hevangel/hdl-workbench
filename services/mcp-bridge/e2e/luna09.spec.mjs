@@ -123,15 +123,20 @@ test("MCP edit -> Xezim WASM counter and ROM runs -> Surfer VCD -> workspace sur
     const surferNotice = page.getByLabel("Surfer license and source information");
     await expect(surferNotice).toContainText("EUPL-1.2 · modified by Xezim Studio on 2026-10-22");
     await expect(surferNotice.getByRole("link", { name: "License" })).toHaveAttribute("href", "/surfer/LICENSE-EUPL-1.2.txt");
-    await expect(surferNotice.getByRole("link", { name: "Pinned source and changes" })).toHaveAttribute("href", "/surfer/UPSTREAM.md");
-    const [licenseResponse, sourceResponse] = await Promise.all([
+    await expect(surferNotice.getByRole("link", { name: "Pinned upstream source" })).toHaveAttribute("href", "https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915");
+    await expect(surferNotice.getByRole("link", { name: "Modified entrypoint source" })).toHaveAttribute("download", "surfer-index.html");
+    await expect(surferNotice.getByRole("link", { name: "Provenance" })).toHaveAttribute("href", "/surfer/UPSTREAM.md");
+    const [licenseResponse, sourceResponse, wrapperResponse] = await Promise.all([
       page.request.get("/surfer/LICENSE-EUPL-1.2.txt"),
       page.request.get("/surfer/UPSTREAM.md"),
+      page.request.get("/surfer/index.html"),
     ]);
     expect(licenseResponse.ok()).toBe(true);
     expect(await licenseResponse.text()).toContain("EUROPEAN UNION PUBLIC LICENCE v. 1.2");
     expect(sourceResponse.ok()).toBe(true);
     expect(await sourceResponse.text()).toContain("bd749b1f786c1c62cd67893ca71346cbe6983915");
+    expect(wrapperResponse.ok()).toBe(true);
+    expect(await wrapperResponse.text()).toContain("xezim-surfer-ready-probe");
     const surfer = page.frameLocator("#surferFrame");
     await expect(surfer.locator("canvas")).toHaveCount(1);
 

@@ -7,9 +7,9 @@ Branch: `codex/luna-10-hardening`
 
 The browser Xezim artifact is linked with a 256 MiB maximum WebAssembly linear memory. The Web Worker converts allocation traps near that limit into a `RESOURCE_LIMIT` response and is terminated after each request, so a subsequent small simulation starts in a fresh worker.
 
-The limit is scoped to WebAssembly linear memory. It does not bound the browser process, JavaScript strings, VCD buffers, browser storage, or other process memory. A minimum supported device profile has not yet been defined, so these desktop measurements do not close the minimum-device release gate.
+The limit is scoped to WebAssembly linear memory. It does not bound the browser process, JavaScript strings, VCD buffers, browser storage, or other process memory. The user selected this computer as the minimum v1 device profile: Windows `10.0.26300`, AMD Ryzen 9 5950X, 63.9 GiB RAM, and 32 logical CPUs. This defines the tested baseline only; the measurements do not support claims for lower-resource machines or other operating systems.
 
-## Validation host reference
+## Selected v1 baseline device
 
 The host used for these browser checks reported Windows `10.0.26300`, 63.9 GiB RAM, an AMD Ryzen 9 5950X, and 32 logical processors. Reproduce the inventory with:
 
@@ -17,9 +17,9 @@ The host used for these browser checks reported Windows `10.0.26300`, 63.9 GiB R
 node -e 'const os=require("node:os"); console.log(JSON.stringify({platform:os.platform(),release:os.release(),totalRamGiB:+(os.totalmem()/1024**3).toFixed(1),logicalCpuCount:os.cpus().length,cpuModel:os.cpus()[0]?.model},null,2))'
 ```
 
-This is a high-resource reference workstation, not the v1 minimum. The whole-browser profiles below are sampled peaks, not guaranteed absolute high-water marks. No device support claim should be inferred from these figures.
+This is the explicitly selected v1 minimum-device test profile. The whole-browser profiles below are sampled peaks, not guaranteed absolute high-water marks. Browser versions are the Playwright-managed builds used for the test, not an inventory of other browser installations on this computer.
 
-## Whole-browser process profile (reference host)
+## Whole-browser process profile (selected baseline)
 
 The profiler runs the same 4.3-million-word direct WASM allocation trap, 1-million-word Worker completion, over-limit Worker `RESOURCE_LIMIT`, and fresh-Worker recovery scenario while sampling the launched browser's process set. Chromium process IDs come from its browser CDP session; Firefox is scoped to the Playwright-launched process tree. On Windows, resident and private bytes are collected every 50 ms from those processes. The aggregate resident-set sum can count shared pages more than once; private bytes are a second measure where available.
 
@@ -32,12 +32,12 @@ pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- firefox
 
 Results from this host:
 
-| Browser | Browser processes | Samples | Peak aggregate resident | Peak aggregate private |
-| --- | ---: | ---: | ---: | ---: |
-| Chromium | 4 | 12 | 844.1 MiB | 796.3 MiB |
-| Firefox | 7 | 8 | 1,247.0 MiB | 1,317.6 MiB |
+| Browser | Version | Browser processes | Samples | Peak aggregate resident | Peak aggregate private |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Chromium | `156.0.8078.4` | 4 | 11 | 1,001.8 MiB | 952.0 MiB |
+| Firefox | `157.0` | 7 | 8 | 1,275.4 MiB | 1,388.1 MiB |
 
-Both profiles observed the 255,524,864-byte direct WASM allocation trap, successful supported Worker workload, over-limit `RESOURCE_LIMIT`, and recovery run. These desktop figures do not close the minimum-device gate; repeat on the product's chosen minimum browser/device profile before making memory claims.
+Both profiles observed the 255,524,864-byte direct WASM allocation trap, successful supported Worker workload, over-limit `RESOURCE_LIMIT`, and recovery run. The selected baseline profile is measured. These results remain specific to this workstation and the listed Playwright browser builds; they do not establish support for lower-spec hardware, other operating systems, or arbitrary browser releases.
 
 ## Reproduce the browser WASM build
 

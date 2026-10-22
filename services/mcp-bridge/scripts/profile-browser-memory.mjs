@@ -244,6 +244,7 @@ async function profileBrowser(browserName, baseUrl) {
     const peakPrivate = privateSamples.length ? Math.max(...privateSamples.map((sample) => sample.privateBytes)) : null;
     return {
       browser: browserName,
+      browserVersion: browser.version(),
       peakAggregateResidentMiB: +(peakResident / 1024 ** 2).toFixed(1),
       peakAggregatePrivateMiB: peakPrivate === null ? null : +(peakPrivate / 1024 ** 2).toFixed(1),
       samples: samples.length,

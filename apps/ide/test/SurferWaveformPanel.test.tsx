@@ -26,7 +26,19 @@ describe("SurferWaveformPanel", () => {
       "href",
       "/surfer/LICENSE-EUPL-1.2.txt",
     );
-    expect(screen.getByRole("link", { name: "Pinned source and changes" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Pinned upstream source" })).toHaveAttribute(
+      "href",
+      "https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915",
+    );
+    expect(screen.getByRole("link", { name: "Modified entrypoint source" })).toHaveAttribute(
+      "download",
+      "surfer-index.html",
+    );
+    expect(screen.getByRole("link", { name: "Modified entrypoint source" })).toHaveAttribute(
+      "href",
+      "/surfer/index.html",
+    );
+    expect(screen.getByRole("link", { name: "Provenance" })).toHaveAttribute(
       "href",
       "/surfer/UPSTREAM.md",
     );

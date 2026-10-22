@@ -2,7 +2,7 @@
 
 Date: 2026-10-22
 
-Status: technical inventory and visible Surfer notice complete; qualified release review remains open.
+Status: technical inventory and served notice complete. The selected channel is a public hosted website; deployment-source publication and qualified release review remain open.
 
 This document records the shipped asset and the applicable text of the upstream license. It does not decide whether the combined Xezim Studio application is a derivative work or approve a distribution model.
 
@@ -16,18 +16,18 @@ This document records the shipped asset and the applicable text of the upstream 
 
 ## License requirements relevant to deployment
 
-The [official EUPL-1.2 text](https://interoperable-europe.ec.europa.eu/sites/default/files/custom-page/attachment/2020-03/EUPL-1.2%20EN.txt) defines distribution/communication to include making copies available online and providing access to essential functionality (Article 1). Article 3 says executable code must be accompanied by a machine-readable source copy or a notice naming a repository where source remains easily and freely accessible while the work is distributed. Article 5 requires preservation of copyright and license notices, a copy of the license, prominent modification notices with modification dates, and provision of source or an accessible repository. Article 11 also addresses information provided by the electronic distribution channel.
+The [official EUPL-1.2 text](https://interoperable-europe.ec.europa.eu/collection/eupl/eupl-text-eupl-12) defines “Distribution or Communication” to include making copies available online or providing access to essential functionality (Article 1). Article 3 permits executable-code delivery when a machine-readable source copy is provided or a notice identifies a repository where source stays easily and freely available while the work is communicated. Article 5 requires retained copyright/license/warranty notices, a license copy, prominent modification notices with dates, and source availability. Article 11 addresses information the electronic distribution channel must provide. The Commission's [EUPL guidance](https://interoperable-europe.ec.europa.eu/collection/eupl/how-use-eupl) expressly discusses public web services and source availability for modified EUPL software. This is a technical compliance checklist, not a legal conclusion that Xezim Studio as a whole is a derivative work or that every source obligation applies to the combined application.
 
 The European Commission's [EUPL guidance](https://interoperable-europe.ec.europa.eu/collection/eupl/how-use-eupl) explains that public web access is within the license's communication language and discusses source availability for modified works offered as a service. The EUPL's treatment of merged works and the applicable law can depend on the facts; an iframe boundary alone is not a legal conclusion.
 
 ## Current release-channel gaps
 
-- The license text and provenance are in the repository's static Surfer asset directory. Source files are in this repository, and the pinned upstream source is linked above.
-- The Surfer panel now presents the pinned version, EUPL-1.2, the local modification date, and links to the license and source/provenance note. Unit and browser acceptance checks cover those links and text.
-- The public deployment URL and the continued public availability of the corresponding source repository have not been specified. The release process must keep the license and source/provenance URLs available for as long as the viewer is distributed or communicated.
-- The runtime bundle contains generated WASM and JavaScript. A release should point recipients to the pinned upstream source and preserve access to the local HTML modification and exact build provenance for as long as the bundle is served.
+- The Surfer panel presents the pinned version, EUPL-1.2, the local modification date, and direct links to the license, pinned upstream source, downloadable modified `index.html`, and provenance note. Browser acceptance checks fetch and verify the served license, provenance, and modified entrypoint in Chromium and Firefox.
+- The release channel is a public hosted website, but no canonical deployment origin has been supplied and this branch has not been published. Consequently, the current source revision is not yet available from a public source repository and production URLs have not been verified.
+- Before launch, publish a versioned source repository or source package containing the exact local wrapper and build/provenance records; keep the pinned upstream source link, `/surfer/UPSTREAM.md`, `/surfer/LICENSE-EUPL-1.2.txt`, and `/surfer/index.html` publicly reachable without authentication for as long as the viewer is communicated. Run a production-origin check for all four URLs and retain the tested origin with the release record.
+- The runtime bundle contains generated WASM and JavaScript. Those assets are unchanged from the pinned upstream build; the local HTML entrypoint change and its date/hash are recorded separately. A legal reviewer must confirm whether the hosted app's integration or any combined-work facts create broader source/licensing obligations.
 
-These are release checks, not findings that distribution is prohibited. Before external distribution, choose the deployment/package model and obtain a qualified review of the bundled viewer and the combined application's license position.
+These are release checks, not findings that distribution is prohibited. The channel choice is recorded; release still needs an actual deployment origin, durable public source access, and qualified review of the bundled viewer and the combined application's license position.
 
 ## Reproducible provenance checks
 
