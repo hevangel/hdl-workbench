@@ -73,6 +73,22 @@ importers:
         specifier: 5.0.5
         version: 5.0.5(@types/node@24.10.0)(jsdom@30.1.3)(vite@8.3.5(@types/node@24.10.0)(yaml@2.9.1))
 
+  packages/wave-index:
+    dependencies:
+      '@xezim-ide/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      zod:
+        specifier: 4.6.7
+        version: 4.6.7
+    devDependencies:
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+      vitest:
+        specifier: 5.0.5
+        version: 5.0.5(@types/node@24.10.0)(jsdom@30.1.3)(vite@8.3.5(@types/node@24.10.0)(yaml@2.9.1))
+
   services/mcp-bridge:
     dependencies:
       '@modelcontextprotocol/server':
