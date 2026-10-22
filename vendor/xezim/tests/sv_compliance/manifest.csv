@@ -1,0 +1,52 @@
+file,topic,description
+01_lexical_identifiers.sv,lexical and identifiers,identifiers escaped identifiers comments strings
+02_preprocessor.sv,preprocessor,define ifdef include macros
+03_literal_values.sv,literal values,binary octal decimal hex x/z literals
+04_data_types.sv,data types,bit logic byte shortint int longint integer time realtime
+05_aggregate_types.sv,aggregate types,enum packed struct packed union
+06_arrays.sv,arrays,packed unpacked dynamic queue associative arrays
+07_operators_expressions.sv,operators and expressions,arithmetic bitwise reduction concat ternary shifts
+08_assignments.sv,assignments,continuous blocking nonblocking timing behavior
+09_control_flow.sv,procedural control flow,if case for while do-while
+10_tasks_functions.sv,tasks and functions,automatic function task ref and output args
+11_modules_ports_params.sv,modules ports parameters,parameterized module instantiation and named ports
+12_generate.sv,generate,if-generate and for-generate
+13_packages_imports.sv,packages and imports,package param and package function import
+14_interfaces_modports.sv,interfaces and modports,interface connectivity and modport directionality
+15_processes_events.sv,processes and events,event synchronization semaphore
+16_classes_oop.sv,classes and oop,class construction inheritance virtual dispatch
+17_randomization_constraints.sv,randomization and constraints,rand fields constraints randomize
+18_assertions_basic.sv,assertions,immediate and concurrent assertion
+19_covergroups_basic.sv,covergroups and coverage,coverpoint cross coverage get_inst_coverage
+20_clocking_blocks.sv,clocking blocks,clocking input output drive/sample behavior
+21_strings_typedef_casts.sv,strings typedefs casts,string methods typedef enum casts
+22_array_methods.sv,array methods,queue methods associative array methods dynamic array sum
+23_events_mailboxes_semaphores.sv,events mailboxes semaphores,event trigger wait mailbox semaphore
+24_fork_join_wait.sv,fork join and wait fork,join_any join_none wait fork behavior
+25_checker_blocks.sv,checker blocks,checker declaration and instantiation
+26_specify_blocks.sv,specify blocks,module path delays via specify
+27_constraints_advanced.sv,advanced constraints,inside relation and repeated randomize
+28_sva_sequences_advanced.sv,advanced sva,sequences properties disable iff
+29_coverage_cross_bins.sv,advanced coverage,cross bins and instance coverage
+30_let_construct.sv,let construct,reusable expression macro-style let
+31_user_defined_nettypes.sv,user-defined nettypes,nettype resolution function
+32_streaming_operators.sv,streaming operators,byte-lane stream packing and unpacking
+33_assignment_patterns.sv,assignment patterns,named and ordered assignment patterns for aggregates
+34_case_inside_ranges.sv,case inside,ranges and discrete items in case inside
+35_disable_fork.sv,process control,disable fork with named fork join_none
+36_tagged_union_patterns.sv,tagged unions,tagged packed union construction and field access
+37_z_skip_resolution.sv,resolution tier 0,z-skip in or-fold for wire tri tri0 tri1
+38_resolver_dispatch.sv,resolution tier 2,user-defined nettype resolver function dispatch
+39_builtin_nettype_resolution.sv,resolution tier 1,per-NetType fold for wand wor triand trior supply
+40_struct_nettype_resolution.sv,resolution tier 2,struct-typed nettype with real field and field-by-field resolver
+41_genfor_localparam_idx.sv,generate-for elaboration,genvar-dependent localparam init substituted per iteration
+42_typeparam_default_resolution.sv,type parameter defaults,non-overridden parameter type default resolved against overridden numeric params
+43_typedef_type_id_create.sv,typedef factory alias,typedef alias of parameterised class resolved via type_id::create factory path
+43_vif_writes.sv,virtual interface writes,blocking/NBA scalar+bit-select+vector writes through a virtual interface propagate to the bound instance
+43_packed_struct_assign.sv,packed struct assignment patterns,named/ordered patterns into packed struct packed by member offset; packed-2D element continuous assign emits full-width gate
+44_eenet_rnm.sv,user-defined nettypes for RNM,EEnet struct-of-real UDN with Millman/KCL resolution over 2-4 simultaneous drivers (DVCon EU 2019 TI/Cadence pattern)
+45_package_nettype.sv,user-defined nettypes in packages,nettype declared in a package used via wildcard import and qualified Pkg::name reference
+46_nettype_hierarchy.sv,user-defined nettypes across hierarchy,nettype nets driven from several module instances through ports; Millman resolution over a nested dut catches per-port double resolution
+47_nettype_coercion.sv,nettype coercion of implicit nets,implicit net used as a port actual takes the port user-defined nettype (§6.6.8/§23.3.3)
+49_specparam_hierarchical.sv,specparam hierarchical access,specparam is a module-scoped elaboration constant reachable by hierarchical name (§6.20.5/§23.3.3) including through generate scopes and specify-block uses
+50_wreal_nets.sv,Verilog-AMS wreal nets,net whose value is a real with multiple drivers resolved by summing (KCL current summing); scalar and port forms

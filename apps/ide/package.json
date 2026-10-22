@@ -7,7 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:wasm-browser": "node scripts/wasm-browser-acceptance.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "4.7.0",

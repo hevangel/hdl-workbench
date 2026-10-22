@@ -27,4 +27,5 @@ rustc-ice-*.txt
 node_modules/
 **/node_modules/
 **/dist/
+apps/ide/public/wasm/
 coverage/

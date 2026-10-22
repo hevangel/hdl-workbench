@@ -1,0 +1,1 @@
+module top; int q=7; function automatic int halt(); q<=1; $finish; q++; return 1; endfunction initial begin #5; q=halt(); q++; end final if(q==7) $display("PASS finish barrier"); else $display("FAIL finish barrier %0d",q); endmodule

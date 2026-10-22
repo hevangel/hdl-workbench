@@ -1,0 +1,60 @@
+module top;
+  int acc = 0;
+  int cnt = 0;
+  task automatic t(input int k); acc = acc + k + 1; cnt = cnt + 1; endtask
+  function automatic int f_desc(input int lo);
+    int s = 0;
+    for (int i = 1; i > lo; i--) s = s * 3 + i + 5;
+    return s;
+  endfunction
+  initial begin
+    for (int i = 1; i > -1; i--) t(i);
+    $display("T|desc acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = -2; i < 2; i++) t(i);
+    $display("T|neg_start acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = 3; i >= 0; i--) t(i);
+    $display("T|ge0 acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = 5; i > -6; i -= 2) t(i);
+    $display("T|minus_eq acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = 5; i > -6; i += -3) t(i);
+    $display("T|plus_neg acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = 4; i > -4; i = i - 1) t(i);
+    $display("T|assign_sub acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int unsigned i = 1; i > -1; i--) t(i);
+    $display("T|uint_vs_neg acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = 1; i >= 0; i--) t(i);
+    $display("T|ge0_from1 acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (byte i = 125; i > 0; i++) t(i);
+    $display("T|byte_wrap acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (shortint i = -3; i < 3; i++) t(i);
+    $display("T|shortint acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (longint i = -3; i < 3; i++) t(int'(i));
+    $display("T|longint acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (integer i = 2; i > -3; i--) t(i);
+    $display("T|integer acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (bit [2:0] i = 5; i != 2; i++) t(i);
+    $display("T|bit3_wrap acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (logic signed [3:0] i = -4; i < 3; i++) t(i);
+    $display("T|lsigned4 acc=%0d cnt=%0d", acc, cnt);
+    acc = 0; cnt = 0;
+    for (int i = -2; i < 2; i++) acc = acc * 7 + i;
+    $display("T|neg_val acc=%0d", acc);
+    acc = 0; cnt = 0;
+    for (int i = 2; i > -3; i--) acc = acc + (i < 0 ? 100 : 1);
+    $display("T|lt0_body acc=%0d", acc);
+    $display("T|fdesc %0d %0d %0d", f_desc(-1), f_desc(-3), f_desc(0));
+  end
+endmodule

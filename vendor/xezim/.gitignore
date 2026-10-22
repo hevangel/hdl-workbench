@@ -1,0 +1,80 @@
+target/
+**/target/
+**/*.rs.bk
+dump.vcd
+xezim_cov.json
+*.pat
+
+# Python bytecode and pytest state (contrib/cocotb and its tests)
+__pycache__/
+.pytest_cache/
+
+# Third-party Accellera UVM source — kept as a local working copy,
+# not vendored into the repo (see tests/uvm_integration_tests.rs).
+uvm-1.2/
+
+# Scratch notes — kept locally, not tracked
+/FUNCTIONAL-PARLOOP-SCOPE.md
+/HOT-ARENA-NOTES.md
+/IMPROVEMENT-SUGGESTIONS.md
+/IN-PLACE-SETTLE-SCOPE.md
+/JIT-REDESIGN-NOTES.md
+/PARALLELIZATION-ALTERNATIVES.md
+/SESSION-3-SUMMARY.md
+/SESSION-4-SUMMARY.md
+/SESSION-SUMMARY.md
+/docs/TRACING.md
+
+# Simulation / build artifacts — never commit (caused a >100MB GitHub push reject)
+*.vvp
+*.xt
+*.xt.bz2
+*.vcd
+uvm-2017-1.0.so
+uvm-2020.3.1.so
+.claude/
+scratchpad/
+
+# editor cruft
+*.swp
+*.swo
+*~
+
+# one-off helper/scratch fragments
+*.new_helper
+
+# UVM benchmark result CSVs (bench/run_uvm_bench.sh)
+bench_uvm_*.csv
+tr_db.log
+
+# Files a test run drops in the REPO ROOT. The testcases `$fopen` these with a
+# relative path, so they land in whatever directory `cargo test` ran from —
+# they are outputs, not fixtures. PR #99 committed several of them by accident.
+#   fscanf_pos_tmp.txt  tests/classes/nonvirtual_dispatch_fscanf_process.rs
+#   ch21_memdump.dec    $readmemh/$writememh round-trip case
+#   /work/              ivtest-derived cases writing work/{temp,test,...}
+# `/work/` is deliberately root-anchored: `simtest/xuantie_c906/work/c906.fl`
+# is a tracked fixture and an unanchored `work/` would swallow it.
+fscanf_pos_tmp.txt
+ch21_memdump.dec
+/work/
+
+# Test fixtures must never land in the repo root (tests write to the
+# system temp dir); belt-and-braces in case an old binary runs here.
+audit45_feof_tmp.txt
+fscanf_pos_tmp.txt
+c10_tmp.txt
+
+Cargo.lock
+
+# Repo-local cargo config written by scripts/use-local-core.sh (per-machine)
+/.cargo/config.toml
+# A nested local xezim-core checkout used via use-local-core.sh
+/xezim-core/
+
+# Local PGO/experiment build dirs (cargo-local variants)
+target-*/
+
+# Local-only working notes (perf resume docs etc.) — never published.
+*_RESUME.md
+*-target/
