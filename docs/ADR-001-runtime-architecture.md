@@ -24,7 +24,8 @@ The current worker operation combines compile and run. It does not yet conform t
 
 ## Consequences
 
-- Native DPI/VPI, libffi/libloading, JIT/AOT, arbitrary host file access, FST/XTrace, profiling, and pause/resume are outside the initial browser profile unless later feasibility tests prove otherwise.
+- Native shared-library DPI/VPI loading, libffi/libloading, JIT/AOT, arbitrary host file access, FST/XTrace, profiling, and pause/resume are outside the browser profile. A later browser-specific extension is verified for scalar `int` DPI imports backed by standalone C/C++-compiled Wasm modules; it does not add the native dynamic-loader path. See the [LUNA-11 DPI/C/C++ report](luna-11-dpi-c-cpp-report.md) and [LUNA-15 MCP end-to-end report](luna-15-dpi-agent-flow-report.md).
+- The browser DPI profile is intentionally narrow: imported functions return `int` and accept only scalar `input int` arguments. DPI tasks, output/ref/inout arguments, strings, real values, vectors, aggregates, open arrays, callbacks into SV, and time-suspending calls remain unsupported. Do not infer those capabilities from native Xezim or from the browser C/C++ compiler.
 - Includes, `$readmem*`, `$fopen`, and logging have explicit project-virtual-file behavior only for the documented and tested subset. Unsupported tasks must return deliberate diagnostics.
 - The browser runtime uses an explicit single-thread entry point, a virtual-file provider, an injected output sink, and a bounded in-memory VCD writer. Native file behavior remains available and covered by the upstream suite.
 - Optional simulation operations such as cancellation, current-value lookup, historical transition queries, and unverified viewer controls are not supported by this decision. Add them only with implementations and acceptance tests.

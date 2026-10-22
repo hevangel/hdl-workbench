@@ -23,7 +23,23 @@ pnpm demo
 - Stop time is limited to 10,000,000 integer nanoseconds. Fractional nanosecond stop times are rejected.
 - Returned stdout is limited by the request to 1 MiB by default and at most 16 MiB. A complete VCD is limited to 64 MiB per artifact; OPFS retains at most 8 artifacts and 128 MiB of VCD data. Browser quota can be lower, and persistent-storage requests can be denied.
 - The Worker has a 300-second wall-time termination guard and a 256 MiB WebAssembly linear-memory maximum. These do not bound total browser-process memory, console-output accumulation before truncation, or per-event work. Large projects, designs with deep recursion, and large simulations still need device-specific validation.
-- Supported browser simulation does not include native DPI-C/VPI plugins, Cranelift JIT/AOT, native threads, Python/cocotb, arbitrary host file access, full UVM parity, FST output, or pausable interactive simulation. Do not infer support from native Xezim.
+- Browser simulation does not load native DPI-C/VPI plugins or native shared libraries. A separate restricted browser DPI profile is available; see below. Cranelift JIT/AOT, native threads, Python/cocotb, arbitrary host file access, full UVM parity, FST output, and pausable interactive simulation are not supported. Do not infer support from native Xezim.
+
+## Browser C/C++ DPI profile
+
+Project `.c`, `.cc`, `.cpp`, and `.cxx` files can be compiled to standalone
+WebAssembly modules in a dedicated browser Worker with the pinned `browsercc`
+0.1.1 Clang/LLD toolchain. Xezim WASM can call a DPI-imported function when it
+returns SystemVerilog `int` and every parameter is scalar `input int`. C++ DPI
+functions must use `extern "C"` so their exports match the imported symbol.
+
+This profile does not load `.so`/`.dll` files and does not provide the native
+libffi dispatcher. It also does not support DPI tasks, output/ref/inout
+arguments, strings, real values, vectors, aggregates, open arrays, callbacks
+into SV, exported SV functions/tasks, or time-suspending calls. Generated Wasm
+modules must be standalone and import-free. See the detailed
+[browser DPI/C/C++ report](luna-11-dpi-c-cpp-report.md) and the
+[MCP-to-browser integration report](luna-15-dpi-agent-flow-report.md).
 
 ## Native compatibility
 
