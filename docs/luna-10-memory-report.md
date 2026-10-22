@@ -9,6 +9,16 @@ The browser Xezim artifact is linked with a 256 MiB maximum WebAssembly linear m
 
 The limit is scoped to WebAssembly linear memory. It does not bound the browser process, JavaScript strings, VCD buffers, browser storage, or other process memory. A minimum supported device profile has not yet been defined, so these desktop measurements do not close the minimum-device release gate.
 
+## Validation host reference
+
+The host used for these browser checks reported Windows `10.0.26300`, 63.9 GiB RAM, an AMD Ryzen 9 5950X, and 32 logical processors. Reproduce the inventory with:
+
+```powershell
+node -e 'const os=require("node:os"); console.log(JSON.stringify({platform:os.platform(),release:os.release(),totalRamGiB:+(os.totalmem()/1024**3).toFixed(1),logicalCpuCount:os.cpus().length,cpuModel:os.cpus()[0]?.model},null,2))'
+```
+
+This is a high-resource reference workstation, not the v1 minimum. The accepted browser test measures `WebAssembly.Memory.buffer.byteLength`; this report has no reliable whole-browser process high-water measurement. No device support claim should be inferred from the figures below.
+
 ## Reproduce the browser WASM build
 
 Use Rust/Cargo 1.99.1 and wasm-bindgen CLI 0.2.129:
