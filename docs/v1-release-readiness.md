@@ -49,6 +49,7 @@ pnpm demo
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
 | Full Chromium + Firefox E2E on current branch | Pass; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. |
 | WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
+| Whole-browser process memory reference | Sampled in Chromium and Firefox on a 64 GiB Ryzen 9 5950X workstation; minimum profile remains undefined | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` and `-- firefox`; see `docs/luna-10-memory-report.md`. |
 | Official MCP Inspector CLI | Pass; targeted Inspector test ran | `pnpm --filter @xezim-ide/mcp-bridge test:inspector`; see `docs/luna-10-memory-report.md`. |
 | Codex CLI ↔ browser pairing, edit, and run | Pass with Codex CLI `0.163.0` and Chromium `156.0.8078.4` | `pnpm --filter @xezim-ide/mcp-bridge smoke:codex`; ephemeral CLI config, temporary project, real Xezim WASM simulation. |
 | Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
@@ -77,5 +78,5 @@ pnpm demo
 ## Next release gates
 
 1. Push this branch or open its PR after GitHub authentication/network access is restored, then run `.github/workflows/luna09-browser-e2e.yml` and retain the hosted logs; local Linux-builder results are documented, but hosted CI remains pending.
-2. Define the minimum supported browser/device and measure total process memory and stress limits there; keep large designs out of v1 claims until measured.
+2. Define the minimum supported browser/device and repeat the whole-browser memory profile and stress workload there; the current 64 GiB workstation figures are reference-only, so keep large-design claims out of v1 until the target is measured.
 3. Choose the release format, keep the linked license and source/provenance available in that channel, and obtain qualified review of the Surfer bundle and combined application. The [technical inventory and panel notice](surfer-distribution-review.md) are complete; this release gate is not.

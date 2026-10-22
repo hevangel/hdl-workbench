@@ -17,7 +17,27 @@ The host used for these browser checks reported Windows `10.0.26300`, 63.9 GiB R
 node -e 'const os=require("node:os"); console.log(JSON.stringify({platform:os.platform(),release:os.release(),totalRamGiB:+(os.totalmem()/1024**3).toFixed(1),logicalCpuCount:os.cpus().length,cpuModel:os.cpus()[0]?.model},null,2))'
 ```
 
-This is a high-resource reference workstation, not the v1 minimum. The accepted browser test measures `WebAssembly.Memory.buffer.byteLength`; this report has no reliable whole-browser process high-water measurement. No device support claim should be inferred from the figures below.
+This is a high-resource reference workstation, not the v1 minimum. The whole-browser profiles below are sampled peaks, not guaranteed absolute high-water marks. No device support claim should be inferred from these figures.
+
+## Whole-browser process profile (reference host)
+
+The profiler runs the same 4.3-million-word direct WASM allocation trap, 1-million-word Worker completion, over-limit Worker `RESOURCE_LIMIT`, and fresh-Worker recovery scenario while sampling the launched browser's process set. Chromium process IDs come from its browser CDP session; Firefox is scoped to the Playwright-launched process tree. On Windows, resident and private bytes are collected every 50 ms from those processes. The aggregate resident-set sum can count shared pages more than once; private bytes are a second measure where available.
+
+Reproduce with installed Playwright browsers and local-loopback access:
+
+```powershell
+pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium
+pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- firefox
+```
+
+Results from this host:
+
+| Browser | Browser processes | Samples | Peak aggregate resident | Peak aggregate private |
+| --- | ---: | ---: | ---: | ---: |
+| Chromium | 4 | 12 | 844.1 MiB | 796.3 MiB |
+| Firefox | 7 | 8 | 1,247.0 MiB | 1,317.6 MiB |
+
+Both profiles observed the 255,524,864-byte direct WASM allocation trap, successful supported Worker workload, over-limit `RESOURCE_LIMIT`, and recovery run. These desktop figures do not close the minimum-device gate; repeat on the product's chosen minimum browser/device profile before making memory claims.
 
 ## Reproduce the browser WASM build
 
