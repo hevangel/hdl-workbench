@@ -1,0 +1,281 @@
+{
+  "result": "passed",
+  "browser_version": "152.0.4-beta.30",
+  "url": "http://127.0.0.1:4216/",
+  "same_origin": true,
+  "verified": [
+    "same-origin VCD load",
+    "AddVariables top.count",
+    "CursorSet 25 ns",
+    "ZoomToRange 0-40 ns",
+    "iframe reload readiness handshake"
+  ],
+  "screenshot_bytes_before_zoom": 35222,
+  "screenshot_bytes_after_zoom": 34510,
+  "console_errors": [],
+  "page_errors": [],
+  "console": [
+    {
+      "type": "warning",
+      "text": "[JavaScript Warning: \"Layout was forced before the page was fully loaded. If stylesheets are not yet loaded this may cause a flash of unstyled content.\" {file: \"http://127.0.0.1:4216/surfer/index.html#dev\" line: 0}]",
+      "url": "http://127.0.0.1:4216/surfer/index.html#dev"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wasm_panic.rs:63  Hook set up",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/batch_commands.rs:84  Parsing batch commands",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "warning",
+      "text": "[JavaScript Warning: \"WEBGL_debug_renderer_info is deprecated in Firefox and will be removed. Please use RENDERER.\" {file: \"http://127.0.0.1:4216/surfer/surfer.js\" line: 836}]",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"http://127.0.0.1:4216/fixtures/counter.vcd\", Clear)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:116  Wave source is url",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: http://127.0.0.1:4216/fixtures/counter.vcd",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"http://127.0.0.1:4216/fixtures/counter.vcd\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(724ms), Url(\"http://127.0.0.1:4216/fixtures/counter.vcd\"), Clear, ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of http://127.0.0.1:4216/fixtures/counter.vcd in 17ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/state.rs:301  VCD file loaded",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(741ms), Url(\"http://127.0.0.1:4216/fixtures/counter.vcd\"), ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1269  Loaded the body of http://127.0.0.1:4216/fixtures/counter.vcd in 18ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(911ms), ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 18ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  ZoomToRange { start: 0, end: 40, viewport_idx: 0 }",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "warning",
+      "text": "[JavaScript Warning: \"Layout was forced before the page was fully loaded. If stylesheets are not yet loaded this may cause a flash of unstyled content.\" {file: \"http://127.0.0.1:4216/surfer/index.html#dev\" line: 0}]",
+      "url": "http://127.0.0.1:4216/surfer/index.html#dev"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wasm_panic.rs:63  Hook set up",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/batch_commands.rs:84  Parsing batch commands",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "warning",
+      "text": "[JavaScript Warning: \"WEBGL_debug_renderer_info is deprecated in Firefox and will be removed. Please use RENDERER.\" {file: \"http://127.0.0.1:4216/surfer/surfer.js\" line: 836}]",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"http://127.0.0.1:4216/fixtures/counter.vcd\", Clear)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:116  Wave source is url",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: http://127.0.0.1:4216/fixtures/counter.vcd",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"http://127.0.0.1:4216/fixtures/counter.vcd\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(285ms), Url(\"http://127.0.0.1:4216/fixtures/counter.vcd\"), Clear, ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of http://127.0.0.1:4216/fixtures/counter.vcd in 17ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/state.rs:301  VCD file loaded",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(303ms), Url(\"http://127.0.0.1:4216/fixtures/counter.vcd\"), ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1269  Loaded the body of http://127.0.0.1:4216/fixtures/counter.vcd in 16ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(320ms), ..)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 16ms",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    },
+    {
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)",
+      "url": "http://127.0.0.1:4216/surfer/surfer.js"
+    }
+  ],
+  "screenshots": [
+    "01-surfer-ready.png",
+    "02-vcd-loaded.png",
+    "03-signal-and-cursor.png",
+    "04-zoomed.png",
+    "05-reloaded-and-controlled.png"
+  ]
+}

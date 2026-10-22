@@ -12,7 +12,7 @@ The product requires simulation to execute Xezim WebAssembly in a dedicated brow
 
 The initial feasibility checks exposed `getrandom` target-feature and `libffi-sys` build-script blockers. The later LUNA-03/LUNA-04 patch set target-gated native FFI, C shims, linker options, and platform-only code while retaining native defaults. The pinned parser/core/Xezim checks, release WASM build, real Firefox Worker counter/VCD fixture, and full native Xezim suite then passed. See the [LUNA-04 report](luna-04-virtual-files-report.md) for the reproducible commands, artifact digest, test counts, and current limits.
 
-LUNA-00B built Surfer v0.7.0 from `bd749b1f786c1c62cd67893ca71346cbe6983915` under EUPL-1.2. Its real browser test loaded a counter VCD through same-origin HTTP and Blob URLs, added `top.count`, and moved the cursor to 25 ns. The redistributed WASM SHA-256 is `1341ad01c59f5169209239728417d14f430183abd92515f22bf07cd7c86937ae`. Upstream marks the inner `InjectMessage` API unstable; keep it isolated behind a versioned adapter. The test did not verify zoom, WCP host exports, large-waveform performance, or production Chromium.
+LUNA-00B built Surfer v0.7.0 from `bd749b1f786c1c62cd67893ca71346cbe6983915` under EUPL-1.2. Its real browser test loaded a counter VCD through same-origin HTTP and Blob URLs, added `top.count`, and moved the cursor to 25 ns. The redistributed WASM SHA-256 is `1341ad01c59f5169209239728417d14f430183abd92515f22bf07cd7c86937ae`. LUNA-05 embedded this bundle in the IDE and passed same-origin VCD load, signal-add, cursor, zoom, and iframe-reload checks in Camoufox Firefox. Upstream marks the inner `InjectMessage` API unstable; keep it isolated behind the versioned adapter. WCP host exports, large-waveform performance, and production Chromium remain unverified.
 
 ## Decision
 
@@ -20,7 +20,7 @@ Keep the product boundary as Xezim WASM in a dedicated browser Worker, with no i
 
 Freeze application-facing interface shapes only as described in ADR-002, after review of both feasibility results. Keep concrete wasm-bindgen signatures, Xezim internal file-provider APIs, Surfer inner messages, readiness wire protocol, and waveform URL transport behind their adapters. Do not expose an adapter capability merely because its interface is frozen.
 
-The current worker operation combines compile and run. It does not yet conform to every separate compile/run operation in `SimulationService`; full protocol mapping, a fixed WASM memory ceiling, and complete work-budget enforcement remain open. Surfer load, signal addition, and cursor movement are proven only for the pinned test build and tested Firefox environment. Zoom and WCP remain unavailable until separately verified.
+The current worker operation combines compile and run. It does not yet conform to every separate compile/run operation in `SimulationService`; full protocol mapping, a fixed WASM memory ceiling, and complete work-budget enforcement remain open. Surfer load, signal addition, cursor movement, and zoom are proven only for the pinned test build and tested Firefox environment. `loadWaveform` uses an injected artifact URL resolver and resolves after the wrapper message is posted; the pinned wrapper does not expose an asynchronous waveform-load acknowledgment. WCP remains unavailable.
 
 ## Consequences
 

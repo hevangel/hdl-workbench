@@ -115,7 +115,9 @@ button { color: inherit; }
 .editor-empty { display: grid; width: 100%; height: 100%; place-items: center; color: #778293; font-size: 12px; }
 .bottom-panel { display: flex; min-height: 0; flex-direction: column; border-top: 1px solid var(--border); background: #10141a; }
 .panel-tabs { display: flex; height: 37px; flex: 0 0 37px; align-items: center; gap: 22px; border-bottom: 1px solid var(--border-soft); padding: 0 17px; }
-.panel-tab { display: flex; height: 100%; align-items: center; gap: 8px; color: #778293; font-size: 9px; font-weight: 700; letter-spacing: .08em; }
+.panel-tab { display: flex; height: 100%; align-items: center; gap: 8px; border: 0; border-bottom: 1px solid transparent; padding: 0; color: #778293; background: transparent; font-size: 9px; font-weight: 700; letter-spacing: .08em; cursor: pointer; }
+.panel-tab:hover { color: #bbc6d3; }
+.panel-tab:focus-visible { outline: 1px solid var(--mint); outline-offset: -2px; }
 .panel-tab.active { border-bottom: 1px solid var(--mint); color: #c4d0dc; }
 .count-pill { display: inline-grid; min-width: 16px; height: 16px; place-items: center; border-radius: 9px; padding: 0 4px; color: #f1959b; background: #3d242b; font-size: 9px; }
 .panel-spacer { flex: 1; }
@@ -133,6 +135,17 @@ button { color: inherit; }
 .empty-panel span:last-child { color: #687587; }
 .checkmark { color: #70c5a5; font-size: 13px; }
 .output-preview { overflow: auto; margin: 0; border-left: 1px solid var(--border-soft); padding: 12px 13px; color: #8e9aaa; background: #0d1117; font-family: var(--mono); font-size: 10px; line-height: 1.7; white-space: pre-wrap; }
+.output-full { min-height: 0; flex: 1; overflow: auto; margin: 0; padding: 12px 14px; color: #a6b2c0; background: #0d1117; font-family: var(--mono); font-size: 10px; line-height: 1.7; white-space: pre-wrap; }
+.waveform-panel-content { display: flex; min-height: 0; flex: 1; overflow: hidden; }
+.surfer-panel { display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; }
+.surfer-toolbar { display: flex; min-height: 34px; flex: 0 0 34px; align-items: center; gap: 7px; border-bottom: 1px solid var(--border-soft); padding: 0 9px; background: #11151c; }
+.surfer-readiness { margin-right: auto; color: #8995a4; font-family: var(--mono); font-size: 9px; }
+.surfer-readiness.ready { color: #82d1b2; }
+.surfer-toolbar button { height: 24px; border: 1px solid #364150; border-radius: 4px; padding: 0 7px; color: #bac5d2; background: #1b222c; font-size: 9px; cursor: pointer; }
+.surfer-toolbar button:hover:not(:disabled) { border-color: #5a8e83; color: #d9f5ec; background: #1c302f; }
+.surfer-toolbar button:disabled { opacity: .45; cursor: not-allowed; }
+.surfer-message { max-width: 28%; overflow: hidden; color: #edb0a8; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.surfer-frame { display: block; width: 100%; min-height: 0; flex: 1; border: 0; background: #fff; }
 .status-bar { display: flex; align-items: center; gap: 20px; border-top: 1px solid #27312f; padding: 0 12px; color: #91a39e; background: #16211f; font-family: var(--mono); font-size: 9px; }
 .status-bar span:first-child { display: inline-flex; align-items: center; gap: 6px; margin-right: auto; }
 .status-dot.green { width: 6px; height: 6px; background: #71cfaa; box-shadow: 0 0 7px #71cfaa66; }
@@ -155,6 +168,9 @@ button { color: inherit; }
   .mock-badge { font-size: 8px; }
   .panel-content { grid-template-columns: minmax(0, 1fr); }
   .output-preview { display: none; }
+  .surfer-toolbar { gap: 4px; padding: 0 5px; }
+  .surfer-toolbar button { padding: 0 5px; font-size: 8px; }
+  .surfer-message { display: none; }
 }
 
 @media (max-width: 620px) {

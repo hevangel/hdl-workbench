@@ -131,6 +131,17 @@ describe("IDE shell", () => {
     expect(new TextDecoder().decode(saved.bytes)).toContain(marker);
   });
 
+  it("opens the pinned Surfer panel with a clearly labeled sample VCD", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(screen.getByRole("tab", { name: "WAVEFORMS" }));
+
+    expect(await screen.findByTitle("Surfer waveform viewer")).toHaveAttribute("src", "/surfer/index.html#dev");
+    expect(screen.getByRole("button", { name: "Load sample VCD" })).toBeInTheDocument();
+    expect(screen.getByText("Loading Surfer v0.7.0…")).toBeInTheDocument();
+  });
+
   it("disables run controls while a mock run is in flight", async () => {
     const user = userEvent.setup();
     let releaseRun: ((result: RunResult) => void) | undefined;

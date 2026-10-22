@@ -31,7 +31,7 @@ class Links(HTMLParser):
             self.title = data.strip()
 
 
-queue = [BASE_URL, *(urljoin(BASE_URL, name) for name in ("assets/", "wasm/", "fixtures/"))]
+queue = [BASE_URL, *(urljoin(BASE_URL, name) for name in ("assets/", "wasm/", "fixtures/", "surfer/"))]
 visited = set()
 while queue:
     url = queue.pop(0)

@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type WorkspaceAdapter } from "@xezim-ide/protocol";
+import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type SurferAdapter, type WorkspaceAdapter } from "@xezim-ide/protocol";
 import { EditorSurface } from "./editor/EditorSurface.js";
 import { createMockServices } from "./mockServices.js";
 import { useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
 import type { PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
 import { exportProjectZip } from "./workspace/projectArchive.js";
+import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
 interface EditorFile {
@@ -17,6 +18,7 @@ interface AppProps {
   workspace?: WorkspaceAdapter;
   simulation?: SimulationService;
   projectManager?: PersistentWorkspaceManager;
+  onSurferAdapterChange?: (adapter: SurferAdapter | null) => void;
 }
 
 const demoServices = createMockServices();
@@ -25,7 +27,7 @@ function fileName(path: string): string {
   return path.split("/").at(-1) ?? path;
 }
 
-export function App({ workspace, simulation = demoServices.simulation, projectManager }: AppProps) {
+export function App({ workspace, simulation = demoServices.simulation, projectManager, onSurferAdapterChange }: AppProps) {
   const [workspaceService, setWorkspaceService] = useState<WorkspaceAdapter>(() => workspace ?? projectManager?.getWorkspace() ?? demoServices.workspace);
   const [activeProject, setActiveProject] = useState<WorkspaceProject>(() => projectManager?.activeProject ?? {
     id: "demo-project" as ProjectId,
@@ -47,6 +49,7 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
   const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
   const [workspaceMessage, setWorkspaceMessage] = useState("");
   const [fileActionsOpen, setFileActionsOpen] = useState(false);
+  const [activePanel, setActivePanel] = useState<"problems" | "output" | "waveforms">("problems");
   const projectArchiveInput = useRef<HTMLInputElement>(null);
   const [layout, setLayout] = useLayoutPreferences();
   const revisionByPath = useRef(new Map<ProjectPath, string>());
@@ -593,9 +596,15 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
             <EditorSurface path={activePath} value={activeFile?.content ?? ""} diagnostics={diagnostics} onChange={handleEdit} />
           </div>
 
-          <section className="bottom-panel" aria-label="Diagnostics and output">
-            <div className="panel-tabs"><div className="panel-tab active" role="heading" aria-level={2}>PROBLEMS <span className="count-pill">{diagnostics.filter((item) => item.severity === "error").length}</span></div><div className="panel-tab" role="heading" aria-level={2}>OUTPUT</div><span className="panel-spacer" /><span className="panel-caption">Mock adapter response</span></div>
-            <div className="panel-content">
+          <section className="bottom-panel" aria-label="Diagnostics, output and waveform viewer">
+            <div className="panel-tabs" role="tablist" aria-label="Bottom panel">
+              <button type="button" role="tab" aria-selected={activePanel === "problems"} className={`panel-tab ${activePanel === "problems" ? "active" : ""}`} onClick={() => setActivePanel("problems")}>PROBLEMS <span className="count-pill">{diagnostics.filter((item) => item.severity === "error").length}</span></button>
+              <button type="button" role="tab" aria-selected={activePanel === "output"} className={`panel-tab ${activePanel === "output" ? "active" : ""}`} onClick={() => setActivePanel("output")}>OUTPUT</button>
+              <button type="button" role="tab" aria-selected={activePanel === "waveforms"} className={`panel-tab ${activePanel === "waveforms" ? "active" : ""}`} onClick={() => setActivePanel("waveforms")}>WAVEFORMS</button>
+              <span className="panel-spacer" />
+              {activePanel !== "waveforms" && <span className="panel-caption">Mock adapter response</span>}
+            </div>
+            {activePanel === "problems" && <div className="panel-content">
               <section className="diagnostics-list" aria-label="Diagnostics">
                 {diagnostics.length === 0 ? (
                   <div className="empty-panel"><span className="checkmark">✓</span> No diagnostics yet <span>Run the mock checks to see editor markers.</span></div>
@@ -609,7 +618,9 @@ export function App({ workspace, simulation = demoServices.simulation, projectMa
                 ))}
               </section>
               <pre className="output-preview" aria-label="Run output">{log}</pre>
-            </div>
+            </div>}
+            {activePanel === "output" && <pre className="output-full" aria-label="Run output">{log}</pre>}
+            {activePanel === "waveforms" && <div className="waveform-panel-content"><SurferWaveformPanel {...(onSurferAdapterChange ? { onAdapterChange: onSurferAdapterChange } : {})} /></div>}
           </section>
 
           <footer className="status-bar"><span><i className="status-dot green" /> {activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>

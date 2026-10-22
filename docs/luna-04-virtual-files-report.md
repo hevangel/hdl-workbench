@@ -78,7 +78,7 @@ The native VFS wrapper test and browser harness check the same expected counter 
 
 ## Recommended next tasks
 
-1. Implement LUNA-05 around the pinned Surfer bundle and the proven load, signal-add, and cursor operations. Keep the tested unstable inner messages behind a versioned adapter; verify zoom and a production Chromium browser before enabling them.
-2. Complete the LUNA-06 persistence acceptance against a supported production browser, including physical quota/out-of-space behavior and normal page-entry startup.
-3. Add memory/work-budget enforcement and map this combined worker operation onto the frozen protocol without advertising unimplemented historical queries or cancellation.
-4. Keep the passing full native Xezim suite as a compatibility gate for all future browser-only changes.
+1. LUNA-05 now embeds the pinned Surfer bundle and passes load, signal-add, cursor, zoom, and iframe reload in Camoufox Firefox. See the [LUNA-05 report](luna-05-surfer-adapter-report.md). Verify production Chromium, large-waveform performance, WCP exports, and artifact-load completion semantics before release.
+2. LUNA-06 persistence passes the available Firefox workflow; verify ordinary page-entry startup in supported browsers and exercise physical quota/eviction behavior.
+3. Implement LUNA-07 MCP bridge and LUNA-08 deterministic historical VCD queries, then wire both through LUNA-09 E2E without enabling unsupported operations.
+4. Add memory/work-budget enforcement and complete the Xezim `SimulationService` mapping. Keep the passing full native Xezim suite as a compatibility gate for future browser-only changes.
