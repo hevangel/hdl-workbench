@@ -23,7 +23,7 @@ The Run button calls the same browser controller `execute()` method as the authe
 ## Known limits
 
 - The Xezim Worker currently accepts integer nanosecond stop times up to 10,000,000 ns. Requests that would need fractional-nanosecond rounding are rejected.
-- The current browser API cannot enforce `maxSteps`, cancellation inside Xezim, arbitrary VCD scope selection, or a fixed WASM memory ceiling. These fields are absent from `simulation.execute`; wall-time termination is enforced by terminating the Worker.
+- The current browser API cannot enforce `maxSteps`, cancellation inside Xezim, or arbitrary VCD scope selection. The runtime has a fixed 256 MiB WebAssembly linear-memory maximum from target linker settings, not a per-request memory field; the Worker reports allocation traps near the ceiling as `RESOURCE_LIMIT`. Wall-time termination is enforced by terminating the Worker. No per-event or instruction-count budget is available.
 - Existing separate compile/run RPC operations remain unavailable in this browser implementation.
 - The Surfer adapter confirms dispatch after readiness but has no asynchronous VCD parse-completion acknowledgment.
 

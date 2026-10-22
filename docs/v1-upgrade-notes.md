@@ -18,11 +18,11 @@ pnpm demo
 
 ## Runtime and data limits
 
-- Browser execution is a one-shot Xezim compile-and-run operation in a Web Worker. The UI and MCP bridge share that operation. Separate compile/run handles, in-run cancellation, `maxSteps`, and a fixed WASM linear-memory ceiling are not available.
+- Browser execution is a one-shot Xezim compile-and-run operation in a Web Worker. The UI and MCP bridge share that operation. Separate compile/run handles, in-run cancellation, and `maxSteps` are not available. A target-specific 256 MiB WebAssembly linear-memory maximum applies to each simulator Worker; allocation traps near the ceiling return `RESOURCE_LIMIT` and the Worker is terminated.
 - Browser project input is capped at 4,096 files and 16 MiB total UTF-8 path plus contents. The MCP filesystem bridge separately caps snapshots at 4,096 files and 64 MiB total, with individual files capped at 16 MiB; Xezim's lower 16 MiB input cap applies when running them in-browser.
 - Stop time is limited to 10,000,000 integer nanoseconds. Fractional nanosecond stop times are rejected.
 - Returned stdout is limited by the request to 1 MiB by default and at most 16 MiB. A complete VCD is limited to 64 MiB per artifact; OPFS retains at most 8 artifacts and 128 MiB of VCD data. Browser quota can be lower, and persistent-storage requests can be denied.
-- The Worker has a wall-time termination guard, but no hard linear-memory ceiling. Large projects, designs with deep recursion, or large simulations need device-specific validation.
+- The Worker has a 300-second wall-time termination guard and a 256 MiB WebAssembly linear-memory maximum. These do not bound total browser-process memory, console-output accumulation before truncation, or per-event work. Large projects, designs with deep recursion, and large simulations still need device-specific validation.
 - Supported browser simulation does not include native DPI-C/VPI plugins, Cranelift JIT/AOT, native threads, Python/cocotb, arbitrary host file access, full UVM parity, FST output, or pausable interactive simulation. Do not infer support from native Xezim.
 
 ## Native compatibility

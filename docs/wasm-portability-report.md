@@ -90,11 +90,12 @@ xezim-core/xezim-parser is a Rust library with only optional serde/serde_json de
 5. Reuse VcdSink::inline with an in-memory writer that enforces a byte limit. Adapt waveform setup to accept that writer, while retaining native file output. Capture simulator messages through an injected sink.
 6. Re-run the parser → core with defaults off → reduced Xezim sequence on a Rust 1.92+ host. Only after compile results, add a real browser Worker counter test and compare native versus WASM output. Keep native regression tests in the same patch set.
 
-## Final gate status after LUNA-03/LUNA-04
+## Gate status after LUNA-03/LUNA-04 (updated after LUNA-10)
 
 - **Confirmed:** the exact Xezim/core pins; the parser, core, and Xezim WASM build path after target-gating native features; release WASM and wasm-bindgen output; a real browser Worker counter and VCD fixture; and the complete native Xezim suite with the default filesystem-backed behavior preserved.
 - **Historical blockers:** the initial no-toolchain check and the later baseline `getrandom`/`libffi-sys` build failures are recorded above and in [the build-gate follow-up](wasm-build-gate-followup.md). They drove the minimal target-gating patch strategy; they are no longer current build blockers for the tested bounded profile.
-- **Still open:** the combined compile/run wrapper is not a full `SimulationService` mapping; no fixed WASM memory ceiling is enforced; the output cap truncates the returned string after collection; and untested tasks/large workloads remain unsupported.
+- **Later hardening:** LUNA-10 added a 256 MiB WebAssembly linear-memory maximum and a 300-second Worker wall-time limit. Chromium and Firefox acceptance tests confirmed allocation failure reports `RESOURCE_LIMIT` and a fresh Worker can recover. The sampled whole-browser profile is reference-host data only; the minimum-device memory gate remains open.
+- **Still open:** the combined compile/run wrapper is not a full `SimulationService` mapping; console output is truncated only after Xezim has collected it, so accumulation itself is not bounded; there is no per-event or instruction-count budget; and untested tasks/large workloads remain unsupported.
 - **Interface freeze:** application-facing contracts were frozen only after reviewing both the completed Xezim and Surfer feasibility results; see [ADR-002](ADR-002-interface-contracts.md). The Surfer adapter still enables only individually verified operations.
 
 Use the reproduction commands and results in [LUNA-04](luna-04-virtual-files-report.md) for the final build and native/browser acceptance evidence.

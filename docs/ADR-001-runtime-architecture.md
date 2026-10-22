@@ -20,7 +20,7 @@ Keep the product boundary as Xezim WASM in a dedicated browser Worker, with no i
 
 Freeze application-facing interface shapes only as described in ADR-002, after review of both feasibility results. Keep concrete wasm-bindgen signatures, Xezim internal file-provider APIs, Surfer inner messages, readiness wire protocol, and waveform URL transport behind their adapters. Do not expose an adapter capability merely because its interface is frozen.
 
-The current worker operation combines compile and run. It does not yet conform to every separate compile/run operation in `SimulationService`; full protocol mapping, a fixed WASM memory ceiling, and complete work-budget enforcement remain open. Surfer load, signal addition, cursor movement, and zoom are proven only for the pinned test build and tested Firefox environment. `loadWaveform` uses an injected artifact URL resolver and resolves after the wrapper message is posted; the pinned wrapper does not expose an asynchronous waveform-load acknowledgment. WCP remains unavailable.
+The current worker operation combines compile and run. It does not yet conform to every separate compile/run operation in `SimulationService`. LUNA-10 added a target-specific 256 MiB WebAssembly linear-memory maximum and a 300-second Worker wall-time limit; a per-event or instruction-count budget remains unavailable. Surfer load, signal addition, cursor movement, and zoom are proven only for the pinned test build and tested Firefox environment. `loadWaveform` uses an injected artifact URL resolver and resolves after the wrapper message is posted; the pinned wrapper does not expose an asynchronous waveform-load acknowledgment. WCP remains unavailable.
 
 ## Consequences
 

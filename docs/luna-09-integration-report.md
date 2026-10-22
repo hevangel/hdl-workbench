@@ -52,7 +52,7 @@ The browser test uses the Xezim counter fixture with `$dumpfile` and `$dumpvars`
 
 - The browser Xezim entrypoint remains combined compile-and-run. Separate compile handles, instruction-step budgeting, and mid-run cancellation are not implemented and are not advertised.
 - Worker execution uses the existing integer-nanosecond stop-time interface and its 10,000,000 ns bound. Fractional nanosecond requests are rejected.
-- Output limits, VCD limits, and a Worker timeout are enforced by existing Xezim/browser code, but there is no hard WASM linear-memory ceiling.
+- At the LUNA-09 milestone, output limits, VCD limits, and a Worker timeout were enforced, but there was no hard WASM linear-memory ceiling. LUNA-10 later added a 256 MiB WebAssembly memory maximum and trap classification; see the [memory report](luna-10-memory-report.md). Console output is still truncated only after Xezim has accumulated it, and there is no per-event or instruction-count budget.
 - This check used Chromium only. A second browser engine and a manual real Codex MCP smoke test remain unverified.
 - Native Xezim was not modified by LUNA-09. Native suite passes are recorded in the LUNA-03/LUNA-04 reports; rerun those suites in the Linux builder before release.
 

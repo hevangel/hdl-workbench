@@ -30,7 +30,7 @@ The vendored sources are the pinned archives documented in [`vendor/UPSTREAM.md`
 - Changed VFS file output is UTF-8-lossy text in this JSON API. Binary file output is not a supported browser contract.
 - `$fopen` supports the modes and text operations exercised by the fixture; this is not full IEEE file-task parity. Unsupported tasks must remain explicit diagnostics.
 - The wrapper combines compile and run and takes nanoseconds. It is not yet a full `SimulationService` implementation with separate compile/run handles, max-step accounting, cancellation, or protocol tick/time-unit conversion.
-- The stdout cap is applied to the returned string; Xezim may accumulate a larger log before truncation. No fixed WASM linear-memory ceiling is enforced.
+- At the LUNA-04 milestone, the stdout cap was applied to the returned string after Xezim accumulated output, and no fixed WASM linear-memory ceiling was enforced. LUNA-10 later added a 256 MiB WebAssembly memory maximum and trap classification; output accumulation itself remains unbounded by that stdout cap. See the [LUNA-10 memory report](luna-10-memory-report.md).
 - The generated wasm and JS glue under `apps/ide/public/wasm/` are build artifacts ignored by Git. Regenerate them from the pinned source before serving a clean checkout.
 
 ## Reproduction
