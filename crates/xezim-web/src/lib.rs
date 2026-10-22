@@ -237,12 +237,13 @@ fn run_project(
     let output_limit = max_output_bytes.min(MAX_OUTPUT_BYTES);
     let vcd_limit = max_vcd_bytes.min(MAX_VCD_BYTES);
     let capture = VcdCapture::new(vcd_limit);
-    let mut sim = match xezim::simulate_project_inline(
+    let mut sim = match xezim::simulate_project_inline_with_output_limit(
         &sources,
         &virtual_files,
         max_time_ns,
         Some(top_module),
         MAX_PROJECT_BYTES,
+        Some(output_limit),
         Box::new(BoundedVcdWriter(capture.clone())),
     ) {
         Ok(sim) => sim,
@@ -273,7 +274,8 @@ fn run_project(
         .map(|line| line.message.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let (stdout, output_truncated) = truncate_utf8(&joined_output, output_limit);
+    let (stdout, stdout_exceeds_response_limit) = truncate_utf8(&joined_output, output_limit);
+    let output_truncated = sim.output_capture_truncated() || stdout_exceeds_response_limit;
     if output_truncated {
         diagnostics.push(Diagnostic {
             severity: "warning",
@@ -506,6 +508,113 @@ mod tests {
         let (output, truncated) = truncate_utf8("éabc", 1);
         assert!(truncated);
         assert_eq!(output, "");
+    }
+
+    #[test]
+    fn bounds_simulator_output_during_capture_and_preserves_utf8() {
+        let source = r#"module top; initial begin $display("%c", 8'hE9); $display("later"); $finish; end endmodule"#;
+        let sources = vec![("top.sv".to_string(), source.to_string())];
+        let virtual_files = vec![("top.sv".to_string(), source.as_bytes().to_vec())];
+        let sim = xezim::simulate_project_inline_with_output_limit(
+            &sources,
+            &virtual_files,
+            1,
+            Some("top"),
+            MAX_PROJECT_BYTES,
+            Some(2),
+            Box::new(Vec::new()),
+        )
+        .unwrap();
+        let stdout = sim
+            .output
+            .iter()
+            .map(|line| line.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(stdout, "é");
+        assert!(stdout.len() <= 2);
+        assert!(sim.output_capture_truncated());
+    }
+
+    #[test]
+    fn project_simulation_keeps_native_output_capture_unbounded_by_default() {
+        let source = r#"module top; initial begin $display("abcdefgh"); $display("ijklmnop"); $finish; end endmodule"#;
+        let sources = vec![("top.sv".to_string(), source.to_string())];
+        let virtual_files = vec![("top.sv".to_string(), source.as_bytes().to_vec())];
+        let sim = xezim::simulate_project_inline(
+            &sources,
+            &virtual_files,
+            1,
+            Some("top"),
+            MAX_PROJECT_BYTES,
+            Box::new(Vec::new()),
+        )
+        .unwrap();
+        let stdout = sim
+            .output
+            .iter()
+            .map(|line| line.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(stdout, "abcdefgh\nijklmnop");
+        assert!(!sim.output_capture_truncated());
+    }
+
+    #[test]
+    fn bounded_output_coalesces_many_small_writes() {
+        let source = r#"module top; integer i; initial begin for (i = 0; i < 100; i = i + 1) $write("x"); $finish; end endmodule"#;
+        let sources = vec![("top.sv".to_string(), source.to_string())];
+        let virtual_files = vec![("top.sv".to_string(), source.as_bytes().to_vec())];
+        let sim = xezim::simulate_project_inline_with_output_limit(
+            &sources,
+            &virtual_files,
+            1,
+            Some("top"),
+            MAX_PROJECT_BYTES,
+            Some(32),
+            Box::new(Vec::new()),
+        )
+        .unwrap();
+        let stdout = sim
+            .output
+            .iter()
+            .map(|line| line.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(sim.output.len(), 1);
+        assert_eq!(stdout, "x\n".repeat(16));
+        assert!(sim.output_capture_truncated());
+    }
+
+    #[test]
+    fn reports_output_budget_exhaustion_in_the_browser_result() {
+        let source = r#"module top; integer i; initial begin for (i = 0; i < 100; i = i + 1) $display("x"); $finish; end endmodule"#;
+        let files = serde_json::to_string(&[serde_json::json!({
+            "path": "top.sv",
+            "contents": source,
+        })])
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&compile_and_run_project(
+            &files,
+            "sha256:stdout-limit",
+            "top",
+            1,
+            10,
+            MAX_VCD_BYTES,
+        ))
+        .unwrap();
+        assert_eq!(value["status"], "resource_limit", "{value}");
+        assert_eq!(value["stdout"], "x\nx\nx\nx\nx\n");
+        assert!(
+            value["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["severity"] == "warning"
+                        && diagnostic["code"] == "XEZIM_WEB_OUTPUT_LIMIT"
+                })
+        );
     }
 
     #[test]

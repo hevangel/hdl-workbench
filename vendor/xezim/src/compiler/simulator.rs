@@ -6474,6 +6474,11 @@ pub struct Simulator {
     edge_iff_denied: Vec<bool>,
     pub time: u64,
     pub output: Vec<SimOutput>,
+    /// Optional byte budget for captured output. Native simulations leave
+    /// this unset so their historical output capture remains unbounded.
+    output_capture_limit: Option<usize>,
+    output_capture_bytes: usize,
+    output_capture_truncated: bool,
     capture_output: bool,
     pub finished: bool,
     /// §20.10: a `$fatal` executed — the run must not exit 0.

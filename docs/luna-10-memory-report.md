@@ -60,6 +60,22 @@ docker exec xezim-luna04-builder sh -lc 'mkdir -p /tmp/xezim-studio-luna10 && ta
 
 This runs Cargo against `/tmp` in Linux instead of the Windows-hosted `/host` filesystem, which avoids the `libffi-sys` Autoconf failure documented in the [LUNA-04 report](luna-04-virtual-files-report.md).
 
+## Bounded simulator console capture
+
+The browser wrapper now passes its 1 MiB console budget into Xezim before compilation and simulation. Xezim counts the same newline separators returned by the wrapper, truncates only at UTF-8 boundaries, and coalesces bounded output into one transcript record so many tiny `$write` calls cannot accumulate a large vector of per-message allocations. Once the cap is reached, later output is dropped and the wrapper reports `XEZIM_WEB_OUTPUT_LIMIT`. The public native/project entry point keeps the default unbounded capture behavior.
+
+Acceptance checks run in the Linux scratch checkout:
+
+```sh
+cargo fmt --manifest-path vendor/xezim/Cargo.toml -- --check
+cargo fmt --manifest-path crates/xezim-web/Cargo.toml -- --check
+cargo test --manifest-path crates/xezim-web/Cargo.toml
+cargo test --manifest-path vendor/xezim/Cargo.toml
+pnpm test:e2e
+```
+
+The browser wrapper suite passed all 11 tests, including an actual multibyte `%c` output boundary, a stream of many one-byte writes, browser-result resource-limit reporting, and the unchanged unbounded project API. On the final source, the complete native Xezim suite passed 5,226 tests with 1 perf test ignored. The locked WASM release build and glue generation passed after the final refinement. `pnpm test:e2e` then passed all 4 Chromium and Firefox checks against those rebuilt assets in 21 seconds.
+
 ## Reproduce the cap and recovery acceptance test
 
 Install workspace dependencies and Playwright browsers as described by the repository setup, then run with local loopback access enabled for Playwright's Vite server:

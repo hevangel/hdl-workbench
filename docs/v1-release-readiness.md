@@ -48,14 +48,15 @@ pnpm demo
 | Capped `pnpm build:browser` equivalent | Pass in the pinned Linux builder | `cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown`, then `wasm-bindgen --target web --out-dir apps/ide/public/wasm crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm`; see `docs/luna-10-memory-report.md`. |
 | Concurrent same-revision bridge writes | Covered by regression test | `pnpm test`; exactly one concurrent write succeeds. |
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
+| Simulator console capture bound | Pass; captured during simulation, Unicode-safe, coalesced, and reported as a resource limit | `cargo test --manifest-path crates/xezim-web/Cargo.toml`; native `simulate_project_inline` keeps its unbounded default. |
 | Full Chromium + Firefox E2E on current branch | Pass; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. |
 | WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
 | Whole-browser process memory reference | Sampled in Chromium and Firefox on a 64 GiB Ryzen 9 5950X workstation; minimum profile remains undefined | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` and `-- firefox`; see `docs/luna-10-memory-report.md`. |
 | Official MCP Inspector CLI | Pass; targeted Inspector test ran | `pnpm --filter @xezim-ide/mcp-bridge test:inspector`; see `docs/luna-10-memory-report.md`. |
 | Codex CLI ↔ browser pairing, edit, and run | Pass with Codex CLI `0.163.0` and Chromium `156.0.8078.4` | `pnpm --filter @xezim-ide/mcp-bridge smoke:codex`; ephemeral CLI config, temporary project, real Xezim WASM simulation. |
 | Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
-| Native Xezim suite on current branch | Pass in Linux builder | Complete `cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1`; includes the 705-test integration target, 4 UPF tests, and doctests. |
-| Native xezim-web wrapper suite on current branch | Pass in Linux builder; 7 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1`. |
+| Native Xezim suite on current branch | Pass in Linux builder; 5,226 passed, 1 perf test ignored | `cargo test --manifest-path vendor/xezim/Cargo.toml`. |
+| Native xezim-web wrapper suite on current branch | Pass in Linux builder; 11 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml`. |
 | Official CI workflow | Pending; GitHub access blocked in the current validation environment | `.github/workflows/luna09-browser-e2e.yml`; `gh auth status` reports an invalid token and `gh run list` could not resolve `api.github.com`. |
 | License/distribution review | Visible Surfer notice and technical inventory pass; release-channel source-hosting confirmation and qualified review pending | See [Surfer distribution review](surfer-distribution-review.md) for the EUPL requirements, exact bundle changes, checksums, and remaining release-channel decisions. |
 
@@ -65,6 +66,7 @@ pnpm demo
 - MCP selected-project snapshot: 4,096 files, 64 MiB total, and 16 MiB per file.
 - Waveform store: 64 MiB per VCD, at most 8 retained artifacts and 128 MiB aggregate. OPFS quota errors are surfaced.
 - Xezim simulation stop time: 10,000,000 integer nanoseconds. Worker wall-time termination: 300,000 ms maximum.
+- Browser console capture is limited to 1 MiB while Xezim records output; bounded mode coalesces messages into one transcript record and stops retaining output after the cap. The existing native entry points remain unbounded.
 - Browser origin storage usage and quota are shown when the Storage API provides them. Persistent storage is requested with a bounded wait and is not assumed granted.
 - WASM linear memory is capped at 256 MiB by the target linker maximum; allocation traps near the ceiling map to `RESOURCE_LIMIT`. This does not bound total browser process memory or impose a per-event/instruction count. Stress measurements on a minimum-supported browser/device remain a release gate for large designs.
 

@@ -3723,6 +3723,9 @@ impl Simulator {
             signal_type_names,
             time: 0,
             output: Vec::new(),
+            output_capture_limit: None,
+            output_capture_bytes: 0,
+            output_capture_truncated: false,
             capture_output: true,
             finished: false,
             saw_fatal: false,
@@ -4914,6 +4917,18 @@ impl Simulator {
 
     pub fn set_stdout_capture_only(&mut self, enabled: bool) {
         self.suppress_stdout_sink = enabled;
+    }
+
+    /// Bound captured output for embedders with a fixed response budget.
+    /// The default is unbounded to preserve native Xezim behavior.
+    pub(crate) fn set_output_capture_limit(&mut self, limit: Option<usize>) {
+        self.output_capture_limit = limit;
+    }
+
+    /// Whether captured output was omitted because its configured byte budget
+    /// was exceeded.
+    pub fn output_capture_truncated(&self) -> bool {
+        self.output_capture_truncated
     }
 
     /// Whether a virtual file write exceeded its configured workspace budget.

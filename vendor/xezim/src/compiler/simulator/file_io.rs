@@ -72,6 +72,37 @@ impl Simulator {
     #[inline]
     pub(super) fn record_output(&mut self, message: String) {
         if self.capture_output {
+            if let Some(limit) = self.output_capture_limit {
+                if self.output_capture_truncated {
+                    return;
+                }
+                let separator_bytes = usize::from(!self.output.is_empty());
+                let available = limit.saturating_sub(self.output_capture_bytes);
+                if separator_bytes > available {
+                    self.output_capture_truncated = true;
+                    return;
+                }
+                let message_budget = available - separator_bytes;
+                let mut end = message.len().min(message_budget);
+                while !message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let truncated = end < message.len();
+                self.output_capture_bytes += separator_bytes + end;
+                if let Some(last) = self.output.last_mut() {
+                    if separator_bytes > 0 {
+                        last.message.push('\n');
+                    }
+                    last.message.push_str(&message[..end]);
+                } else {
+                    self.output.push(SimOutput {
+                        time: self.time,
+                        message: message[..end].to_string(),
+                    });
+                }
+                self.output_capture_truncated = truncated;
+                return;
+            }
             self.output.push(SimOutput {
                 time: self.time,
                 message,

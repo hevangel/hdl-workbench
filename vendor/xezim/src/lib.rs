@@ -1016,6 +1016,7 @@ pub fn simulate_multi_inline(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1031,6 +1032,30 @@ pub fn simulate_project_inline(
     max_time: u64,
     top_module_name: Option<&str>,
     max_project_bytes: usize,
+    vcd_writer: Box<dyn std::io::Write + Send>,
+) -> Result<compiler::Simulator, String> {
+    simulate_project_inline_with_output_limit(
+        sources,
+        virtual_files,
+        max_time,
+        top_module_name,
+        max_project_bytes,
+        None,
+        vcd_writer,
+    )
+}
+
+/// Compile and simulate a browser/project snapshot with a bounded captured
+/// console output budget. Bounded capture coalesces its retained messages into
+/// one transcript record to keep per-message allocation overhead bounded. This
+/// opt-in API leaves native entry points and their output behavior unchanged.
+pub fn simulate_project_inline_with_output_limit(
+    sources: &[(String, String)],
+    virtual_files: &[(String, Vec<u8>)],
+    max_time: u64,
+    top_module_name: Option<&str>,
+    max_project_bytes: usize,
+    output_limit: Option<usize>,
     vcd_writer: Box<dyn std::io::Write + Send>,
 ) -> Result<compiler::Simulator, String> {
     let source_texts: Vec<String> = sources.iter().map(|(_, text)| text.clone()).collect();
@@ -1076,6 +1101,7 @@ pub fn simulate_project_inline(
         Some((virtual_files.to_vec(), max_project_bytes)),
         Some(vcd_writer),
         Some(pre),
+        output_limit,
     )?;
     Ok(sim)
 }
@@ -1141,6 +1167,7 @@ pub fn simulate_multi(
             None,
             None,
             None,
+            None,
         );
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -1174,6 +1201,7 @@ pub fn simulate_multi(
                 profile_input,
                 collapse_islands,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -1220,6 +1248,7 @@ pub fn simulate_multi(
                         None,
                         None,
                         None,
+                        None,
                     ))
                 })
                 .expect("spawn simulation worker")
@@ -1258,6 +1287,7 @@ fn simulate_multi_inner(
     virtual_files: Option<(Vec<(String, Vec<u8>)>, usize)>,
     vcd_writer: Option<Box<dyn std::io::Write + Send>>,
     preprocessed: Option<xezim_core::PreprocessedSources>,
+    output_capture_limit: Option<usize>,
 ) -> Result<compiler::Simulator, String> {
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
@@ -1421,6 +1451,7 @@ fn simulate_multi_inner(
     if let Some((files, max_bytes)) = virtual_files {
         sim.set_virtual_files(files, max_bytes)?;
     }
+    sim.set_output_capture_limit(output_capture_limit);
     sim.set_stdout_capture_only(project_vfs_enabled);
     if let Some(writer) = vcd_writer {
         sim.set_vcd_writer(writer)?;
