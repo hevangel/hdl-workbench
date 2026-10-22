@@ -112,7 +112,7 @@ The adapter is the only module allowed to know the viewer's private messages. Th
 
 The v1 application interfaces are frozen; backend conformance is not:
 
-1. **Xezim:** run parser, core, and reduced Xezim checks on a Rust 1.92+ host, then build the browser Worker counter fixture. Verify VCD output, output/work limits, and native regression behavior before exposing browser compile/run as available.
+1. **Xezim (partial):** `sv-parser` passed on Rust 1.99.1; core and reduced Xezim checks fail before compiling their sources because `getrandom` 0.2.17 and 0.3.4 lack the required wasm browser configuration. See the [build-gate follow-up](wasm-build-gate-followup.md). After resolving that dependency boundary, inspect subsequent build-script and runtime failures, then build the browser Worker counter fixture. Verify VCD output, output/work limits, and native regression behavior before exposing browser compile/run as available.
 2. **Surfer:** build from the pinned source or obtain an immutable asset, record its digest and license, then run a real-browser test that opens the VCD fixture, adds `top.count`, and positions the cursor at tick 25. Do not enable the corresponding adapter methods until the viewer passes.
 3. **Cross-cutting:** keep `readTransitions`, `getSignalNow`, cancellation, FST, and other future capabilities absent until each has an implementation and acceptance tests. Existing interfaces may return explicit `UNSUPPORTED_CAPABILITY` or `SIMULATOR_UNAVAILABLE` errors while a gate is open.
 
