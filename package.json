@@ -1,0 +1,14 @@
+{
+  "name": "xezim-studio",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@11.25.0",
+  "engines": {
+    "node": ">=24 <27"
+  },
+  "scripts": {
+    "test": "pnpm -r --if-present test",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "build": "pnpm -r --if-present build && node scripts/export-json-schema.mjs"
+  }
+}

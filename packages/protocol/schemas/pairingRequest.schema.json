@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "challengeId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z2-7]{8,16}$"
+    },
+    "clientName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "requestedRole": {
+      "type": "string",
+      "enum": [
+        "read",
+        "write"
+      ]
+    }
+  },
+  "required": [
+    "challengeId",
+    "code",
+    "clientName",
+    "requestedRole"
+  ],
+  "additionalProperties": false
+}

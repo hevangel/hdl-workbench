@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "magnitude": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,2}$"
+    },
+    "unit": {
+      "type": "string",
+      "enum": [
+        "s",
+        "ms",
+        "us",
+        "ns",
+        "ps",
+        "fs"
+      ]
+    }
+  },
+  "required": [
+    "magnitude",
+    "unit"
+  ],
+  "additionalProperties": false
+}

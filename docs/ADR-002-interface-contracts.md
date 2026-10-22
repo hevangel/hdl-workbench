@@ -19,6 +19,8 @@ The application-facing contracts below can be fixed without depending on those i
 
 Freeze these application-facing contracts for v1. Implementations may report a capability as available only after its corresponding acceptance gate passes. Until then, return an explicit unsupported/unavailable error and keep that feature disabled in the UI and MCP tools. Never route browser simulation to native Xezim as a fallback.
 
+The TypeScript/Zod source of truth and generated Draft 2020-12 wire schemas live in `packages/protocol/`. Its strict object schemas reject unknown fields; semantic validators additionally bind compile/run results to their requested project snapshot and bind RPC responses to the request id and operation. This package implements the application-facing shapes below without claiming either backend is available.
+
 ### 1. Workspace
 
 ```ts
