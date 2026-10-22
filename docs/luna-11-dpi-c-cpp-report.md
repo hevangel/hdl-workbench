@@ -39,10 +39,11 @@ error and a successful compile/simulation after that error.
   project may load up to 32 modules / 32 MiB total.
 - Exports used as DPI calls must return exactly one `i32` and take only `i32`
   parameters. Xezim’s SystemVerilog side supports only signed scalar `int`.
-- The browser downloads about 94 MiB of compiler assets on first use before
-  compression. The unused 19 MiB C++ PCH is excluded from the app bundle.
-  The initial download and the LLVM Wasm compiler's peak memory need testing
-  on more hardware before any broad public release.
+- The first-use compiler assets total 94,377,252 bytes (94.4 MB / 90.0 MiB)
+  before HTTP compression. The unused 19.4 MB C++ PCH is excluded from the app
+  bundle. A compiler-inclusive process profile on the selected workstation is
+  recorded in [`luna-12-dpi-memory-report.md`](luna-12-dpi-memory-report.md);
+  it does not qualify lower-resource devices or another browser engine.
 
 ## Pins and notices
 
@@ -51,14 +52,16 @@ error and a successful compile/simulation after that error.
 - Its build script pins LLVM `llvmorg-20.1.2` and downloads WASI SDK sysroot
   25.0. The package MIT license is copied to
   `apps/ide/public/licenses/browsercc-MIT.txt`.
-- LLVM's Apache-2.0 with LLVM exception and the WASI SDK Apache-2.0 license are
-  linked from `apps/ide/public/licenses/THIRD_PARTY.md`.
+- The identified LLVM, WASI SDK, wasi-libc, and Emscripten license texts and
+  generated asset hashes are served from `/licenses/`; see
+  [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md).
 
 The packed `browsercc` npm tarball includes LLVM and a WASI sysroot but does not
-include an inventory of every sysroot component's license notices. That
-component-level notice audit remains required before promoting the compiler
-assets as a public hosted release. The app can be built and tested locally;
-this report does not claim legal review or a deployment.
+include a component manifest. The sysroot archive contains no notice files, and
+the upstream build container uses the mutable Emscripten `latest` channel.
+Therefore the notice work is a technical inventory, not a complete audit or a
+qualified legal review. The app can be built and tested locally; this report
+does not claim legal approval or a deployment.
 
 ## Reproduce
 

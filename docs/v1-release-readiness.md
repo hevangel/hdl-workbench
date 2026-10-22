@@ -1,8 +1,8 @@
 # v1 release readiness
 
 Date: 2026-10-22
-Branch: `codex/luna-10-hardening`
-Status: branch-local hardening and acceptance checks pass; external release gates remain.
+Branch: `codex/luna-12-dpi-memory`
+Status: feature, integration, and selected-workstation memory checks pass; source publication, hosted-origin checks, and qualified release review remain open.
 
 ## Pins
 
@@ -44,12 +44,14 @@ pnpm demo
 | Frozen workspace install | Pass with pnpm `11.25.0`; all five workspace projects already up to date | `pnpm install --frozen-lockfile`. |
 | `pnpm typecheck` | Pass | All four workspace packages. |
 | `pnpm build` | Pass; existing Monaco bundle size warning | All workspace packages and generated protocol JSON schema. |
-| `pnpm test` | Pass with local loopback permission; 63 tests | Protocol 20, IDE 30, MCP bridge 7, wave-index 6. |
+| `pnpm test` | Pass with local loopback permission; 71 tests | Protocol 20, IDE 38, MCP bridge 7, wave-index 6. |
 | Capped `pnpm build:browser` equivalent | Pass in the pinned Linux builder | `cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown`, then `wasm-bindgen --target web --out-dir apps/ide/public/wasm crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm`; see `docs/luna-10-memory-report.md`. |
 | Concurrent same-revision bridge writes | Covered by regression test | `pnpm test`; exactly one concurrent write succeeds. |
 | Source project and waveform bounds | Implemented with regression coverage | `pnpm test`; see limits below. |
 | Simulator console capture bound | Pass; captured during simulation, Unicode-safe, coalesced, and reported as a resource limit | `cargo test --manifest-path crates/xezim-web/Cargo.toml`; native `simulate_project_inline` keeps its unbounded default. |
-| Full Chromium + Firefox E2E on current branch | Pass; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. |
+| LUNA-10 full Chromium + Firefox E2E | Pass before the DPI compiler change; 4 cases across 2 browsers, 22.6 seconds | `pnpm test:e2e`; MCP edit/run, ROM/NBA, Surfer waveform/reload, memory ceiling, and worker recovery. On LUNA-11/12, the direct browser harness and C/C++ memory profile pass on Chrome; the full two-browser suite has not been rerun. |
+| Browser C/C++ compile and SystemVerilog DPI | Pass in Chrome `156.0.8078.47`; C returns 30 and C++ returns 42 | `node apps/ide/scripts/wasm-browser-acceptance.mjs` with the local harness; see `docs/luna-11-dpi-c-cpp-report.md`. |
+| Compiler-inclusive whole-browser process memory | Pass on selected Windows workstation with Chrome `156.0.8078.47`; during compile/DPI, peak sampled resident 1,160.7 MiB and private 1,426.9 MiB | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` with `XEZIM_CHROME_EXECUTABLE`; see `docs/luna-12-dpi-memory-report.md`. This does not establish a lower-resource minimum or Firefox compiler memory. |
 | WASM memory ceiling and failure recovery | Pass in Chromium `156.0.8078.4` and Firefox `157.0` | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna10-memory.spec.mjs --project=chromium` and `--project=firefox`; see `docs/luna-10-memory-report.md`. |
 | Whole-browser process memory on selected v1 baseline | Pass on the user-selected computer: Windows 10.0.26300, Ryzen 9 5950X, 63.9 GiB RAM, 32 logical CPUs; Chromium 156.0.8078.4 and Firefox 157.0 | `pnpm --filter @xezim-ide/mcp-bridge profile:browser-memory -- chromium` and `-- firefox`; see `docs/luna-10-memory-report.md`. Does not qualify lower-resource devices or other OS/browser versions. |
 | Official MCP Inspector CLI | Pass; targeted Inspector test ran | `pnpm --filter @xezim-ide/mcp-bridge test:inspector`; see `docs/luna-10-memory-report.md`. |
@@ -58,7 +60,7 @@ pnpm demo
 | Native Xezim suite on current branch | Pass in Linux builder; 5,226 passed, 1 perf test ignored | `cargo test --manifest-path vendor/xezim/Cargo.toml`. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 11 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml`. |
 | Official CI workflow | Pending; GitHub access blocked in the current validation environment | `.github/workflows/luna09-browser-e2e.yml`; `gh auth status` reports an invalid token and `gh run list` could not resolve `api.github.com`. |
-| License/distribution review | Visible notice and technical inventory pass; public-hosted source publication, production URL checks, and qualified review pending | See [Surfer distribution review](surfer-distribution-review.md) for EUPL requirements, exact bundle changes, checksums, and release steps. |
+| License/distribution review | Compiler license texts and asset hashes are now served; component/build provenance remains incomplete, and public source publication, production URL checks, and qualified review are pending | See [Surfer distribution review](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md). browsercc's WASI sysroot tar has no notice files, and its build container uses mutable Emscripten `latest`. |
 
 ## Implemented bounds and remaining memory risk
 
@@ -80,6 +82,6 @@ pnpm demo
 
 ## Next release gates
 
-1. Push this branch or open its PR after GitHub authentication/network access is restored, then run `.github/workflows/luna09-browser-e2e.yml` and retain the hosted logs; local Linux-builder results are documented, but hosted CI remains pending.
-2. For the chosen public hosted website, publish the versioned source/provenance, record the canonical deployment origin, and verify the license, source note, modified HTML entrypoint, and upstream source remain public while the viewer is served.
-3. Obtain qualified review of the Surfer bundle and combined application's license position. The [technical inventory and panel notice](surfer-distribution-review.md) are complete; this release gate is not.
+1. Push this branch or open its PR after GitHub access is restored, then run `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs. The current shell cannot resolve `github.com`; GitHub connector calls are unavailable in this session.
+2. For the chosen public hosted website, publish the versioned source/provenance, configure the hosting project, record its canonical origin, and verify the license, source note, modified HTML entrypoint, and upstream source remain public while the viewer is served. No hosting manifest or canonical origin is configured in this checkout.
+3. Obtain qualified review of the Surfer bundle, compiler toolchain assets, and combined application's license position. The [technical inventories](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md) are evidence for review, not legal approval.

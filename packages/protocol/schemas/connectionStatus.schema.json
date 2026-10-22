@@ -18,6 +18,8 @@
             "type": "string",
             "enum": [
               "browser_simulation",
+              "browser_dpi_scalar_int32",
+              "browser_c_cpp_compile",
               "waveform_load",
               "waveform_add_signals",
               "waveform_cursor"

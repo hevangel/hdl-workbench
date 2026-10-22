@@ -149,7 +149,10 @@ async function profileBrowser(browserName, baseUrl) {
   let sampleError;
 
   if (browserName === "chromium") {
-    browser = await chromium.launch({ args: ["--enable-webgl", "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"] });
+    browser = await chromium.launch({
+      ...(process.env.XEZIM_CHROME_EXECUTABLE ? { executablePath: process.env.XEZIM_CHROME_EXECUTABLE } : {}),
+      args: ["--enable-webgl", "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+    });
     cdpSession = await browser.newBrowserCDPSession();
   } else {
     browserServer = await firefox.launchServer();
@@ -197,7 +200,57 @@ async function profileBrowser(browserName, baseUrl) {
       await waitForSamples(windowsSampler.samples, 2);
     } else {
       samplingTask = sampleLoop();
+      await waitForSamples(samples, 2);
     }
+
+    const processSamples = windowsSampler?.samples ?? samples;
+    await waitForSamples(processSamples, process.platform === "win32" ? 20 : 5);
+    const samplesBeforeDpi = processSamples.slice();
+    const dpiSampleStart = processSamples.length;
+    const dpiResult = await page.evaluate(async () => {
+      const readFixture = async (path) => {
+        const response = await fetch(`/fixtures/${path}`);
+        if (!response.ok) throw new Error(`Could not load DPI profile fixture ${path} (${response.status}).`);
+        return response.text();
+      };
+      const files = await Promise.all([
+        "dpi/add.c",
+        "dpi/add_cpp.cpp",
+        "dpi/add.h",
+        "dpi/add_cpp.hpp",
+      ].map(async (path) => ({ path, contents: await readFixture(path) })));
+      const top = await readFixture("dpi/top.sv");
+      const { compileDpiProjectInBrowser } = await import("/src/workers/dpiCompilerClient.ts");
+      const { runXezimWorker } = await import("/src/workers/xezimClient.ts");
+      const compileStarted = performance.now();
+      const compiled = await compileDpiProjectInBrowser(files);
+      const compileMs = Math.round(performance.now() - compileStarted);
+      if (!compiled.ok) return { ok: false, error: compiled.error, compileMs };
+      const moduleBytes = compiled.modules.reduce((sum, module) => sum + module.bytes.byteLength, 0);
+      const simulation = await runXezimWorker({
+        source: top,
+        topModule: "dpi_top",
+        maxTimeNs: 1,
+        dpiModules: compiled.modules.map(({ path, bytes }) => ({ path: `${path}.wasm`, bytes })),
+      });
+      return {
+        ok: simulation.ok
+          && simulation.result.status === "completed"
+          && simulation.result.finished
+          && simulation.result.stdout.includes("DPI_C=30")
+          && simulation.result.stdout.includes("DPI_CPP=42"),
+        compileMs,
+        moduleCount: compiled.modules.length,
+        moduleBytes,
+        modules: compiled.modules.map(({ path }) => path),
+        simulation: simulation.ok
+          ? { status: simulation.result.status, stdout: simulation.result.stdout }
+          : simulation.error,
+      };
+    });
+    await waitForSamples(processSamples, dpiSampleStart + 2);
+    const samplesDuringDpi = processSamples.slice(dpiSampleStart);
+
     const directMeasurement = await page.evaluate(async (source) => {
       const wasm = await import("/wasm/xezim_web.js");
       const exports = await wasm.default();
@@ -237,16 +290,41 @@ async function profileBrowser(browserName, baseUrl) {
     if (!workerResults.supported.ok || !workerResults.supported.result.stdout.includes("RAM0=1")) throw new Error("Supported Worker workload failed.");
     if (workerResults.oversized.ok || workerResults.oversized.error.code !== "RESOURCE_LIMIT") throw new Error("Over-limit Worker workload was not reported as RESOURCE_LIMIT.");
     if (!workerResults.recovery.ok || !workerResults.recovery.result.stdout.includes("RECOVERY=OK")) throw new Error("Worker did not recover after the resource limit.");
+    if (!dpiResult.ok) throw new Error(`C/C++ compile-and-DPI profile failed: ${JSON.stringify(dpiResult)}`);
     if (samples.length === 0) throw new Error("No browser process memory samples were collected.");
 
     const peakResident = samples.reduce((peak, sample) => Math.max(peak, sample.residentBytes), 0);
     const privateSamples = samples.filter((sample) => sample.privateBytes !== null);
     const peakPrivate = privateSamples.length ? Math.max(...privateSamples.map((sample) => sample.privateBytes)) : null;
+    const beforeDpiResident = samplesBeforeDpi.length
+      ? Math.max(...samplesBeforeDpi.map((sample) => sample.residentBytes))
+      : null;
+    const beforeDpiPrivateSamples = samplesBeforeDpi.filter((sample) => sample.privateBytes !== null);
+    const beforeDpiPrivate = beforeDpiPrivateSamples.length
+      ? Math.max(...beforeDpiPrivateSamples.map((sample) => sample.privateBytes))
+      : null;
+    const duringDpiResident = samplesDuringDpi.length
+      ? Math.max(...samplesDuringDpi.map((sample) => sample.residentBytes))
+      : null;
+    const duringDpiPrivateSamples = samplesDuringDpi.filter((sample) => sample.privateBytes !== null);
+    const duringDpiPrivate = duringDpiPrivateSamples.length
+      ? Math.max(...duringDpiPrivateSamples.map((sample) => sample.privateBytes))
+      : null;
     return {
       browser: browserName,
       browserVersion: browser.version(),
       peakAggregateResidentMiB: +(peakResident / 1024 ** 2).toFixed(1),
       peakAggregatePrivateMiB: peakPrivate === null ? null : +(peakPrivate / 1024 ** 2).toFixed(1),
+      beforeDpi: {
+        samples: samplesBeforeDpi.length,
+        peakAggregateResidentMiB: beforeDpiResident === null ? null : +(beforeDpiResident / 1024 ** 2).toFixed(1),
+        peakAggregatePrivateMiB: beforeDpiPrivate === null ? null : +(beforeDpiPrivate / 1024 ** 2).toFixed(1),
+      },
+      duringDpi: {
+        samples: samplesDuringDpi.length,
+        peakAggregateResidentMiB: duringDpiResident === null ? null : +(duringDpiResident / 1024 ** 2).toFixed(1),
+        peakAggregatePrivateMiB: duringDpiPrivate === null ? null : +(duringDpiPrivate / 1024 ** 2).toFixed(1),
+      },
       samples: samples.length,
       processCountRange: [Math.min(...samples.map((sample) => sample.processCount)), Math.max(...samples.map((sample) => sample.processCount))],
       wasm: directMeasurement,
@@ -255,6 +333,7 @@ async function profileBrowser(browserName, baseUrl) {
         overLimit: workerResults.oversized.error.code,
         recovery: workerResults.recovery.result.status,
       },
+      dpiCompiler: dpiResult,
     };
   } finally {
     sampling = false;
