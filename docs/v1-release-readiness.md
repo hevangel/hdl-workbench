@@ -41,6 +41,7 @@ pnpm demo
 | Surfer license/source notice and served assets | Pass in Chromium and Firefox | `pnpm --filter @xezim-ide/mcp-bridge exec playwright test e2e/luna09.spec.mjs --project=chromium --project=firefox`; verifies visible dated attribution, EUPL text, and pinned source metadata. |
 | End-to-end MCP edit → Xezim WASM → OPFS VCD → Surfer → reload | Pass in Chromium `156.0.8078.4` | `pnpm test:e2e`; ROM plus counter run. |
 | End-to-end in Firefox | Pass in Firefox `157.0` | `pnpm test:e2e` runs both configured browser projects. |
+| Frozen workspace install | Pass with pnpm `11.25.0`; all five workspace projects already up to date | `pnpm install --frozen-lockfile`. |
 | `pnpm typecheck` | Pass | All four workspace packages. |
 | `pnpm build` | Pass; existing Monaco bundle size warning | All workspace packages and generated protocol JSON schema. |
 | `pnpm test` | Pass with local loopback permission; 63 tests | Protocol 20, IDE 30, MCP bridge 7, wave-index 6. |
