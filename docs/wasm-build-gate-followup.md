@@ -20,7 +20,8 @@ Source checkouts:
 The checks used Rust `1.99.1` in the official image digest `rust@sha256:a5ab4292e80567dc92f642e2a7d63773ebd695b82b56e8f06dc8d6ecc5600b76`. Set `$srcRoot` to the directory containing the two pinned checkouts.
 
 ```powershell
-$srcRoot = 'B:\xezim-studio\.codex-rust-luna00\src'
+$repoRoot = git rev-parse --show-toplevel
+$srcRoot = Join-Path $repoRoot '.codex-rust-luna00\src'
 $image = 'rust@sha256:a5ab4292e80567dc92f642e2a7d63773ebd695b82b56e8f06dc8d6ecc5600b76'
 docker run --rm -v "${srcRoot}:/src" $image sh -c 'rustup target add wasm32-unknown-unknown && cargo check --manifest-path /src/xezim-core/xezim-parser/Cargo.toml --target wasm32-unknown-unknown'
 docker run --rm -v "${srcRoot}:/src" $image sh -c 'rustup target add wasm32-unknown-unknown && cargo check --manifest-path /src/xezim-core/Cargo.toml --target wasm32-unknown-unknown --no-default-features'
@@ -65,7 +66,8 @@ getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] 
 The scratch Xezim manifest also used local paths to the pinned core/parser checkouts and set `default-features = false` on `xezim-core`. The Rust flag selected getrandom 0.3's browser backend. Clang was installed only in the ephemeral container:
 
 ```powershell
-$experimentRoot = 'B:\xezim-studio\.codex-rust-luna00\experiment'
+$repoRoot = git rev-parse --show-toplevel
+$experimentRoot = Join-Path $repoRoot '.codex-rust-luna00\experiment'
 $image = 'rust@sha256:a5ab4292e80567dc92f642e2a7d63773ebd695b82b56e8f06dc8d6ecc5600b76'
 docker run --rm -v "${experimentRoot}:/work" -e 'RUSTFLAGS=--cfg getrandom_backend="wasm_js"' $image sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends clang lld && rustup target add wasm32-unknown-unknown && cargo check --manifest-path /work/xezim-core/Cargo.toml --target wasm32-unknown-unknown --no-default-features'
 docker run --rm -v "${experimentRoot}:/work" -e 'RUSTFLAGS=--cfg getrandom_backend="wasm_js"' $image sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends clang lld && rustup target add wasm32-unknown-unknown && cargo check --manifest-path /work/xezim/Cargo.toml --target wasm32-unknown-unknown --no-default-features --lib'

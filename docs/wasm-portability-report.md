@@ -4,7 +4,7 @@
 
 Date: 2026-10-21
 Branch: codex/luna-00a-wasm-feasibility
-Worktree: C:/Users/hevan/AppData/Local/Temp/xezim-studio-luna/luna-00a
+Worktree: C:/Users/hevan/AppData/Local/Temp/hdl-workbench-luna/luna-00a
 
 ## Result
 

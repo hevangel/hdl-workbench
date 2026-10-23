@@ -60,8 +60,8 @@ pnpm demo
 | Native Xezim core suite on current branch | Pass in Linux builder | `cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1`; full results are recorded in `docs/luna-10-memory-report.md`. |
 | Native Xezim suite on current branch | Pass in Linux builder; 5,226 passed, 1 perf test ignored | `cargo test --manifest-path vendor/xezim/Cargo.toml`. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 11 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml`. |
-| Official CI workflow | Pending; GitHub access blocked in the current validation environment | `.github/workflows/luna09-browser-e2e.yml`; `gh auth status` reports an invalid token and `gh run list` could not resolve `api.github.com`. |
-| License/distribution review | Compiler license texts and asset hashes are now served; the source branch is public in [PR #1](https://github.com/hevangel/xezim-studio/pull/1), while component/build provenance remains incomplete, hosted production URL checks, and qualified review are pending | See [Surfer distribution review](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md). browsercc's WASI sysroot tar has no notice files, and its build container uses mutable Emscripten `latest`. |
+| Official CI workflow | Pass on `ea45cec`; Chromium, Firefox, and native Xezim jobs all passed in [run 39910731328](https://github.com/hevangel/hdl-workbench/actions/runs/39910731328) | `.github/workflows/luna09-browser-e2e.yml`. |
+| License/distribution review | Compiler license texts and asset hashes are served; source is on `main` after [PR #1](https://github.com/hevangel/hdl-workbench/pull/1) merged. Component/build provenance, hosted production URL checks, and qualified review remain pending | See [Surfer distribution review](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md). browsercc's WASI sysroot tar has no notice files, and its build container uses mutable Emscripten `latest`. |
 
 ## Implemented bounds and remaining memory risk
 
@@ -83,6 +83,6 @@ pnpm demo
 
 ## Next release gates
 
-1. Review and merge [PR #1](https://github.com/hevangel/xezim-studio/pull/1) after its checks pass; run `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs.
+1. For any subsequent source change, rerun `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs.
 2. For the chosen public hosted website, publish the versioned source/provenance, configure the hosting project, record its canonical origin, and verify the license, source note, modified HTML entrypoint, and upstream source remain public while the viewer is served. No hosting manifest or canonical origin is configured in this checkout.
 3. Obtain qualified review of the Surfer bundle, compiler toolchain assets, and combined application's license position. The [technical inventories](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md) are evidence for review, not legal approval.
