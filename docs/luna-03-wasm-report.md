@@ -54,7 +54,7 @@ node apps/ide/scripts/wasm-browser-acceptance.mjs
 
 Run the server and browser in separate terminals. On Node 20, add `--experimental-websocket` to the Node command; Node 24+ provides WebSocket globally. Set `XEZIM_CHROME_DEVTOOLS` or `XEZIM_BROWSER_TEST_URL` to override the defaults. The runner opens a fresh page, disables the browser cache, and checks the harness result.
 
-The wasm wrapper tests and native Xezim suites must run on a Linux filesystem in this Windows environment. A Windows bind-mounted checkout caused `libffi-sys` Autoconf config probes to fail, so the checkout was copied to `/tmp/xezim-studio-native` inside the disposable Debian container before running native Cargo tests. From that scratch copy:
+The wasm wrapper tests and native Xezim suites must run on a Linux filesystem in this Windows environment. A Windows bind-mounted checkout caused `libffi-sys` Autoconf config probes to fail, so the checkout was copied to `/tmp/hdl-workbench-native` inside the disposable Debian container before running native Cargo tests. From that scratch copy:
 
 ```sh
 cargo test --offline --manifest-path crates/xezim-web/Cargo.toml
