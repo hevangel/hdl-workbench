@@ -31,3 +31,4 @@ apps/ide/public/wasm/
 coverage/
 **/test-results/
 **/playwright-report/
+.tmp/
