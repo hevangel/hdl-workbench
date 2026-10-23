@@ -1,0 +1,760 @@
+//! Regression tests for the July-2026 missing-system-task audit.
+//!
+//! Group 1: unknown-system-task meta-diagnostic (once per name, never for
+//!          names serviced by either dispatcher or by internals).
+//! Group 2: $exit terminates like $finish.
+//! Group 3: $fstrobe/$fmonitor file variants.
+//! Group 4: $fread binary load (reg + memory forms).
+//! Group 5: $sdf_annotate runtime annotation.
+//! Group 6: $fsdbDumpfile/$fsdbDumpvars/$vcdpluson mapping.
+//! Group 7: recognized-warn stubs.
+
+use xezim::simulate;
+
+fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
+    sim.get_signal(n)
+        .or_else(|| sim.get_signal(&format!("tb.{}", n)))
+        .unwrap_or_else(|| panic!("signal not found: {}", n))
+        .to_u64()
+        .unwrap_or_else(|| panic!("{} not u64-able", n))
+        & 0xFFFF_FFFF
+}
+
+// ---------------------------------------------------------------- group 1
+
+#[test]
+fn unknown_task_warns_once_per_name() {
+    let src = r#"
+module tb;
+  integer n;
+  initial begin
+    $bogus_task(1);
+    $bogus_task(2);
+    n = $bogus_func(3);
+    repeat (3) $another_missing;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let warned = sim.warned_system_task_names();
+    assert!(
+        warned.contains(&"$bogus_task".to_string()),
+        "warned: {:?}",
+        warned
+    );
+    assert!(
+        warned.contains(&"$bogus_func".to_string()),
+        "warned: {:?}",
+        warned
+    );
+    assert!(
+        warned.contains(&"$another_missing".to_string()),
+        "warned: {:?}",
+        warned
+    );
+    // unknown function returns 0, does not abort simulation
+    assert_eq!(u(&sim, "n"), 0);
+}
+
+// ---------------------------------------------------------------- group 2
+
+#[test]
+fn exit_terminates_like_finish() {
+    let src = r#"
+module tb;
+  initial begin
+    $display("before");
+    #5 $exit;
+    $display("after");
+  end
+  initial #20 $display("late");
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert!(outs.contains(&"before"), "outs: {:?}", outs);
+    assert!(
+        !outs.contains(&"after"),
+        "$exit must stop the process: {:?}",
+        outs
+    );
+    assert!(
+        !outs.contains(&"late"),
+        "$exit must end simulation: {:?}",
+        outs
+    );
+    assert!(sim.warned_system_task_names().is_empty());
+}
+
+// ---------------------------------------------------------------- group 3
+
+#[test]
+fn fstrobe_and_fmonitor_write_to_file() {
+    let dir = std::env::temp_dir().join(format!("xezim_fstrobe_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("out.txt");
+    let src = format!(
+        r#"
+module tb;
+  integer fd;
+  reg [7:0] a;
+  initial begin
+    fd = $fopen("{out}", "w");
+    a = 8'h11;
+    $fstrobe(fd, "strobe a=%h t=%0t", a, $time);
+    a = 8'h22;
+    #1;
+    $fmonitor(fd, "mon a=%h t=%0t", a, $time);
+    #1 a = 8'h33;
+    #1 a = 8'h44;
+    #1 $fclose(fd);
+    $finish;
+  end
+endmodule
+"#,
+        out = out.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let text = std::fs::read_to_string(&out).expect("fstrobe output file missing");
+    // Matches a reference simulator (a reference simulator) verbatim: strobe sees the post-update
+    // value 22; fmonitor prints once when armed and on each change.
+    assert_eq!(
+        text,
+        "strobe a=22 t=0\nmon a=22 t=1\nmon a=33 t=2\nmon a=44 t=3\n"
+    );
+    assert!(sim.warned_system_task_names().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- group 4
+
+#[test]
+fn fread_reg_memory_and_eof() {
+    let dir = std::env::temp_dir().join(format!("xezim_fread_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bin = dir.join("data.bin");
+    std::fs::write(&bin, [1u8, 2, 3, 4, 5, 6, 7, 8, 0xAA, 0xBB]).unwrap();
+    let src = format!(
+        r#"
+module tb;
+  integer fd;
+  integer n1, n2, n3, n4, n5, n6;
+  reg [15:0] r16;
+  reg [15:0] r16b;
+  reg [7:0] mem [0:3];
+  reg [11:0] w12;
+  reg [7:0] m0, m1, m2, m3, p1, p2;
+  initial begin
+    fd = $fopen("{bin}", "rb");
+    n1 = $fread(r16, fd);
+    n2 = $fread(mem, fd);
+    m0 = mem[0]; m1 = mem[1]; m2 = mem[2]; m3 = mem[3];
+    n3 = $fread(w12, fd);
+    n4 = $fread(r16b, fd);
+    n5 = $fread(r16b, fd);
+    $fclose(fd);
+    fd = $fopen("{bin}", "rb");
+    n6 = $fread(mem, fd, 1, 2);
+    p1 = mem[1]; p2 = mem[2];
+    $fclose(fd);
+  end
+endmodule
+"#,
+        bin = bin.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    // All values verified against a reference simulator (a reference simulator).
+    assert_eq!(u(&sim, "n1"), 2);
+    assert_eq!(u(&sim, "r16"), 0x0102);
+    assert_eq!(u(&sim, "n2"), 4);
+    assert_eq!(
+        (u(&sim, "m0"), u(&sim, "m1"), u(&sim, "m2"), u(&sim, "m3")),
+        (3, 4, 5, 6)
+    );
+    assert_eq!(u(&sim, "n3"), 2);
+    assert_eq!(
+        u(&sim, "w12"),
+        0x708,
+        "12-bit dest keeps low 12 bits of 0x0708"
+    );
+    assert_eq!(u(&sim, "n4"), 2);
+    assert_eq!(u(&sim, "r16b"), 0xAABB);
+    assert_eq!(u(&sim, "n5"), 0, "EOF returns 0");
+    assert_eq!(u(&sim, "n6"), 2, "start/count form reads 2 elements");
+    assert_eq!((u(&sim, "p1"), u(&sim, "p2")), (1, 2));
+    assert!(sim.warned_system_task_names().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- group 5
+
+#[test]
+fn sdf_annotate_applies_iopath_delay_at_runtime() {
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "andcell") (INSTANCE u1)
+    (DELAY (ABSOLUTE (IOPATH a y (5.0:5.0:5.0) (5.0:5.0:5.0))
+                     (IOPATH b y (5.0:5.0:5.0) (5.0:5.0:5.0)))))
+)
+"#,
+    )
+    .unwrap();
+    let tpl = r#"
+`timescale 1ns/1ns
+module andcell(input a, input b, output y);
+  assign y = a & b;
+endmodule
+module tb;
+  reg a, b; wire y;
+  reg mid, fin;
+  andcell u1(.a(a), .b(b), .y(y));
+  initial begin
+    ANNOTATE
+    a = 1; b = 0;
+    #10 b = 1;
+    #3  mid = y;  // 5ns IOPATH: still 0 here; without SDF: 1
+    #10 fin = y;  // settled: 1 either way
+  end
+endmodule
+"#;
+    let with = tpl.replace(
+        "ANNOTATE",
+        &format!("$sdf_annotate(\"{}\");", sdf.display()),
+    );
+    let sim = simulate(&with, 1000).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "mid") & 1,
+        0,
+        "IOPATH delay must postpone y past t=13"
+    );
+    assert_eq!(u(&sim, "fin") & 1, 1);
+    let without = tpl.replace("ANNOTATE", "");
+    let sim2 = simulate(&without, 1000).expect("simulate failed");
+    assert_eq!(
+        u(&sim2, "mid") & 1,
+        1,
+        "without annotation y updates immediately"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SDF values count in the SDF TIMESCALE and scale to the simulation tick:
+/// in a 1ns/1ps design the 5 ns IOPATH is 5000 ticks, not 5 (it used to be
+/// scaled as if the tick were always 1 ns). The reference simulator reads
+/// the same file as mid=0 fin=1.
+#[test]
+fn sdf_annotate_scales_to_the_simulation_tick() {
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_ps_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "andcell") (INSTANCE u1)
+    (DELAY (ABSOLUTE (IOPATH a y (5.0:5.0:5.0) (5.0:5.0:5.0))
+                     (IOPATH b y (5.0:5.0:5.0) (5.0:5.0:5.0)))))
+)
+"#,
+    )
+    .unwrap();
+    let src = format!(
+        r#"
+`timescale 1ns/1ps
+module andcell(input a, input b, output y);
+  assign y = a & b;
+  specify (a => y) = 0; (b => y) = 0; endspecify
+endmodule
+module tb;
+  reg a, b; wire y;
+  reg mid, fin;
+  andcell u1(.a(a), .b(b), .y(y));
+  initial begin
+    $sdf_annotate("{}");
+    a = 1; b = 0;
+    #10 b = 1;
+    #3  mid = y;
+    #10 fin = y;
+  end
+endmodule
+"#,
+        sdf.display()
+    );
+    let sim = simulate(&src, 100_000).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "mid") & 1,
+        0,
+        "5 ns IOPATH must postpone y past t=13"
+    );
+    assert_eq!(u(&sim, "fin") & 1, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sdf_annotate_missing_file_is_fatal() {
+    let src = r#"
+`timescale 1ns/1ns
+module tb;
+  reg done;
+  initial begin
+    $sdf_annotate("/nonexistent/xezim_no_such.sdf");
+    #1 done = 1;  // must never run
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    // hard failure: simulation ends at time 0, so `#1 done = 1` never runs
+    let done = sim
+        .get_signal("tb.done")
+        .or_else(|| sim.get_signal("done"))
+        .and_then(|v| v.to_u64())
+        .unwrap_or(0);
+    assert_ne!(
+        done, 1,
+        "simulation must stop before #1 after a missing SDF file"
+    );
+}
+
+// ---------------------------------------------------------------- group 6
+
+#[test]
+fn fsdb_dump_tasks_write_fst() {
+    // Waveform dumping is opt-in (`--wave` on the CLI).
+    xezim::compiler::simulator::set_wave_enabled(true);
+    let dir = std::env::temp_dir().join(format!("xezim_fsdb_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fsdb = dir.join("wave.fsdb");
+    let fst = dir.join("wave.fst");
+    let src = format!(
+        r#"
+`timescale 1ns/1ns
+module tb;
+  reg clk = 0;
+  reg [3:0] cnt = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) cnt <= cnt + 1;
+  initial begin
+    $fsdbDumpfile("{fsdb}");
+    $fsdbDumpvars(0, tb);
+    #40 $finish;
+  end
+endmodule
+"#,
+        fsdb = fsdb.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let meta = std::fs::metadata(&fst).expect(".fsdb path must be rewritten to .fst");
+    assert!(meta.len() > 0, "FST dump must not be empty");
+    assert!(
+        sim.warned_system_task_names()
+            .iter()
+            .any(|n| n.contains("$fsdbDump")),
+        "one fsdb mapping note must be recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vcdpluson_maps_to_vcd() {
+    // Waveform dumping is opt-in (`--wave` on the CLI).
+    xezim::compiler::simulator::set_wave_enabled(true);
+    let dir = std::env::temp_dir().join(format!("xezim_vcdplus_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let vcd = dir.join("plus.vcd");
+    let src = format!(
+        r#"
+`timescale 1ns/1ns
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  initial begin
+    $dumpfile("{vcd}");
+    $vcdpluson;
+    #20 $vcdplusoff;
+    #20 $finish;
+  end
+endmodule
+"#,
+        vcd = vcd.display()
+    );
+    let sim = simulate(&src, 1000).expect("simulate failed");
+    let text = std::fs::read_to_string(&vcd).expect("VCD file must exist");
+    assert!(text.contains("$enddefinitions"), "VCD must have a header");
+    assert!(text.contains("#5"), "VCD must record changes while on");
+    assert!(
+        sim.warned_system_task_names()
+            .contains(&"$vcdpluson".to_string()),
+        "one vcdplus mapping note must be recorded"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- group 7
+
+#[test]
+fn recognized_stub_tasks_warn_once_and_continue() {
+    let src = r#"
+module tb;
+  integer n;
+  reg [7:0] m [0:3];
+  reg [7:0] m0;
+  reg done;
+  wire w;
+  initial begin
+    m[0] = 8'h5A;
+    $save("cp.dat");
+    $restart("cp.dat");
+    $sreadmemh("nope.dat", m);
+    n = $countdrivers(w);
+    $countdrivers(w);
+    $key;
+    $log;
+    $list;
+    $getpattern(0);
+    m0 = m[0];
+    done = 1;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    assert_eq!(u(&sim, "done") & 1, 1, "stubs must not abort execution");
+    assert_eq!(u(&sim, "n"), 0, "$countdrivers returns 0");
+    assert_eq!(u(&sim, "m0"), 0x5A, "$sreadmemh leaves memory unchanged");
+    let warned = sim.warned_system_task_names();
+    for name in [
+        "$save",
+        "$restart",
+        "$sreadmemh",
+        "$countdrivers",
+        "$key",
+        "$log",
+        "$list",
+        "$getpattern",
+    ] {
+        assert!(
+            warned.contains(&name.to_string()),
+            "missing stub warning for {}: {:?}",
+            name,
+            warned
+        );
+    }
+}
+
+#[test]
+fn handled_names_do_not_trip_unknown_warning() {
+    // Function-only names in statement position (result discarded) and
+    // ordinary handled tasks must NOT be reported as unknown.
+    let src = r#"
+module tb;
+  integer x;
+  initial begin
+    $urandom;
+    $random;
+    x = $countones(8'hF0);
+    $display("x=%0d", x);
+    $strobe("s=%0d", x);
+    $monitoroff;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    assert!(
+        sim.warned_system_task_names().is_empty(),
+        "spurious unknown-task warnings: {:?}",
+        sim.warned_system_task_names()
+    );
+}
+
+/// §18.13.3/.4: $srandom seeds the default RNG (repeatable streams from
+/// source), and $get_randstate/$set_randstate round-trip the RNG state. All
+/// three were silently unknown before — the meta-warn surfaced them.
+#[test]
+fn srandom_and_randstate() {
+    let sim = xezim::simulate(
+        r#"
+module t; int a,b,c,d; string st;
+initial begin
+  $srandom(42); a = $urandom();
+  $srandom(42); b = $urandom();
+  $srandom(1);  void'($urandom());
+  st = $get_randstate();
+  c = $urandom();
+  $set_randstate(st);
+  d = $urandom();
+  if (a == b)  $display("SEED_OK");
+  if (c == d)  $display("STATE_OK");
+end endmodule
+"#,
+        1000,
+    )
+    .expect("simulate");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("SEED_OK"),
+        "$srandom(42) must reproduce the stream:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("STATE_OK"),
+        "get/set_randstate must round-trip:\n{}",
+        joined
+    );
+}
+
+/// SDF back-annotation must OVERRIDE a specify path delay (SDF standard), and
+/// the CLI `--sdf` path must agree with the runtime `$sdf_annotate` path — the
+/// CLI path previously `.max()`'d specify over SDF, so the two diverged when a
+/// cell had both a specify delay and a smaller SDF value. Specify-only timing
+/// (no SDF) is unaffected. CLI-level because it exercises `--sdf` argument wiring.
+#[test]
+fn sdf_annotation_overrides_specify_and_paths_agree() {
+    fn xezim_bin() -> std::path::PathBuf {
+        let mut p = std::env::current_exe().expect("current_exe");
+        p.pop();
+        if p.ends_with("deps") {
+            p.pop();
+        }
+        p.join("xezim")
+    }
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_specify_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("c.sv");
+    std::fs::write(
+        &sv,
+        "`timescale 1ns/1ns\n\
+         module cbuf2(input a, output y); assign y=a; specify (a=>y)=8; endspecify endmodule\n\
+         module t; reg a=0; wire y; cbuf2 u(.a(a),.y(y));\n\
+         initial begin #1 a=1; #6 $display(\"T7 y=%b\",y); #4 $display(\"T11 y=%b\",y); $finish; end\n\
+         endmodule\n",
+    )
+    .unwrap();
+    let sdf = dir.join("d.sdf");
+    std::fs::write(
+        &sdf,
+        "(DELAYFILE (CELL (CELLTYPE \"cbuf2\") (INSTANCE u) (DELAY (ABSOLUTE (IOPATH a y (5:5:5) (5:5:5))))))\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| -> String {
+        let out = std::process::Command::new(xezim_bin())
+            .args(args)
+            .arg(&sv)
+            .output()
+            .expect("run");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    // SDF (5) overrides specify (8): edge at t=6, so y=1 at t=7.
+    let with_sdf = run(&["--sdf", sdf.to_str().unwrap()]);
+    assert!(
+        with_sdf.contains("T7 y=1"),
+        "SDF must override specify:\n{}",
+        with_sdf
+    );
+    // Specify-only (no SDF): edge at t=9, and the time-0 x->0 change waits
+    // for the path delay as well, so y is still x at t=7 (as the reference
+    // simulator prints).
+    let no_sdf = run(&[]);
+    assert!(
+        no_sdf.contains("T7 y=x"),
+        "specify-only timing must be unchanged:\n{}",
+        no_sdf
+    );
+}
+
+/// §20.5: $bitstoreal must reinterpret a 64-bit pattern as an IEEE-754 double
+/// (inverse of $realtobits), not read the bits as an integer. The old
+/// pass-through left the result non-real, so `$bitstoreal(64'h3FF0…)` printed
+/// 4.6e18 instead of 1.0. Round-tripping a real through $realtobits →
+/// $bitstoreal must reproduce it exactly.
+#[test]
+fn bitstoreal_realtobits_roundtrip() {
+    const SRC: &str = r#"
+module top;
+  initial begin
+    $display("B1 %.4f", $bitstoreal(64'h3FF0000000000000));
+    $display("B2 %.4f", $bitstoreal(64'h4000000000000000));
+    $display("RT %016h", $realtobits(1.0));
+    $display("ROUND %.5f", $bitstoreal($realtobits(3.14159)));
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("B1 1.0000"),
+        "$bitstoreal(0x3FF0…)=1.0:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("B2 2.0000"),
+        "$bitstoreal(0x4000…)=2.0:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("RT 3ff0000000000000"),
+        "$realtobits(1.0) bits:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("ROUND 3.14159"),
+        "round-trip must be exact:\n{}",
+        joined
+    );
+}
+
+/// §20.4: $itor honors the operand's sign ($itor(-5) = -5.0, not 4.29e9), and
+/// $rtoi returns a SIGNED `integer` (so %d prints -3, not 4294967293).
+#[test]
+fn itor_rtoi_signed() {
+    const SRC: &str = r#"
+module top;
+  initial begin
+    $display("I1 %.2f", $itor(5));
+    $display("I2 %.2f", $itor(-5));
+    $display("R1 %0d", $rtoi(3.7));
+    $display("R2 %0d", $rtoi(-3.7));
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("I1 5.00"), "$itor(5)=5.0:\n{}", joined);
+    assert!(joined.contains("I2 -5.00"), "$itor(-5)=-5.0:\n{}", joined);
+    assert!(joined.contains("R1 3"), "$rtoi(3.7)=3:\n{}", joined);
+    assert!(joined.contains("R2 -3"), "$rtoi(-3.7)=-3:\n{}", joined);
+}
+
+/// §20.15.1: no-seed $random must draw from the global RNG, not return a
+/// constant 0. It used to be stuck at 0, so every `$random` stimulus was 0.
+#[test]
+fn random_no_seed_varies() {
+    const SRC: &str = r#"
+module top;
+  int nonzero, i, v, seen_neg;
+  initial begin
+    nonzero = 0; seen_neg = 0;
+    for (i = 0; i < 40; i++) begin
+      v = $random;
+      if (v != 0) nonzero++;
+      if (v < 0)  seen_neg++;
+    end
+    $display("NZ %0d NEG %0d", nonzero, seen_neg);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Essentially all of 40 draws are non-zero, and $random is signed so some
+    // are negative — proves it's a real 32-bit stream, not a stuck 0.
+    let nz: i32 = joined
+        .split("NZ ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let neg: i32 = joined
+        .split("NEG ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        nz >= 38,
+        "$random must vary (got {} non-zero of 40):\n{}",
+        nz,
+        joined
+    );
+    assert!(
+        neg > 0,
+        "$random is signed — expected some negatives:\n{}",
+        joined
+    );
+}
+
+// ---------------------------------------------------------------- group 8
+
+/// §20.12 assertion controls take a SCOPE argument. The field-confirmed
+/// killer: `initial begin $assertoff(0,testbench); wait(rst_l===1);
+/// $asserton(0,testbench); end` failed whole-testbench elaboration with
+/// "Undeclared identifier 'testbench'".
+#[test]
+fn assertion_control_scope_args_elaborate() {
+    let src = r#"
+module tb;
+  logic rst_l = 0;
+  int done = 0;
+  initial begin $assertoff(0,tb); wait (rst_l === 1'b1); $asserton(0,tb); end
+  initial begin #5 rst_l = 1; #2 done = 1; $finish; end
+endmodule: tb
+"#;
+    let sim = simulate(src, 100).expect("assertion-control scope args must elaborate");
+    assert_eq!(u(&sim, "done"), 1, "sim must run past $assertoff/$asserton");
+    // §20.12 assertion control is modeled: no stub warning.
+    let warned = sim.warned_system_task_names();
+    assert!(
+        !warned.iter().any(|n| n.starts_with("$assert")),
+        "assertion control must not warn: {warned:?}"
+    );
+}
+
+/// The SHM + SST2 waveform tasks take a SCOPE as first argument
+/// (`$shm_probe(testbench, "AC")`). Elaboration's identifier validation
+/// treated that scope as a value lookup and failed the whole testbench with
+/// "Undeclared identifier 'testbench'" — a field report from a real
+/// verification environment written for another simulator. They must
+/// elaborate and no-op.
+#[test]
+fn shm_and_record_tasks_with_scope_args_elaborate() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  int done = 0;
+  always #5 clk = ~clk;
+  initial begin
+    $shm_open("waves.shm");
+    $shm_probe(tb, "AC");
+    $recordvars(tb);
+    $probe(tb.clk);
+    $xmvwdbDumpvars(tb);
+    $xm_probe(tb, "AC");
+    $indago_probe(tb);
+    #12;
+    done = 1;
+    $shm_close;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("SHM scope args must not fail elaboration");
+    assert_eq!(u(&sim, "done"), 1, "sim must run past the SHM calls");
+}

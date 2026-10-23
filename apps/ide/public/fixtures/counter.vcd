@@ -1,0 +1,60 @@
+$date
+  2026-10-21
+$end
+$version
+  xezim-studio LUNA-00B fixture
+$end
+$timescale 1 ns $end
+$scope module top $end
+$var wire 1 a clk $end
+$var wire 4 b count [3:0] $end
+$upscope $end
+$enddefinitions $end
+#0
+0a
+b0000 b
+#5
+1a
+b0001 b
+#10
+0a
+b0010 b
+#15
+1a
+b0011 b
+#20
+0a
+b0100 b
+#25
+1a
+b0101 b
+#30
+0a
+b0110 b
+#35
+1a
+b0111 b
+#40
+0a
+b1000 b
+#45
+1a
+b1001 b
+#50
+0a
+b1010 b
+#55
+1a
+b1011 b
+#60
+0a
+b1100 b
+#65
+1a
+b1101 b
+#70
+0a
+b1110 b
+#75
+1a
+b1111 b

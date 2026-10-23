@@ -1,0 +1,8 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "services/*"
+allowBuilds:
+  '@modelcontextprotocol/inspector': false
+minimumReleaseAgeExclude:
+  - '@modelcontextprotocol/inspector@2.12.0'

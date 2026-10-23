@@ -1,0 +1,8 @@
+(DELAYFILE
+ (SDFVERSION "3.0")
+ (DESIGN "c32_sdf")
+ (TIMESCALE 1ns)
+ (CELL (CELLTYPE "bufc") (INSTANCE u1)
+   (DELAY (ABSOLUTE (IOPATH a y (4:5:6) (7:8:9))))
+ )
+)

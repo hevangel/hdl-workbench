@@ -1,0 +1,67 @@
+//! IEEE 1800-2023 clause 5: lexical conventions.
+
+use crate::harness::{Order, check};
+
+// §5.4, §5.6, §5.6.1, §5.7.1, §5.7.2, §5.8, ...: comments, identifiers, integer/real/time/string literals, attributes
+#[test]
+fn c5_lexical_conventions() {
+    // Known gap (§5.9): `5.9b` reference `abcdef`, xezim `abc`
+    check(
+        "c05_lex",
+        include_str!("sv/c05_lex.sv"),
+        "c05",
+        Order::Exact,
+        &[
+            "T|5.7.1a|00ff",
+            "T|5.7.1b|00ff",
+            "T|5.7.1c|0000000000000001",
+            "T|5.7.1d|xxxxxxxxxxxxxxxx",
+            "T|5.7.1e|zzzzzzzzzzzzzzz1",
+            "T|5.7.1f|000000000000xxx1",
+            "T|5.7.1g|0000zzzzzzzz1010",
+            "T|5.7.1h|0000ffffffffffff",
+            "T|5.7.1i|0000010000000000",
+            "T|5.7.1j|xxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T|5.7.1k|8000000000000000000000000",
+            "T|5.7.1l|-3 11111101",
+            "T|5.7.1m|-56",
+            "T|5.7.1n|-5",
+            "T|5.7.1o|-3",
+            "T|5.7.1p|-1 -1",
+            "T|5.7.1q|0",
+            "T|5.7.1r|111",
+            "T|5.7.1s|zzzz",
+            "T|5.7.1t|1000000",
+            "T|5.7.1u|12",
+            "T|5.7.1v|10",
+            "T|5.7.1w|ffff",
+            "T|5.7.1x|fffffffffffffffffffffffff",
+            "T|5.7.1y|xxxx",
+            "T|5.7.1z|zzzz",
+            "T|5.7.1A|0000",
+            "T|5.7.1B|1",
+            "T|5.7.1C|0010",
+            "T|5.7.1D|ffffffffffffffff",
+            "T|5.7.2a|1500.000000",
+            "T|5.7.2b|2.000000e-02",
+            "T|5.7.2c|1000.000500",
+            "T|5.7.2d|0.10000000000000001",
+            "T|5.7.2e|3",
+            "T|5.7.2f|-3",
+            "T|5.7.2g|1",
+            "T|5.7.2h|4",
+            "T|5.8|1 3",
+            "T|5.9a|a\u{9}b\\c\"dAA",
+            "T|5.9c|6162",
+            "T|5.9d|0061",
+            "T|5.9e|   hello|00000068656c6c6f",
+            "T|5.9f|24",
+            "T|5.9g|6",
+            "T|5.6.1|1 0 1",
+            "T|5.12|1",
+            "T|5.11|'{1, 2, 3} '{a:5, b:6}",
+            "T|5.4|comments ok",
+        ],
+        &["T|5.9b|"],
+    );
+}

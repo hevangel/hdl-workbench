@@ -1,0 +1,140 @@
+[package]
+name = "xezim"
+version = "0.11.2"
+build = "src/build.rs"
+edition = "2024"
+rust-version = "1.92"
+description = "SystemVerilog bytecode interpreter (IEEE 1800-2023, with --sv2017 opt-out)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+ahash = { version = "0.8", features = ["serde"] }
+rand = "0.8"
+# Fetched from git so `cargo build` works from a bare clone of this repo
+# alone — PINNED to the exact xezim-core revision this xezim revision was
+# tested against (a floating branch let a fresh clone resolve a core the
+# code had never met). The rev is bumped in the same push that starts
+# depending on new core behavior; releases therefore always pair.
+#
+# Local checkout at ./xezim-core or ../xezim-core? Run
+# `./scripts/use-local-core.sh` once (or use scripts/cargo-local.sh per
+# invocation) and plain `cargo build` uses it — no network, no git dep.
+# See "Modifying xezim-core" in README.md.
+xezim-core = { path = "../xezim-core", default-features = false }
+sv-parser = { path = "../xezim-core/xezim-parser" }
+libc = "0.2"
+serde = { version = "1", features = ["derive", "rc"] }
+bincode = "1.3"
+once_cell = "1.18"
+# JIT: enabled with `--features jit`. Kept optional to avoid adding the
+# cranelift build dependency to users who only want the interpreter.
+cranelift = { version = "0.131", optional = true }
+cranelift-jit = { version = "0.131", optional = true }
+cranelift-module = { version = "0.131", optional = true }
+cranelift-native = { version = "0.131", optional = true }
+fst-writer = "0.3"
+# Inflate only, for the FST time-table repair in `fst_finish`. Already in the
+# tree via fst-writer, so this adds no build cost.
+miniz_oxide = "0.8"
+
+# macOS: link the SDK's libffi instead of building libffi-sys's vendored copy.
+# The vendored autoconf build breaks on aarch64 with modern clang two ways —
+# `configure` hands clang the GCC-only `-print-multi-os-directory`, and clang's
+# integrated assembler rejects the CFI expressions in `src/aarch64/sysv.S`.
+# Feature-gated by target so Linux and Windows keep the self-contained
+# vendored build and need no system libffi; Cargo unions features, so this
+# only adds `system` when building for macOS.
+# See issue #56.
+[target.'cfg(target_os = "macos")'.dependencies]
+libffi = { version = "3", features = ["system"] }
+
+# Dynamic C plugins and libffi are native-only. The browser worker uses the
+# interpreter and rejects DPI/VPI library loading at its boundary.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libloading = "0.8"
+libffi = "3"
+
+# The core's mimalloc allocator is native-only; native builds keep it through
+# the default feature below, while the wasm crate opts out.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+web-time = "1"
+
+# IEEE 1800 §35.5.2: each call of an imported DPI task runs on its own
+# stack (src/compiler/simulator/dpi_task.rs). Stackful coroutines for
+# x86_64 and aarch64 on Linux (glibc and musl) and macOS alike; elsewhere the
+# nested-scheduler fallback runs (#290).
+[target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+corosensei = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# `tests/gates/fst_roundtrip.rs` DECODES the FST dumps this crate writes, to
+# check var types, widths, aliases, values and the trailer's end_time. An FST
+# is block-compressed, so byte-level assertions cannot see any of that — and
+# shelling out to GTKWave's `fst2vcd` would put a system tool on the test path.
+# Reader half of the `fst-writer` above, same author and format revision.
+fst-reader = "0.17"
+# `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
+# check that its header declares the compression (XTrace §6.8). Same version
+# xezim-core writes the stream with.
+zstd = "0.13"
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["native-allocator"]
+native-allocator = ["xezim-core/mimalloc-allocator"]
+# Per-instruction opcode/adjacent-pair histogram for fusion planning.
+# Off by default: the counting sits on the VM dispatch critical path.
+opcode-census = []
+# Check EVERY failed signal-name lookup against the input-port nets left out
+# by unobserved-port elision (validation runs; release builds check only the
+# resolution points that can plausibly reach one).
+elide-audit = []
+jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "xezim-core/native-layout"]
+
+[[bin]]
+name = "xezim"
+path = "src/main.rs"
+
+[[bin]]
+name = "xezim-bench"
+path = "src/bin/bench.rs"
+
+[lib]
+name = "xezim"
+path = "src/lib.rs"
+
+[profile.release]
+# Thin-LTO: the LLVM-JIT miscompile that forced lto=false is gone with
+# that backend; cross-crate inlining of xezim-core Value accessors
+# (raw_bits was 6% of a CoreMark run un-inlined) is worth the build time.
+# Validated against the cranelift JIT + full suites on re-enable.
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = "line-tables-only"
+panic = "abort"
+
+# Interpreter-only LTO build. Use when NOT building with `--features jit`.
+# Build with:
+#   cargo build --release --profile release-lto --bin xezim
+# (Binary lands in `target/release-lto/xezim`.)  Measured on c910 hello
+# to shave a few seconds off the interpreter hot path via cross-crate
+# inlining of Value ops and signal_table access.
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
+# Optimize xezim-core (Value bit/slice arithmetic) and sv-parser (lexing/parsing
+# uvm_pkg.sv across UVM integration tests) during `cargo test`, while keeping
+# the xezim crate itself at opt-level = 0 for fast incremental test builds.
+[profile.test.package.xezim-core]
+opt-level = 2
+
+[profile.test.package.sv-parser]
+opt-level = 2

@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "projectId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "finish",
+        "failed",
+        "timeout",
+        "resource_limit"
+      ]
+    },
+    "diagnostics": {
+      "maxItems": 100000,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warning",
+              "info"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "pattern": "^(?!\\/)(?![A-Za-z]:)(?!.*(?:^|\\/)\\.{1,2}(?:\\/|$))(?!.*\\/\\/)(?!.*[\\\\\\u0000-\\u001f\\u007f])[^/]+(?:\\/[^/]+)*$"
+          },
+          "line": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          },
+          "column": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "severity",
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "stdout": {
+      "type": "string",
+      "maxLength": 16777216
+    },
+    "stderr": {
+      "type": "string",
+      "maxLength": 16777216
+    },
+    "lastTime": {
+      "type": "object",
+      "properties": {
+        "ticks": {
+          "type": "string",
+          "maxLength": 40,
+          "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "timescale": {
+          "type": "object",
+          "properties": {
+            "magnitude": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,2}$"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "s",
+                "ms",
+                "us",
+                "ns",
+                "ps",
+                "fs"
+              ]
+            }
+          },
+          "required": [
+            "magnitude",
+            "unit"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "ticks",
+        "timescale"
+      ],
+      "additionalProperties": false
+    },
+    "waveform": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "runId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "snapshotId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "format": {
+          "type": "string",
+          "const": "vcd"
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 268435456
+        },
+        "storage": {
+          "type": "string",
+          "enum": [
+            "opfs",
+            "bridge-file"
+          ]
+        },
+        "timescale": {
+          "type": "object",
+          "properties": {
+            "magnitude": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,2}$"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "s",
+                "ms",
+                "us",
+                "ns",
+                "ps",
+                "fs"
+              ]
+            }
+          },
+          "required": [
+            "magnitude",
+            "unit"
+          ],
+          "additionalProperties": false
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "runId",
+        "snapshotId",
+        "format",
+        "sizeBytes",
+        "storage",
+        "timescale",
+        "complete"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "runId",
+    "projectId",
+    "snapshotId",
+    "status",
+    "diagnostics",
+    "stdout",
+    "stderr",
+    "lastTime"
+  ],
+  "additionalProperties": false
+}

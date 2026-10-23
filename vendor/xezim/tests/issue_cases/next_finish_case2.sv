@@ -1,0 +1,1 @@
+module top; int q=0; task automatic halt(); q<=1; $finish; q++; endtask initial begin #5; halt(); q++; end final if(q==0) $display("PASS finish barrier"); else $display("FAIL finish barrier %0d",q); endmodule

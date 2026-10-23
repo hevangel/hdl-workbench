@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "runId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "format": {
+      "type": "string",
+      "const": "vcd"
+    },
+    "sizeBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 268435456
+    },
+    "storage": {
+      "type": "string",
+      "enum": [
+        "opfs",
+        "bridge-file"
+      ]
+    },
+    "timescale": {
+      "type": "object",
+      "properties": {
+        "magnitude": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,2}$"
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "s",
+            "ms",
+            "us",
+            "ns",
+            "ps",
+            "fs"
+          ]
+        }
+      },
+      "required": [
+        "magnitude",
+        "unit"
+      ],
+      "additionalProperties": false
+    },
+    "complete": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "id",
+    "runId",
+    "snapshotId",
+    "format",
+    "sizeBytes",
+    "storage",
+    "timescale",
+    "complete"
+  ],
+  "additionalProperties": false
+}

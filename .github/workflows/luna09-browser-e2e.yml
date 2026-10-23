@@ -1,0 +1,93 @@
+name: Xezim browser and native CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-workspaces: |
+            crates/xezim-web -> target
+            vendor/xezim -> target
+            vendor/xezim-core -> target
+
+      - name: Install wasm build dependency
+        run: sudo apt-get update && sudo apt-get install --yes clang
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+
+      - name: Build browser Xezim WASM assets
+        run: |
+          cargo build --locked --release --manifest-path crates/xezim-web/Cargo.toml --target wasm32-unknown-unknown
+          mkdir -p apps/ide/public/wasm
+          wasm-bindgen --target web --out-dir apps/ide/public/wasm \
+            crates/xezim-web/target/wasm32-unknown-unknown/release/xezim_web.wasm
+        env:
+          # The pinned upstream keeps native-only implementations compiled out on wasm32;
+          # their expected dead-code warnings must not fail the browser-target build.
+          CARGO_BUILD_WARNINGS: warn
+
+      - name: Build and test workspace
+        run: |
+          pnpm build
+          pnpm test
+
+      - name: Install Playwright browser and system dependencies
+        run: pnpm --filter @xezim-ide/mcp-bridge exec playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run browser integration acceptance test
+        run: pnpm test:e2e
+        env:
+          CI: true
+          PLAYWRIGHT_PROJECT: ${{ matrix.browser }}
+
+  native-xezim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          cache-workspaces: |
+            crates/xezim-web -> target
+            vendor/xezim -> target
+            vendor/xezim-core -> target
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes clang
+
+      - name: Run native Xezim compatibility suites
+        run: |
+          cargo test --manifest-path vendor/xezim-core/Cargo.toml -- --test-threads=1
+          cargo test --manifest-path vendor/xezim/Cargo.toml -- --test-threads=1
+          cargo test --manifest-path crates/xezim-web/Cargo.toml --lib -- --test-threads=1
