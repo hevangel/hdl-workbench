@@ -95,5 +95,5 @@ The case verifies this sequence:
 This validates local development and production bundles in the tested Chromium
 and Playwright Firefox projects. It does not establish a public hosted-site
 origin, public network performance, minimum hardware requirements, or legal
-approval. Source publication and the existing hosted-site and qualified-review
-gates remain open; see [v1 release readiness](v1-release-readiness.md).
+approval. The source branch is published in [PR #1](https://github.com/hevangel/xezim-studio/pull/1);
+the hosted-site and qualified-review gates remain open. See [v1 release readiness](v1-release-readiness.md).
