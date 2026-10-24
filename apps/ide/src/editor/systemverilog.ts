@@ -38,7 +38,7 @@ export function registerSystemVerilog(monaco: MonacoApi): void {
     languageRegistered = true;
   }
 
-  monaco.editor.defineTheme("xezim-studio-dark", {
+  monaco.editor.defineTheme("hdl-workbench-dark", {
     base: "vs-dark",
     inherit: true,
     rules: [
@@ -46,14 +46,23 @@ export function registerSystemVerilog(monaco: MonacoApi): void {
       { token: "macro", foreground: "F78C6C" },
       { token: "predefined", foreground: "82AAFF" },
       { token: "number", foreground: "F78C6C" },
+      { token: "comment", foreground: "5F6877", fontStyle: "italic" },
     ],
     colors: {
-      "editor.background": "#101319",
-      "editorLineNumber.foreground": "#555d6d",
-      "editorLineNumber.activeForeground": "#d8deea",
-      "editor.selectionBackground": "#27354a",
-      "editorCursor.foreground": "#76d6c2",
-      "editorLineHighlightBackground": "#171c24",
+      "editor.background": "#0e1116",
+      "editorGutter.background": "#0e1116",
+      "editorLineNumber.foreground": "#4b5361",
+      "editorLineNumber.activeForeground": "#c9d1dc",
+      "editor.selectionBackground": "#264a46",
+      "editor.inactiveSelectionBackground": "#1d2a2c",
+      "editorCursor.foreground": "#5fd4b8",
+      "editor.lineHighlightBackground": "#151920",
+      "editor.lineHighlightBorder": "#00000000",
+      "editorIndentGuide.background1": "#1c2129",
+      "editorWidget.background": "#161a21",
+      "editorWidget.border": "#2a303a",
+      "scrollbarSlider.background": "#2a303a80",
+      "scrollbarSlider.hoverBackground": "#3a414d99",
     },
   });
 }
@@ -73,7 +82,7 @@ export function toMonacoMarkers(monaco: MonacoApi, diagnostics: Diagnostic[]) {
       startColumn: column,
       endLineNumber: line,
       endColumn: column + 1,
-      source: "Xezim Studio",
+      source: "HDL Workbench",
       code: diagnostic.code,
     };
   });

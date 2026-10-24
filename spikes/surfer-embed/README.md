@@ -11,7 +11,7 @@ In PowerShell:
 
 Open http://127.0.0.1:4173/ in Chromium and wait at least 15 seconds. The page logs each posted message. Inspect the Surfer frame for the top.count waveform and a cursor at tick 25. The fixture uses a 1 ns timescale and transitions from 0 to 15 every 5 ns.
 
-The script waits after the iframe document's load event because the pinned source provides no documented readiness callback for a parent page. This delay is only a smoke-test accommodation; production should add a readiness hook when building pinned assets. This harness has not passed in the available environment: the browser runner cannot reach the local loopback server, and the hosted iframe is not pinned or same-origin. See `docs/surfer-integration-report.md` before treating any message as supported.
+The script waits after the iframe document's load event because the pinned source provides no documented readiness callback for a parent page. This delay is only a smoke-test accommodation; production should add a readiness hook when building pinned assets. This harness has not passed in the available environment: the browser runner cannot reach the local loopback server, and the hosted iframe is not pinned or same-origin. See `docs/session_history/initial_build/surfer-integration-report.md` before treating any message as supported.
 
 ## Pin and license
 

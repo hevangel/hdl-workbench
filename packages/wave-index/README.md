@@ -1,4 +1,4 @@
-# Xezim Studio waveform index
+# HDL Workbench waveform index
 
 This package indexes VCD value changes for historical queries. It does not use pixels from Surfer and does not modify the waveform artifact. Feed it a string for small fixtures or an async iterable of UTF-8 chunks for larger artifacts. `Blob.stream()` can be passed directly in browser runtimes that expose `ReadableStream` async iteration.
 

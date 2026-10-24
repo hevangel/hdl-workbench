@@ -20,7 +20,7 @@ describe("SurferWaveformPanel", () => {
     render(<SurferWaveformPanel />);
 
     expect(screen.getByLabelText("Surfer license and source information")).toHaveTextContent(
-      "Surfer v0.7.0 · EUPL-1.2 · modified by Xezim Studio on 2026-10-22",
+      "Surfer v0.7.0 · EUPL-1.2 · modified by HDL Workbench on 2026-10-22",
     );
     expect(screen.getByRole("link", { name: "License" })).toHaveAttribute(
       "href",

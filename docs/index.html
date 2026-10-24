@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How HDL Workbench Works</title>
+<meta name="description" content="How HDL Workbench edits SystemVerilog, simulates it with Xezim WebAssembly in a browser Worker, shows waveforms in Surfer, and lets a local AI agent drive it over MCP.">
+<style>
+  :root {
+    --bg: #f7f6f2;
+    --surface: #ffffff;
+    --surface-2: #efede6;
+    --ink: #1c1c1a;
+    --muted: #5d5b55;
+    --line: #d6d3c9;
+    --accent: #2457c5;
+    --accent-soft: #dfe7fa;
+    --agent: #8a4fc2;
+    --agent-soft: #efe4fa;
+    --sim: #1d8a5b;
+    --sim-soft: #dcf2e7;
+    --wave: #c26a12;
+    --wave-soft: #fbead8;
+    --store: #5b6575;
+    --store-soft: #e6e9ee;
+    --warn: #a3361f;
+    --radius: 12px;
+    --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141413;
+      --surface: #1d1d1b;
+      --surface-2: #262623;
+      --ink: #ecebe6;
+      --muted: #a6a39a;
+      --line: #3a3934;
+      --accent: #7ea2ff;
+      --accent-soft: #1f2b47;
+      --agent: #c49af0;
+      --agent-soft: #33264a;
+      --sim: #5fd3a0;
+      --sim-soft: #173a2b;
+      --wave: #f0a85a;
+      --wave-soft: #43301a;
+      --store: #a3adbd;
+      --store-soft: #2a2f38;
+      --warn: #ff8a70;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141413;
+    --surface: #1d1d1b;
+    --surface-2: #262623;
+    --ink: #ecebe6;
+    --muted: #a6a39a;
+    --line: #3a3934;
+    --accent: #7ea2ff;
+    --accent-soft: #1f2b47;
+    --agent: #c49af0;
+    --agent-soft: #33264a;
+    --sim: #5fd3a0;
+    --sim-soft: #173a2b;
+    --wave: #f0a85a;
+    --wave-soft: #43301a;
+    --store: #a3adbd;
+    --store-soft: #2a2f38;
+    --warn: #ff8a70;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.6 var(--sans);
+  }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  code { font-family: var(--mono); font-size: 0.88em; background: var(--surface-2); padding: 0.1em 0.35em; border-radius: 4px; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+
+  header.hero { padding: 64px 0 32px; border-bottom: 1px solid var(--line); }
+  .eyebrow { font: 600 0.78rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: clamp(2rem, 5vw, 3.2rem); line-height: 1.1; margin: 12px 0 16px; letter-spacing: -0.02em; }
+  .lede { font-size: 1.15rem; color: var(--muted); max-width: 62ch; margin: 0; }
+  .invariant {
+    margin-top: 28px; padding: 14px 18px; border-left: 4px solid var(--sim);
+    background: var(--sim-soft); border-radius: 0 var(--radius) var(--radius) 0; max-width: 72ch;
+  }
+  nav.toc { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 28px; font-size: 0.95rem; }
+  .host { color: var(--muted); font: 0.75rem var(--mono); white-space: nowrap; }
+
+  section { padding: 56px 0 8px; }
+  h2 { font-size: 1.6rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h3 { font-size: 1.1rem; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 24px; max-width: 70ch; }
+
+  /* Architecture diagram */
+  .diagram-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; }
+  .diagram-scroll { overflow-x: auto; }
+  svg.arch { display: block; width: 100%; min-width: 720px; height: auto; font-family: var(--sans); }
+  .arch .frame { fill: none; stroke: var(--line); stroke-width: 1.5; stroke-dasharray: 6 5; }
+  .arch .frame-label { fill: var(--muted); font: 600 12px var(--mono); letter-spacing: 0.06em; }
+  .arch .node rect { stroke-width: 1.5; rx: 10; transition: opacity .25s, stroke-width .25s; }
+  .arch .node .t { font-weight: 650; font-size: 14px; fill: var(--ink); }
+  .arch .node .d { font-size: 11.5px; fill: var(--muted); }
+  .arch .agent rect { fill: var(--agent-soft); stroke: var(--agent); }
+  .arch .ui rect { fill: var(--accent-soft); stroke: var(--accent); }
+  .arch .sim rect { fill: var(--sim-soft); stroke: var(--sim); }
+  .arch .wave rect { fill: var(--wave-soft); stroke: var(--wave); }
+  .arch .store rect { fill: var(--store-soft); stroke: var(--store); }
+  .arch .edge path { fill: none; stroke: var(--muted); stroke-width: 1.6; transition: opacity .25s, stroke .25s; }
+  .arch .edge text { font: 11px var(--mono); fill: var(--muted); transition: opacity .25s; }
+  .arch .edge .bg { fill: var(--surface); }
+  .arch.stepping .node:not(.on) { opacity: 0.28; }
+  .arch.stepping .edge:not(.on) { opacity: 0.15; }
+  .arch .node.on rect { stroke-width: 3; }
+  .arch .edge.on path { stroke: var(--ink); stroke-width: 2.4; stroke-dasharray: 7 5; animation: march 0.9s linear infinite; }
+  .arch .edge.on text { fill: var(--ink); }
+  @keyframes march { to { stroke-dashoffset: -24; } }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .arch .edge.on path { animation: none; }
+    .arch .node rect, .arch .edge path, .arch .edge text { transition: none; }
+  }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 14px 4px 2px; font-size: 0.85rem; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1.5px solid var(--c); background: var(--cs); }
+
+  /* Run walkthrough */
+  .stepper { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; margin-top: 20px; }
+  @media (min-width: 900px) { .stepper { grid-template-columns: 300px minmax(0, 1fr); } }
+  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: s; display: grid; gap: 6px; }
+  ol.steps li { counter-increment: s; }
+  ol.steps button {
+    width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px 10px 46px; position: relative;
+  }
+  ol.steps button::before {
+    content: counter(s); position: absolute; left: 12px; top: 10px; width: 24px; height: 24px; border-radius: 50%;
+    display: grid; place-items: center; font: 600 12px var(--mono); background: var(--surface-2); color: var(--muted);
+  }
+  ol.steps button[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  ol.steps button[aria-pressed="true"]::before { background: var(--accent); color: var(--surface); }
+  ol.steps .k { display: block; font-weight: 650; }
+  ol.steps .v { display: block; font-size: 0.86rem; color: var(--muted); }
+  .step-detail { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+  .step-detail h3 { margin-bottom: 8px; }
+  .step-detail p { margin: 0 0 10px; }
+  .step-controls { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .btn {
+    font: 600 0.9rem var(--sans); padding: 8px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--surface-2); color: var(--ink);
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+  .nojs-note { font-size: 0.9rem; color: var(--muted); }
+
+  /* Cards */
+  .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 20px; }
+  .card p { margin: 0 0 8px; }
+  .card ul { margin: 6px 0 0; padding-left: 18px; }
+  .tag { display: inline-block; font: 600 0.72rem/1 var(--mono); padding: 5px 8px; border-radius: 999px; margin-bottom: 10px; letter-spacing: 0.04em; }
+  .tag.ui { background: var(--accent-soft); color: var(--accent); }
+  .tag.agent { background: var(--agent-soft); color: var(--agent); }
+
+  /* Pairing sequence */
+  .seq { display: grid; gap: 0; margin: 8px 0 0; padding: 0; list-style: none; position: relative; }
+  .seq li { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 16px; padding: 12px 0; border-bottom: 1px dashed var(--line); }
+  .seq li:last-child { border-bottom: 0; }
+  .who { font: 600 0.78rem/1.4 var(--mono); padding: 4px 8px; border-radius: 6px; align-self: start; text-align: center; }
+  .who.a { background: var(--agent-soft); color: var(--agent); }
+  .who.b { background: var(--store-soft); color: var(--store); }
+  .who.p { background: var(--accent-soft); color: var(--accent); }
+  .who.w { background: var(--sim-soft); color: var(--sim); }
+  @media (max-width: 520px) { .seq li { grid-template-columns: minmax(0, 1fr); gap: 6px; } .who { justify-self: start; } }
+
+  /* Limits */
+  .limits { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); }
+  .limit { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; }
+  .limit .n { font: 700 1.5rem/1.2 var(--sans); letter-spacing: -0.01em; }
+  .limit .l { font-size: 0.88rem; color: var(--muted); }
+  .unsupported { margin-top: 16px; padding: 14px 18px; border-left: 4px solid var(--warn); background: var(--surface); border-radius: 0 var(--radius) var(--radius) 0; }
+
+  /* Tables */
+  .table-scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); background: var(--surface-2); }
+  tr:last-child td { border-bottom: 0; }
+  td code { white-space: nowrap; }
+
+  footer { margin-top: 64px; padding: 28px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">HDL Workbench · overview</div>
+    <h1>SystemVerilog, simulated in your browser</h1>
+    <p class="lede">HDL Workbench pairs a Monaco editor with the Xezim simulator compiled to WebAssembly and the Surfer waveform viewer, all in one browser tab. A local AI agent can drive the same tab over MCP.</p>
+    <p class="invariant"><strong>One rule shapes everything:</strong> simulation always runs as Xezim WebAssembly inside a browser Web Worker. Nothing falls back to a native, server-side or JavaScript simulator. If the WASM assets are missing, the Run button stays disabled.</p>
+    <nav class="toc" aria-label="On this page">
+      <a href="#architecture">Architecture</a>
+      <a href="#run">Life of a run</a>
+      <a href="#modes">Two ways to work</a>
+      <a href="#pairing">Agent pairing</a>
+      <a href="#limits">Limits</a>
+      <a href="#components">Components</a>
+      <a href="#repo">Repository</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+<section id="architecture">
+  <div class="wrap">
+    <h2>Architecture</h2>
+    <p class="sub">Everything inside the dashed frame runs in one browser origin. The optional agent path on the left only moves files and requests; it never simulates.</p>
+    <div class="diagram-card">
+      <div class="diagram-scroll">
+        <svg class="arch" id="arch" viewBox="0 0 960 520" role="img" aria-labelledby="arch-title arch-desc">
+          <title id="arch-title">HDL Workbench component diagram</title>
+          <desc id="arch-desc">An AI agent talks MCP over stdio to a local Node bridge, which owns a project folder on disk and connects to the browser over a loopback WebSocket. Inside the browser, the IDE shell and controller use an OPFS workspace, send snapshots to a C/C++ DPI compiler Worker and the Xezim WASM Worker, store the VCD in OPFS and show it in the Surfer viewer.</desc>
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+
+          <rect class="frame" x="250" y="12" width="698" height="496" rx="16"/>
+          <text class="frame-label" x="268" y="34">BROWSER TAB · ONE ORIGIN</text>
+          <text class="frame-label" x="20" y="34">OPTIONAL · LOCAL</text>
+
+          <!-- Edges -->
+          <g class="edge" data-id="e-agent-bridge" style="color: var(--muted)">
+            <path d="M115 128 V206" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+            <rect class="bg" x="122" y="158" width="74" height="16" rx="3"/><text x="126" y="170">MCP stdio</text>
+          </g>
+          <g class="edge" data-id="e-bridge-disk" style="color: var(--muted)">
+            <path d="M115 302 V378" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+            <rect class="bg" x="122" y="332" width="74" height="16" rx="3"/><text x="126" y="344">revisions</text>
+          </g>
+          <g class="edge" data-id="e-bridge-ctrl" style="color: var(--muted)">
+            <path d="M212 254 H236 L250 240 H286" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+            <rect class="bg" x="213" y="264" width="74" height="44" rx="3"/><text x="215" y="276">ws://</text><text x="215" y="290">127.0.0.1</text><text x="215" y="304">xezim-ide/1</text>
+          </g>
+          <g class="edge" data-id="e-ui-ctrl" style="color: var(--muted)">
+            <path d="M430 122 V166" marker-end="url(#arrow)"/>
+            <rect class="bg" x="438" y="136" width="40" height="16" rx="3"/><text x="442" y="148">Run</text>
+          </g>
+          <g class="edge" data-id="e-ctrl-ws" style="color: var(--muted)">
+            <path d="M430 262 V326" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+            <rect class="bg" x="438" y="286" width="70" height="16" rx="3"/><text x="442" y="298">snapshot</text>
+          </g>
+          <g class="edge" data-id="e-ctrl-dpi" style="color: var(--muted)">
+            <path d="M572 186 H586 L600 172 V96 L612 84 H616" marker-end="url(#arrow)"/>
+          </g>
+          <g class="edge" data-id="e-ctrl-sim" style="color: var(--muted)">
+            <path d="M572 208 H616" marker-end="url(#arrow)"/>
+          </g>
+          <g class="edge" data-id="e-dpi-sim" style="color: var(--muted)">
+            <path d="M765 110 V146" marker-end="url(#arrow)"/>
+            <rect class="bg" x="773" y="120" width="88" height="16" rx="3"/><text x="777" y="132">.wasm modules</text>
+          </g>
+          <g class="edge" data-id="e-sim-vcd" style="color: var(--muted)">
+            <path d="M765 232 V266" marker-end="url(#arrow)"/>
+            <rect class="bg" x="773" y="242" width="96" height="16" rx="3"/><text x="777" y="254">bounded VCD</text>
+          </g>
+          <g class="edge" data-id="e-vcd-surfer" style="color: var(--muted)">
+            <path d="M765 330 V366" marker-end="url(#arrow)"/>
+            <rect class="bg" x="773" y="340" width="82" height="16" rx="3"/><text x="777" y="352">object URL</text>
+          </g>
+          <g class="edge" data-id="e-ctrl-surfer" style="color: var(--muted)">
+            <path d="M572 240 H584 L598 254 V406 L612 420 H616" marker-end="url(#arrow)"/>
+            <rect class="bg" x="512" y="430" width="96" height="16" rx="3"/><text x="516" y="442">SurferAdapter</text>
+          </g>
+
+          <!-- Nodes -->
+          <g class="node agent" data-id="agent">
+            <rect x="20" y="52" width="190" height="76"/>
+            <text class="t" x="36" y="80">AI agent</text>
+            <text class="d" x="36" y="100">Codex, Claude Code,</text>
+            <text class="d" x="36" y="116">any MCP client</text>
+          </g>
+          <g class="node store" data-id="bridge">
+            <rect x="20" y="206" width="190" height="96"/>
+            <text class="t" x="36" y="234">MCP bridge</text>
+            <text class="d" x="36" y="254">Node · services/mcp-bridge</text>
+            <text class="d" x="36" y="270">loopback, paired, origin-checked</text>
+            <text class="d" x="36" y="286">never simulates</text>
+          </g>
+          <g class="node store" data-id="disk">
+            <rect x="20" y="378" width="190" height="76"/>
+            <text class="t" x="36" y="406">Project folder</text>
+            <text class="d" x="36" y="426">--project-root on disk</text>
+            <text class="d" x="36" y="442">sha256 revisions</text>
+          </g>
+
+          <g class="node ui" data-id="ui">
+            <rect x="288" y="46" width="284" height="76"/>
+            <text class="t" x="304" y="74">IDE shell</text>
+            <text class="d" x="304" y="94">React · Monaco SystemVerilog editor</text>
+            <text class="d" x="304" y="110">explorer, diagnostics, output panels</text>
+          </g>
+          <g class="node ui" data-id="ctrl">
+            <rect x="288" y="166" width="284" height="96"/>
+            <text class="t" x="304" y="194">BrowserIdeController</text>
+            <text class="d" x="304" y="214">one execute() for the Run button</text>
+            <text class="d" x="304" y="230">and authenticated MCP requests;</text>
+            <text class="d" x="304" y="246">binds every run to a snapshot ID</text>
+          </g>
+          <g class="node store" data-id="ws">
+            <rect x="288" y="326" width="284" height="76"/>
+            <text class="t" x="304" y="354">Browser workspace</text>
+            <text class="d" x="304" y="374">OPFS files + IndexedDB metadata</text>
+            <text class="d" x="304" y="390">revisioned writes · ZIP import/export</text>
+          </g>
+
+          <g class="node sim" data-id="dpi">
+            <rect x="616" y="46" width="300" height="64"/>
+            <text class="t" x="632" y="72">DPI compiler Worker</text>
+            <text class="d" x="632" y="92">browsercc Clang/LLD · C/C++ → standalone .wasm</text>
+          </g>
+          <g class="node sim" data-id="sim">
+            <rect x="616" y="146" width="300" height="86"/>
+            <text class="t" x="632" y="174">Xezim WASM Worker</text>
+            <text class="d" x="632" y="194">one-shot compile + simulate</text>
+            <text class="d" x="632" y="210">virtual files · 256 MiB memory · 300 s</text>
+          </g>
+          <g class="node store" data-id="vcd">
+            <rect x="616" y="266" width="300" height="64"/>
+            <text class="t" x="632" y="292">Waveform store</text>
+            <text class="d" x="632" y="312">OPFS · 8 VCDs / 128 MiB retained</text>
+          </g>
+          <g class="node wave" data-id="surfer">
+            <rect x="616" y="366" width="300" height="96"/>
+            <text class="t" x="632" y="394">Surfer viewer</text>
+            <text class="d" x="632" y="414">v0.7.0 WASM in a same-origin iframe</text>
+            <text class="d" x="632" y="430">load · add signals · cursor · zoom</text>
+            <text class="d" x="632" y="446">EUPL-1.2</text>
+          </g>
+        </svg>
+      </div>
+      <div class="legend" aria-hidden="true">
+        <span style="--c: var(--agent); --cs: var(--agent-soft)">Agent</span>
+        <span style="--c: var(--accent); --cs: var(--accent-soft)">Interface &amp; control</span>
+        <span style="--c: var(--sim); --cs: var(--sim-soft)">Execution Workers</span>
+        <span style="--c: var(--store); --cs: var(--store-soft)">Files &amp; transport</span>
+        <span style="--c: var(--wave); --cs: var(--wave-soft)">Waveforms</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="run">
+  <div class="wrap">
+    <h2>Life of a run</h2>
+    <p class="sub">The same path serves the Run button and an agent's <code>run_simulation</code> call. Pick a step to highlight it in the diagram above, or play the whole sequence.</p>
+    <div class="stepper">
+      <ol class="steps" id="steps">
+        <li><button type="button" data-nodes="agent bridge disk ui ws" data-edges="e-agent-bridge e-bridge-disk e-ui-ctrl e-ctrl-ws"><span class="k">Edit</span><span class="v">Type in Monaco, or the agent writes a file</span></button></li>
+        <li><button type="button" data-nodes="bridge ctrl ws" data-edges="e-bridge-ctrl e-ctrl-ws"><span class="k">Snapshot</span><span class="v">Freeze an immutable, hashed set of files</span></button></li>
+        <li><button type="button" data-nodes="ctrl dpi" data-edges="e-ctrl-dpi"><span class="k">Compile DPI helpers</span><span class="v">Only when the project has C/C++</span></button></li>
+        <li><button type="button" data-nodes="ctrl dpi sim" data-edges="e-ctrl-sim e-dpi-sim"><span class="k">Simulate</span><span class="v">Xezim WASM compiles and runs in a Worker</span></button></li>
+        <li><button type="button" data-nodes="sim vcd" data-edges="e-sim-vcd"><span class="k">Store the waveform</span><span class="v">The VCD is persisted in OPFS</span></button></li>
+        <li><button type="button" data-nodes="ctrl vcd surfer" data-edges="e-vcd-surfer e-ctrl-surfer"><span class="k">View</span><span class="v">Surfer loads it; signals and cursor follow</span></button></li>
+        <li><button type="button" data-nodes="agent bridge ctrl ui" data-edges="e-agent-bridge e-bridge-ctrl e-ui-ctrl"><span class="k">Report</span><span class="v">Status, output and diagnostics return</span></button></li>
+      </ol>
+      <div class="step-detail" id="step-detail" aria-live="polite">
+        <div data-step="0">
+          <h3>1 · Edit</h3>
+          <p>In browser-only mode you edit in Monaco, and saves go to the browser's origin-private file system with a revision check. When an agent is paired, the <strong>disk folder becomes the authority</strong>. The agent calls <code>write_project_file</code> with the revision it last read, and a stale revision returns <code>REVISION_CONFLICT</code> instead of overwriting your work.</p>
+        </div>
+        <div data-step="1" hidden>
+          <h3>2 · Snapshot</h3>
+          <p>Before every run the bridge hashes the project into a <code>snapshotId</code> and synchronizes those exact bytes to the browser workspace. The controller recomputes the snapshot from file revisions and refuses to run a mismatched one. Logs and waveforms keep that ID, so every result traces back to the sources that produced it.</p>
+        </div>
+        <div data-step="2" hidden>
+          <h3>3 · Compile DPI helpers</h3>
+          <p>Project <code>.c</code>/<code>.cpp</code> files are compiled by a pinned Clang/LLD toolchain running as WebAssembly in its own Worker. Each becomes a standalone, import-free <code>.wasm</code> module. The browser ABI is narrow: <code>int</code> functions with scalar <code>input int</code> arguments, and <code>extern "C"</code> for C++. A compile error returns <code>DPI_COMPILATION_FAILED</code>.</p>
+        </div>
+        <div data-step="3" hidden>
+          <h3>4 · Simulate</h3>
+          <p>The Xezim Worker receives the snapshot, top module, stop time and limits, then compiles and simulates in one bounded call. <code>$readmemh</code>, <code>$fopen</code> and <code>$display</code> work against project-relative virtual files. A wall-time guard terminates the Worker after at most 300 s, and allocation past the 256 MiB WASM ceiling reports <code>RESOURCE_LIMIT</code>.</p>
+        </div>
+        <div data-step="4" hidden>
+          <h3>5 · Store the waveform</h3>
+          <p>The VCD is written into a bounded in-memory sink (up to 64 MiB) and persisted in OPFS as a waveform artifact with its run ID, snapshot ID and timescale. Waveform bytes never travel through MCP JSON; only artifact metadata does.</p>
+        </div>
+        <div data-step="5" hidden>
+          <h3>6 · View</h3>
+          <p>Surfer runs as WebAssembly in a same-origin iframe and receives the artifact as an object URL. Only the versioned <code>SurferAdapter</code> knows Surfer's unstable internal messages, which it uses to load, add signals, set the cursor and zoom. An agent can call <code>show_waveforms</code> to open the run you're both looking at.</p>
+        </div>
+        <div data-step="6" hidden>
+          <h3>7 · Report</h3>
+          <p>The run result carries a <code>status</code> (<code>completed</code>, <code>finish</code>, <code>failed</code>, <code>timeout</code> or <code>resource_limit</code>), stdout/stderr, structured diagnostics with file and line, the last simulated time and the waveform reference. The IDE shows it in its panels and marks diagnostics in the editor. The agent receives the same result over the bridge.</p>
+        </div>
+        <div class="step-controls" id="step-controls" hidden>
+          <button type="button" class="btn" id="prev">Previous</button>
+          <button type="button" class="btn primary" id="play">Play sequence</button>
+          <button type="button" class="btn" id="next">Next</button>
+          <button type="button" class="btn" id="clear">Show everything</button>
+        </div>
+      </div>
+    </div>
+    <noscript><p class="nojs-note">The interactive highlighting needs JavaScript. The steps above describe the whole sequence on their own.</p></noscript>
+  </div>
+</section>
+
+<section id="modes">
+  <div class="wrap">
+    <h2>Two ways to work</h2>
+    <p class="sub">Both modes use the same browser simulator. The bridge only changes where files live and who is allowed to request runs.</p>
+    <div class="grid">
+      <div class="card">
+        <span class="tag ui">BROWSER ONLY</span>
+        <h3>Just open the IDE</h3>
+        <p>Static files only: the IDE shell, Xezim WASM and Surfer. Projects live in your browser's origin-private storage and survive restarts.</p>
+        <ul>
+          <li>Edit, set <strong>Top module</strong>, press <strong>Run</strong>.</li>
+          <li>Export or import projects as ZIP files to move between profiles.</li>
+          <li>No bridge, network service or account needed.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag agent">AGENT CONNECTED</span>
+        <h3>Pair a local AI agent</h3>
+        <p>The agent runs the MCP bridge against a folder on disk and pairs with your open tab. You watch every edit, run and waveform happen.</p>
+        <ul>
+          <li>Tools: <code>list_project_files</code>, <code>read_project_file</code>, <code>write_project_file</code>, <code>run_simulation</code>, <code>get_simulation_log</code>, <code>get_diagnostics</code>, <code>list_runs</code>, <code>show_waveforms</code>.</li>
+          <li>Disk is the source of truth while paired, so browser-side ZIP import and file actions are locked.</li>
+          <li>Close or disconnect at any time from <strong>Connect agent</strong>.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="pairing">
+  <div class="wrap">
+    <h2>Agent pairing and trust</h2>
+    <p class="sub">The bridge can read and write your project, so a connection requires an explicit act in your own browser.</p>
+    <div class="card">
+      <ol class="seq">
+        <li><span class="who b">bridge</span><span>Starts with an explicit <code>--project-root</code> and listens on <code>127.0.0.1</code> only (default port 47531). It has no implicit workspace.</span></li>
+        <li><span class="who a">agent</span><span>Calls <code>get_connection_status</code> and receives the WebSocket URL and a <strong>single-use pairing code that expires in two minutes</strong>.</span></li>
+        <li><span class="who p">you</span><span>Click <strong>Connect agent</strong>, paste the JSON, and press <strong>Pair browser</strong>.</span></li>
+        <li><span class="who b">bridge</span><span>Accepts only an exact allow-listed <code>Origin</code> and a valid code. It then issues a session token, checks it on every message, and expires it after one hour. One browser session at a time.</span></li>
+        <li><span class="who w">worker</span><span>Every <code>run_simulation</code> executes in your tab's Xezim Worker. The bridge forwards files and requests; it never runs commands or a simulator.</span></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="limits">
+  <div class="wrap">
+    <h2>Limits</h2>
+    <p class="sub">These are deliberate, tested boundaries of the first release. Exceeding them returns a named error instead of a hang or a silent truncation.</p>
+    <div class="limits">
+      <div class="limit"><div class="n">10,000,000 ns</div><div class="l">maximum stop time, in whole nanoseconds</div></div>
+      <div class="limit"><div class="n">300 s</div><div class="l">wall time per run, enforced by terminating the Worker</div></div>
+      <div class="limit"><div class="n">256 MiB</div><div class="l">WebAssembly linear memory per simulator Worker</div></div>
+      <div class="limit"><div class="n">4,096 files · 16 MiB</div><div class="l">project input to the browser simulator</div></div>
+      <div class="limit"><div class="n">64 MiB</div><div class="l">per VCD; 8 VCDs and 128 MiB retained</div></div>
+      <div class="limit"><div class="n">1 MiB → 16 MiB</div><div class="l">captured output, default and maximum</div></div>
+    </div>
+    <div class="unsupported">
+      <strong>Not supported in the browser:</strong> native DPI/VPI <code>.so</code>/<code>.dll</code> plugins, DPI tasks and non-<code>int</code> DPI arguments, Python/cocotb, full UVM, FST output, multithreaded or JIT simulation, and pause, resume or in-run cancellation. The MCP <code>compile</code> tool reports <code>UNSUPPORTED_CAPABILITY</code>, because the browser binding compiles and runs in one step.
+    </div>
+  </div>
+</section>
+
+<section id="components">
+  <div class="wrap">
+    <h2>Pinned components</h2>
+    <p class="sub">Every external piece is pinned to an exact revision so a checkout rebuilds the same tool.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Component</th><th>Role</th><th>Pin</th><th>License</th></tr></thead>
+        <tbody>
+          <tr><td><a href="https://github.com/aionhw/xezim">Xezim</a> <span class="host">GitHub</span></td><td>SystemVerilog compiler and simulator, built for <code>wasm32-unknown-unknown</code></td><td><a href="https://github.com/aionhw/xezim/commit/22faa127a9cc0156bd23e0ab117f400c64231913"><code>22faa127</code></a> (0.11.2)</td><td>MIT OR Apache-2.0</td></tr>
+          <tr><td><a href="https://github.com/aionhw/xezim-core">xezim-core / parser</a> <span class="host">GitHub</span></td><td>Elaboration core, VCD sink and SV parser</td><td><a href="https://github.com/aionhw/xezim-core/commit/d15cdc39e27a4c0a8a55f7e1d46369181307ead9"><code>d15cdc39</code></a> (0.11.2)</td><td>MIT OR Apache-2.0</td></tr>
+          <tr><td><a href="https://gitlab.com/surfer-project/surfer">Surfer</a> <span class="host">GitLab</span></td><td>Waveform viewer, embedded as WASM</td><td><a href="https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915"><code>bd749b1f</code></a> (v0.7.0)</td><td>EUPL-1.2</td></tr>
+          <tr><td>browsercc</td><td>Clang/LLD toolchain for C/C++ DPI helpers</td><td>0.1.1 (LLVM 20.1.2)</td><td>MIT (browsercc), LLVM Apache-2.0 with exception, WASI SDK and others; see <a href="../apps/ide/public/licenses/THIRD_PARTY.md">THIRD_PARTY</a></td></tr>
+          <tr><td>Toolchain</td><td>Rust/Cargo, wasm-bindgen, Node, pnpm</td><td>1.99.1 · 0.2.129 · 24+ · 11.25.0</td><td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="repo">
+  <div class="wrap">
+    <h2>Where things live</h2>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Path</th><th>Contents</th></tr></thead>
+        <tbody>
+          <tr><td><code>apps/ide/</code></td><td>Browser IDE, controller, simulator and DPI Workers, OPFS workspace, Surfer adapter</td></tr>
+          <tr><td><code>crates/xezim-web/</code></td><td>Rust wasm-bindgen wrapper exposing the bounded <code>compileAndRunProject</code> call</td></tr>
+          <tr><td><code>packages/protocol/</code></td><td>Versioned <code>xezim-ide/1</code> schemas shared by the browser and the bridge</td></tr>
+          <tr><td><code>packages/wave-index/</code></td><td>VCD indexer for historical signal queries</td></tr>
+          <tr><td><code>services/mcp-bridge/</code></td><td>MCP stdio server, project-file authority and loopback WebSocket pairing</td></tr>
+          <tr><td><code>vendor/</code></td><td>Pinned Xezim sources with target-gated browser patches</td></tr>
+          <tr><td><code>docs/session_history/initial_build/</code></td><td>ADRs, original plan, task lanes and milestone reports from the first build</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px">Start here: <a href="../README.md">README</a> for setup, <a href="../AGENTS.md">AGENTS.md</a> for driving the workbench as an AI agent, <a href="session_history/initial_build/v1-release-readiness.md">release readiness</a> for recorded test evidence, and <a href="session_history/initial_build/v1-upgrade-notes.md">upgrade notes</a> for runtime limits.</p>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">HDL Workbench is part of the AI Engineer project. Static page with no external scripts or tracking. Facts here reflect the pinned sources and the recorded results in <code>docs/session_history/initial_build/</code>.</div>
+</footer>
+
+<script>
+(() => {
+  const svg = document.getElementById("arch");
+  const buttons = [...document.querySelectorAll("#steps button")];
+  const panels = [...document.querySelectorAll("#step-detail [data-step]")];
+  const controls = document.getElementById("step-controls");
+  const playBtn = document.getElementById("play");
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let current = -1;
+  let timer = null;
+
+  controls.hidden = false;
+
+  function show(index) {
+    current = index;
+    buttons.forEach((b, i) => b.setAttribute("aria-pressed", String(i === index)));
+    panels.forEach((p, i) => { p.hidden = index === -1 ? i !== 0 : i !== index; });
+    svg.querySelectorAll(".node, .edge").forEach((el) => el.classList.remove("on"));
+    if (index === -1) { svg.classList.remove("stepping"); return; }
+    svg.classList.add("stepping");
+    const b = buttons[index];
+    b.dataset.nodes.split(" ").forEach((id) => svg.querySelector(`.node[data-id="${id}"]`)?.classList.add("on"));
+    b.dataset.edges.split(" ").forEach((id) => svg.querySelector(`.edge[data-id="${id}"]`)?.classList.add("on"));
+  }
+
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+    playBtn.textContent = "Play sequence";
+  }
+
+  buttons.forEach((b, i) => b.addEventListener("click", () => { stop(); show(i); }));
+  document.getElementById("prev").addEventListener("click", () => { stop(); show(current <= 0 ? buttons.length - 1 : current - 1); });
+  document.getElementById("next").addEventListener("click", () => { stop(); show((current + 1) % buttons.length); });
+  document.getElementById("clear").addEventListener("click", () => { stop(); show(-1); });
+  playBtn.addEventListener("click", () => {
+    if (timer) { stop(); return; }
+    playBtn.textContent = "Pause";
+    show(current < 0 || current >= buttons.length - 1 ? 0 : current + 1);
+    timer = setInterval(() => {
+      if (current >= buttons.length - 1) { stop(); return; }
+      show(current + 1);
+    }, reduced.matches ? 4500 : 2800);
+  });
+
+  show(0);
+})();
+</script>
+</body>
+</html>

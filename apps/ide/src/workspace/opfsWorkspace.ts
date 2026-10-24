@@ -14,9 +14,9 @@ import {
 } from "@xezim-ide/protocol";
 import { exportProjectZip, importProjectZip, type ArchiveFile } from "./projectArchive.js";
 
-const DATABASE_NAME = "xezim-studio-workspace";
+const DATABASE_NAME = "hdl-workbench-workspace";
 const DATABASE_VERSION = 1;
-const STORAGE_ROOT = "xezim-studio";
+const STORAGE_ROOT = "hdl-workbench";
 const PROJECTS_DIRECTORY = "projects";
 const TEMP_DIRECTORY = "pending";
 const ACTIVE_PROJECT_KEY = "activeProjectId";
@@ -124,7 +124,7 @@ function openDatabase(): Promise<IDBDatabase> {
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new WorkspaceStorageError("INDEXEDDB_OPEN_FAILED", "Could not open workspace metadata storage."));
-    request.onblocked = () => reject(new WorkspaceStorageError("INDEXEDDB_BLOCKED", "Close older Xezim Studio tabs to upgrade workspace storage."));
+    request.onblocked = () => reject(new WorkspaceStorageError("INDEXEDDB_BLOCKED", "Close older HDL Workbench tabs to upgrade workspace storage."));
   });
 }
 
@@ -230,7 +230,7 @@ function storageError(error: unknown): never {
 
 async function withProjectLock<T>(projectId: ProjectId, action: () => Promise<T>): Promise<T> {
   if (!navigator.locks) throw new WorkspaceStorageError("CROSS_TAB_LOCK_UNAVAILABLE", "This browser lacks cross-tab workspace locks; writes are disabled to avoid overwriting another tab.");
-  return navigator.locks.request(`xezim-studio:${projectId}`, { mode: "exclusive" }, action);
+  return navigator.locks.request(`hdl-workbench:${projectId}`, { mode: "exclusive" }, action);
 }
 
 async function requestPersistentStorage(): Promise<boolean> {
@@ -261,7 +261,7 @@ export class OpfsWorkspace implements WorkspaceAdapter {
     private readonly projectRoot: FileSystemDirectoryHandle,
     private readonly storageRoot: FileSystemDirectoryHandle,
   ) {
-    this.channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("xezim-studio-workspace-v1");
+    this.channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("hdl-workbench-workspace-v1");
     this.channel?.addEventListener("message", (event: MessageEvent<FileChange & { projectId?: string }>) => {
       if (event.data?.projectId !== this.project.id) return;
       const { projectId: _projectId, ...change } = event.data;

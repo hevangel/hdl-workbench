@@ -1,6 +1,6 @@
 import { WaveformArtifactSchema, type WaveformArtifact } from "@xezim-ide/protocol";
 
-const STORE_DIRECTORY = "xezim-studio-waveforms";
+const STORE_DIRECTORY = "hdl-workbench-waveforms";
 const ARTIFACTS_DIRECTORY = "artifacts";
 const MAX_RETAINED_ARTIFACTS = 8;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;

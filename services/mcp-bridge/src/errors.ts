@@ -25,7 +25,7 @@ export class BridgeError extends Error {
 
 export function asBridgeError(error: unknown): BridgeError {
   if (error instanceof BridgeError) return error;
-  if (error instanceof ZodError) return new BridgeError("INVALID_REQUEST", "Request did not match the Xezim Studio protocol schema");
+  if (error instanceof ZodError) return new BridgeError("INVALID_REQUEST", "Request did not match the HDL Workbench protocol schema");
   if (error instanceof Error) return new BridgeError("INTERNAL_ERROR", error.message);
   return new BridgeError("INTERNAL_ERROR", "Unexpected bridge error");
 }

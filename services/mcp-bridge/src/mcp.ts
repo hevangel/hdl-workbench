@@ -30,7 +30,7 @@ function tool<T extends z.ZodRawShape>(
 }
 
 export function createMcpServer(service: IdeMcpService): McpServer {
-  const server = new McpServer({ name: "xezim-studio", version: "0.1.0" });
+  const server = new McpServer({ name: "hdl-workbench", version: "0.1.0" });
   tool(server, "get_connection_status", "Check browser bridge status and receive a short-lived pairing code.", z.strictObject({}), () => service.getConnectionStatus());
   tool(server, "list_project_files", "List files inside the explicitly selected project root.", z.strictObject({}), () => service.listProjectFiles());
   tool(server, "read_project_file", "Read a project-relative file and its revision.", z.strictObject({ path: ProjectPathSchema }), ({ path }) => service.readProjectFile(path));

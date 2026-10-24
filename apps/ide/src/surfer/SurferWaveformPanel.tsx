@@ -87,7 +87,7 @@ export function SurferWaveformPanel({ onAdapterChange, resolveWaveformUrl }: Sur
         allow="fullscreen"
       />
       <div className="surfer-attribution" aria-label="Surfer license and source information">
-        <span>Surfer v{PINNED_SURFER_VERSION} · EUPL-1.2 · modified by Xezim Studio on 2026-10-22</span>
+        <span>Surfer v{PINNED_SURFER_VERSION} · EUPL-1.2 · modified by HDL Workbench on 2026-10-22</span>
         <a href="/surfer/LICENSE-EUPL-1.2.txt" target="_blank" rel="noreferrer">License</a>
         <a href="https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915" target="_blank" rel="noreferrer">Pinned upstream source</a>
         <a href="/surfer/index.html" download="surfer-index.html">Modified entrypoint source</a>
