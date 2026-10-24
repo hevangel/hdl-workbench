@@ -61,7 +61,7 @@ describe("IDE shell", () => {
     await waitFor(() => {
       expect(setModelMarkers).toHaveBeenCalledWith(
         expect.any(Object),
-        "xezim-studio",
+        "hdl-workbench",
         expect.arrayContaining([
           expect.objectContaining({
             severity: 8,
@@ -71,7 +71,7 @@ describe("IDE shell", () => {
         ]),
       );
     });
-    expect(screen.getByRole("status")).toHaveTextContent("MOCK SERVICES");
+    expect(screen.getByRole("status")).toHaveTextContent("Mock services · no HDL simulation");
   });
 
   it("asks before closing a dirty tab and can discard the draft", async () => {
@@ -191,5 +191,67 @@ describe("IDE shell", () => {
 
     renderDemo();
     expect(await screen.findByRole("button", { name: "Show file explorer" })).toBeInTheDocument();
+  });
+
+  it("collapses the explorer from its header and toggles it with Ctrl+B", async () => {
+    const user = userEvent.setup();
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const sidebar = screen.getByRole("complementary", { name: "Project files" });
+
+    await user.click(screen.getByRole("button", { name: "Collapse file explorer" }));
+    expect(sidebar).toHaveClass("collapsed");
+    expect(screen.getByRole("button", { name: "Show file explorer" })).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    expect(sidebar).not.toHaveClass("collapsed");
+    // Other modifier combinations are left to the editor.
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true, shiftKey: true });
+    expect(sidebar).not.toHaveClass("collapsed");
+  });
+
+  it("resizes the bottom panel from the keyboard and keeps the height across reloads", async () => {
+    const firstRender = renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const resizer = screen.getByRole("separator", { name: "Resize bottom panel" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "220");
+
+    fireEvent.keyDown(resizer, { key: "ArrowUp" });
+    fireEvent.keyDown(resizer, { key: "ArrowUp" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "260");
+    expect(screen.getByRole("main")).toHaveStyle({ "--bottom-panel-height": "260px" });
+    await waitFor(() => expect(window.localStorage.getItem("xezim-ide/layout-v1")).toContain('"bottomPanelHeight":260'));
+    firstRender.unmount();
+
+    renderDemo();
+    expect(await screen.findByRole("separator", { name: "Resize bottom panel" })).toHaveAttribute("aria-valuenow", "260");
+  });
+
+  it("clamps the bottom panel to its minimum and resets it on double-click", async () => {
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const resizer = screen.getByRole("separator", { name: "Resize bottom panel" });
+
+    fireEvent.keyDown(resizer, { key: "Home" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "80");
+    fireEvent.keyDown(resizer, { key: "ArrowDown" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "80");
+
+    fireEvent.doubleClick(resizer);
+    expect(resizer).toHaveAttribute("aria-valuenow", "220");
+  });
+
+  it("links the help button to the user guide in a new tab", async () => {
+    renderDemo();
+    const help = await screen.findByRole("link", { name: "How HDL Workbench works" });
+    expect(help).toHaveAttribute("href", "/docs/index.html");
+    expect(help).toHaveAttribute("target", "_blank");
+  });
+
+  it("ignores a malformed stored panel height but keeps the stored explorer state", async () => {
+    window.localStorage.setItem("xezim-ide/layout-v1", JSON.stringify({ explorerCollapsed: true, bottomPanelHeight: "tall" }));
+    renderDemo();
+    expect(await screen.findByRole("button", { name: "Show file explorer" })).toBeInTheDocument();
+    expect(screen.getByRole("separator", { name: "Resize bottom panel" })).toHaveAttribute("aria-valuenow", "220");
   });
 });

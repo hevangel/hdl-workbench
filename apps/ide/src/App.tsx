@@ -1,14 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { ProjectPathSchema, type Diagnostic, type ProjectId, type ProjectPath, type SimulationService, type SurferAdapter, type WaveformArtifact, type WorkspaceAdapter } from "@xezim-ide/protocol";
 import { EditorSurface } from "./editor/EditorSurface.js";
 import { createMockServices } from "./mockServices.js";
-import { useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
+import { clampBottomPanelHeight, DEFAULT_BOTTOM_PANEL_HEIGHT, MIN_BOTTOM_PANEL_HEIGHT, useLayoutPreferences } from "./hooks/useLayoutPreferences.js";
 import type { BrowserStorageStatus, PersistentWorkspaceManager, WorkspaceProject } from "./workspace/opfsWorkspace.js";
 import { exportProjectZip } from "./workspace/projectArchive.js";
 import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
 import type { BrowserIdeController } from "./controller/BrowserIdeController.js";
 import { McpBrowserClient, type BrowserBridgeState } from "./controller/McpBrowserClient.js";
 import { McpConnectionPanel } from "./controller/McpConnectionPanel.js";
+import { AgentIcon, BrandMark, ChevronIcon, CollapseLeftIcon, ExportIcon, FolderIcon, HelpIcon, ImportIcon, MoreIcon, PlayIcon, SaveIcon, SidebarIcon, SpinnerIcon, WarningIcon } from "./icons.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
 interface EditorFile {
@@ -39,6 +40,11 @@ function fileKindLabel(path: string): string {
   return "SV";
 }
 
+// Rows of .editor-workspace other than the bottom panel: tabs, breadcrumb and the
+// editor's minimum height. Keep in step with grid-template-rows in styles.css.
+const EDITOR_WORKSPACE_RESERVED_HEIGHT = 36 + 26 + 180;
+const BOTTOM_PANEL_KEYBOARD_STEP = 20;
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${Math.max(0, Math.round(bytes))} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -63,7 +69,11 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
   const [activePath, setActivePath] = useState<ProjectPath | null>(null);
   const [topModule, setTopModule] = useState("counter_tb");
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
-  const [log, setLog] = useState("Mock services are active. No HDL simulation is performed.");
+  const [log, setLog] = useState(() => !controller
+    ? "Mock services are active. No HDL simulation is performed."
+    : controller.canExecute
+      ? "Ready. Run compiles and simulates the top module with Xezim WASM in a browser Worker."
+      : "The Xezim WASM assets were not found; no native simulation fallback is configured.");
   const [busy, setBusy] = useState(false);
   const [pendingClose, setPendingClose] = useState<ProjectPath | null>(null);
   const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
@@ -76,6 +86,8 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
   const [activePanel, setActivePanel] = useState<"problems" | "output" | "waveforms">("problems");
   const projectArchiveInput = useRef<HTMLInputElement>(null);
   const [layout, setLayout] = useLayoutPreferences();
+  const [resizingPanel, setResizingPanel] = useState(false);
+  const editorWorkspaceRef = useRef<HTMLElement>(null);
   const revisionByPath = useRef(new Map<ProjectPath, string>());
   const loadedSessionProject = useRef<ProjectId | null>(null);
   const saveTimers = useRef(new Map<ProjectPath, ReturnType<typeof setTimeout>>());
@@ -98,6 +110,63 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     if (!controller) return Promise.reject(new Error("No browser waveform artifact store is configured."));
     return controller.artifacts.objectUrl(artifact);
   }, [controller]);
+
+  const toggleExplorer = useCallback(() => {
+    setLayout((current) => ({ ...current, explorerCollapsed: !current.explorerCollapsed }));
+  }, [setLayout]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "b") {
+        event.preventDefault();
+        toggleExplorer();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [toggleExplorer]);
+
+  const maxBottomPanelHeight = useCallback(() => {
+    const height = editorWorkspaceRef.current?.getBoundingClientRect().height ?? 0;
+    // Layout is unmeasured in non-rendering environments; fall back to the stored limit.
+    return height > 0 ? Math.max(MIN_BOTTOM_PANEL_HEIGHT, height - EDITOR_WORKSPACE_RESERVED_HEIGHT) : Number.POSITIVE_INFINITY;
+  }, []);
+
+  const setBottomPanelHeight = useCallback((height: number) => {
+    const next = clampBottomPanelHeight(Math.min(height, maxBottomPanelHeight()));
+    setLayout((current) => current.bottomPanelHeight === next ? current : { ...current, bottomPanelHeight: next });
+  }, [maxBottomPanelHeight, setLayout]);
+
+  const startPanelResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setResizingPanel(true);
+  };
+
+  const movePanelResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
+    const bounds = editorWorkspaceRef.current?.getBoundingClientRect();
+    if (bounds) setBottomPanelHeight(bounds.bottom - event.clientY);
+  };
+
+  const endPanelResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    setResizingPanel(false);
+  };
+
+  const resizePanelWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const steps: Record<string, number> = {
+      ArrowUp: layout.bottomPanelHeight + BOTTOM_PANEL_KEYBOARD_STEP,
+      ArrowDown: layout.bottomPanelHeight - BOTTOM_PANEL_KEYBOARD_STEP,
+      Home: MIN_BOTTOM_PANEL_HEIGHT,
+      End: maxBottomPanelHeight(),
+    };
+    const target = steps[event.key];
+    if (target === undefined) return;
+    event.preventDefault();
+    setBottomPanelHeight(target);
+  };
 
   useEffect(() => {
     const nextWorkspace = workspace ?? controller?.workspace;
@@ -616,60 +685,48 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
         ? "Save failed"
         : "Saved";
 
+  // Only abnormal runtime states earn space in the app bar; the status bar always reports the runtime.
+  const runtime: { tone: "ok" | "warn"; label: string; detail: string } = controller
+    ? controller.canExecute
+      ? { tone: "ok", label: "Xezim WASM", detail: "Simulation runs Xezim WebAssembly in a browser Worker." }
+      : { tone: "warn", label: "WASM unavailable", detail: "The Xezim WASM assets were not found; no native simulation fallback is configured." }
+    : { tone: "warn", label: "Mock services", detail: "Mock services are active. No HDL simulation is performed." };
+
   return (
     <div className="ide-shell">
-      <header className="app-header">
-        <div className="brand-lockup">
-          <div className="brand-mark" aria-hidden="true">X</div>
-          <div>
-            <div className="brand-name">xezim <span>studio</span></div>
-            <div className="brand-caption">SystemVerilog workspace</div>
+      <header className="app-bar">
+        <div className="app-bar-start">
+          <div className="brand" title="HDL Workbench">
+            <span className="brand-mark"><BrandMark /></span>
+            <span className="brand-name">HDL Workbench</span>
           </div>
-        </div>
-        {controller
-          ? <div className={`runtime-badge ${controller.canExecute ? "wasm" : "unavailable"}`} role="status"><span className="status-dot" />{controller.canExecute ? "XEZIM WASM · BROWSER WORKER" : "XEZIM WASM ASSETS UNAVAILABLE"}</div>
-          : <div className="mock-badge" role="status"><span className="status-dot" /> MOCK SERVICES · NO HDL SIMULATION</div>}
-        <div className="header-actions">
-          {controller && <button className="connect-agent-button" type="button" onClick={() => setBridgePanelOpen((open) => !open)} aria-expanded={bridgePanelOpen}>
-            {bridgeState === "connected" ? "Agent connected" : "Connect agent"}
-          </button>}
-          <button className="icon-button" type="button" aria-label="Settings" title="Settings are not available in this preview">⚙</button>
-          <div className="avatar" aria-label="Local workspace">LX</div>
-          {controller && bridgePanelOpen && bridgeClientRef.current && <McpConnectionPanel
-            client={bridgeClientRef.current}
-            state={bridgeState}
-            message={bridgeMessage}
-            onClose={() => setBridgePanelOpen(false)}
-          />}
-        </div>
-      </header>
-
-      <div className="workspace-toolbar">
-        <div className="toolbar-project">
+          <span className="bar-divider" aria-hidden="true" />
           <button
-            className="explorer-toggle"
+            className="icon-button explorer-toggle"
             type="button"
             aria-label={layout.explorerCollapsed ? "Show file explorer" : "Hide file explorer"}
-            title="Toggle file explorer"
-            onClick={() => setLayout({ explorerCollapsed: !layout.explorerCollapsed })}
-          >▤</button>
+            title="Toggle file explorer (Ctrl+B)"
+            aria-expanded={!layout.explorerCollapsed}
+            onClick={toggleExplorer}
+          ><SidebarIcon /></button>
           {projectManager ? (
             <div className="project-controls">
               <label className="sr-only" htmlFor="project-select">Project</label>
               <select id="project-select" value={activeProject.id} onChange={(event) => void switchProject(event.target.value)} disabled={busy}>
                 {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
               </select>
-              <span className="branch-pill">BROWSER ONLY</span>
             </div>
           ) : (
-            <div className="breadcrumb"><span>Projects</span><span className="crumb-separator">/</span><strong>counter-lab</strong><span className="branch-pill">LOCAL</span></div>
+            <div className="breadcrumb"><span>Projects</span><span className="crumb-separator">/</span><strong>counter-lab</strong><span className="mode-pill">Local</span></div>
           )}
+          {runtime.tone === "warn" && <span className="runtime-warning" title={runtime.detail}><WarningIcon />{runtime.label}</span>}
         </div>
-        <div className="run-controls">
-          {projectManager && <>
-            <button className="secondary-button toolbar-button" type="button" onClick={() => void saveProject()} disabled={busy || bridgeState === "connected"}>Save</button>
-            <button className="secondary-button toolbar-button" type="button" onClick={() => projectArchiveInput.current?.click()} disabled={busy || bridgeState === "connected"}>Import ZIP</button>
-            <button className="secondary-button toolbar-button" type="button" onClick={exportProject} disabled={busy || files.length === 0}>Export ZIP</button>
+
+        <div className="app-bar-end">
+          {projectManager && <div className="button-group" role="group" aria-label="Project files">
+            <button className="icon-button" type="button" aria-label="Save" title="Save all files" onClick={() => void saveProject()} disabled={busy || bridgeState === "connected"}><SaveIcon /></button>
+            <button className="icon-button" type="button" aria-label="Import ZIP" title="Import project from ZIP" onClick={() => projectArchiveInput.current?.click()} disabled={busy || bridgeState === "connected"}><ImportIcon /></button>
+            <button className="icon-button" type="button" aria-label="Export ZIP" title="Export project as ZIP" onClick={exportProject} disabled={busy || files.length === 0}><ExportIcon /></button>
             <input
               ref={projectArchiveInput}
               className="sr-only"
@@ -678,19 +735,41 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               aria-label="Import project ZIP"
               onChange={(event) => void importProject(event.currentTarget.files?.[0])}
             />
-          </>}
-          <label className="top-module-label" htmlFor="top-module">Top module</label>
-          <input id="top-module" className="top-module-input" value={topModule} onChange={(event) => setTopModule(event.target.value)} disabled={busy} />
-          <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim() || Boolean(controller && !controller.canExecute)} title={controller && !controller.canExecute ? "The Xezim WASM assets were not found; no native simulation fallback is configured." : undefined}>
-            <span aria-hidden="true">{busy ? "◌" : "▶"}</span> {busy ? "Running…" : "Run"}
-          </button>
+          </div>}
+          <div className="run-group">
+            <label className="top-module-field" htmlFor="top-module" title="Top module">
+              <span className="top-module-prefix" aria-hidden="true">top</span>
+              <input id="top-module" aria-label="Top module" className="top-module-input" value={topModule} onChange={(event) => setTopModule(event.target.value)} disabled={busy} spellCheck={false} />
+            </label>
+            <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim() || Boolean(controller && !controller.canExecute)} title={controller && !controller.canExecute ? runtime.detail : "Compile and simulate the top module"}>
+              {busy ? <SpinnerIcon /> : <PlayIcon />} {busy ? "Running…" : "Run"}
+            </button>
+          </div>
+          {controller && <div className="agent-anchor">
+            <button className={`agent-button ${bridgeState === "connected" ? "connected" : ""}`} type="button" onClick={() => setBridgePanelOpen((open) => !open)} aria-expanded={bridgePanelOpen}>
+              <AgentIcon />{bridgeState === "connected" ? "Agent connected" : "Connect agent"}
+            </button>
+            {bridgePanelOpen && bridgeClientRef.current && <McpConnectionPanel
+              client={bridgeClientRef.current}
+              state={bridgeState}
+              message={bridgeMessage}
+              onClose={() => setBridgePanelOpen(false)}
+            />}
+          </div>}
+          <a className="icon-button help-link" href="/docs/index.html" target="_blank" rel="noopener" aria-label="How HDL Workbench works" title="How HDL Workbench works"><HelpIcon /></a>
         </div>
-      </div>
+      </header>
 
       <div className="workspace-main">
         <aside className={`file-sidebar ${layout.explorerCollapsed ? "collapsed" : ""}`} aria-label="Project files">
-          <div className="sidebar-heading"><span>EXPLORER</span><button type="button" className="subtle-icon" aria-label="More file actions">···</button></div>
-          <div className="project-root"><span className="chevron">⌄</span><span className="folder-icon">▰</span> {activeProject.name}</div>
+          <div className="sidebar-heading">
+            <span>EXPLORER</span>
+            <span className="sidebar-heading-actions">
+              <button type="button" className="subtle-icon" aria-label="More file actions"><MoreIcon /></button>
+              <button type="button" className="subtle-icon" aria-label="Collapse file explorer" title="Collapse file explorer (Ctrl+B)" onClick={toggleExplorer}><CollapseLeftIcon /></button>
+            </span>
+          </div>
+          <div className="project-root"><ChevronIcon className="chevron" /><span className="project-root-name">{activeProject.name}</span></div>
           {projectManager && <div className="authority-row">
             <label htmlFor="authority-mode">Authority</label>
             <select id="authority-mode" value={bridgeState === "connected" ? "connected" : "browser-only"} onChange={() => undefined}>
@@ -706,7 +785,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
             </div>}
           </div>}
           <div className="file-tree">
-            {folders.map((folder) => <div className="folder-row" key={folder}><span className="tree-indent" /><span className="chevron">⌄</span><span className="folder-icon">▰</span>{folder}</div>)}
+            {folders.map((folder) => <div className="folder-row" key={folder}><span className="tree-indent" /><ChevronIcon className="chevron" /><FolderIcon className="folder-icon" />{folder}</div>)}
             {sortedFiles.map((file) => (
               <button
                 className={`file-row ${activePath === file.path ? "selected" : ""}`}
@@ -736,7 +815,11 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
           </div>
         </aside>
 
-        <main className="editor-workspace">
+        <main
+          ref={editorWorkspaceRef}
+          className={`editor-workspace ${resizingPanel ? "resizing" : ""}`}
+          style={{ "--bottom-panel-height": `${layout.bottomPanelHeight}px` } as CSSProperties}
+        >
           {projectManager && (workspaceMessage || conflictPath) && <div className={`workspace-notice ${conflictPath ? "conflict" : ""}`} role={conflictPath ? "alert" : "status"}>
             <span>{conflictPath ? `Storage conflict for ${conflictPath}. Your editor draft remains available.` : workspaceMessage}</span>
             {conflictPath && <div className="workspace-notice-actions">
@@ -763,6 +846,22 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
           </div>
 
           <section className="bottom-panel" aria-label="Diagnostics, output and waveform viewer">
+            <div
+              className="panel-resizer"
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize bottom panel"
+              aria-valuemin={MIN_BOTTOM_PANEL_HEIGHT}
+              aria-valuenow={layout.bottomPanelHeight}
+              tabIndex={0}
+              title="Drag to resize · double-click to reset"
+              onPointerDown={startPanelResize}
+              onPointerMove={movePanelResize}
+              onPointerUp={endPanelResize}
+              onPointerCancel={endPanelResize}
+              onKeyDown={resizePanelWithKeyboard}
+              onDoubleClick={() => setBottomPanelHeight(DEFAULT_BOTTOM_PANEL_HEIGHT)}
+            />
             <div className="panel-tabs" role="tablist" aria-label="Bottom panel">
               <button type="button" role="tab" aria-selected={activePanel === "problems"} className={`panel-tab ${activePanel === "problems" ? "active" : ""}`} onClick={() => setActivePanel("problems")}>PROBLEMS <span className="count-pill">{diagnostics.filter((item) => item.severity === "error").length}</span></button>
               <button type="button" role="tab" aria-selected={activePanel === "output"} className={`panel-tab ${activePanel === "output" ? "active" : ""}`} onClick={() => setActivePanel("output")}>OUTPUT</button>
@@ -793,10 +892,19 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               />
             </div>
           </section>
-
-          <footer className="status-bar"><span><i className="status-dot green" /> {bridgeState === "connected" ? "Local bridge project · editor read-only" : activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span><a href="/licenses/THIRD_PARTY.md" target="_blank" rel="noreferrer">Third-party notices</a><span>UTF-8</span><span>SystemVerilog</span><span>Ln {activeFile ? activeFile.content.split("\n").length : 1}</span><span>Spaces: 2</span></footer>
         </main>
       </div>
+
+      <footer className="status-bar">
+        <span className={`status-runtime ${runtime.tone}`} role="status" title={runtime.detail}><i className="status-dot" />{runtime.tone === "warn" && !controller ? `${runtime.label} · no HDL simulation` : runtime.label}</span>
+        <span className="status-project">{bridgeState === "connected" ? "Local bridge project · editor read-only" : activeProject.authority === "browser-only" ? "Browser-only project" : "Connected project"}</span>
+        <span className="status-spacer" />
+        <span>{activeFile ? activeFile.content.split("\n").length : 0} lines</span>
+        <span>Spaces: 2</span>
+        <span>UTF-8</span>
+        <span>{activePath ? fileKindLabel(activePath) === "SV" ? "SystemVerilog" : fileKindLabel(activePath) : "SystemVerilog"}</span>
+        <a href="/licenses/THIRD_PARTY.md" target="_blank" rel="noreferrer">Third-party notices</a>
+      </footer>
 
       {pendingClose && (
         <div className="dialog-backdrop">

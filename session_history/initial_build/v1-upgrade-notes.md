@@ -1,4 +1,4 @@
-# Xezim Studio v1 upgrade notes
+# HDL Workbench v1 upgrade notes
 
 This is the first browser IDE release line. There is no earlier persisted-workspace schema to migrate. Source projects remain ordinary UTF-8 project files stored in the browser's origin-private storage; export a project ZIP before moving to another browser profile or origin.
 

@@ -2,7 +2,7 @@ $date
   2026-10-21
 $end
 $version
-  xezim-studio LUNA-00B fixture
+  hdl-workbench LUNA-00B fixture
 $end
 $timescale 1 ns $end
 $scope module top $end

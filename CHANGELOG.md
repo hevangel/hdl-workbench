@@ -1,6 +1,6 @@
 # Changelog
 
-Changes to Xezim Studio are recorded here.
+Changes to HDL Workbench are recorded here.
 
 ## Unreleased — v1 hardening
 

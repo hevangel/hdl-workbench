@@ -89,7 +89,7 @@ export class McpBrowserClient {
         type: "pair",
         challengeId: challenge.challengeId,
         code: challenge.code,
-        clientName: "Xezim Studio browser",
+        clientName: "HDL Workbench browser",
         requestedRole: "write",
       }));
     });

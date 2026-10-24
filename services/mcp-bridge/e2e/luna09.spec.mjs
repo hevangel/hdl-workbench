@@ -56,7 +56,7 @@ test("MCP edit -> Xezim WASM counter and ROM runs -> Surfer VCD -> workspace sur
     cwd: packageRoot,
     stderr: "pipe",
   });
-  const client = new Client({ name: "xezim-studio-luna09-e2e", version: "0.1.0" });
+  const client = new Client({ name: "hdl-workbench-luna09-e2e", version: "0.1.0" });
 
   try {
     await client.connect(transport);
@@ -122,7 +122,7 @@ test("MCP edit -> Xezim WASM counter and ROM runs -> Surfer VCD -> workspace sur
     }));
     await expect(page.getByRole("tab", { name: "WAVEFORMS" })).toHaveAttribute("aria-selected", "true");
     const surferNotice = page.getByLabel("Surfer license and source information");
-    await expect(surferNotice).toContainText("EUPL-1.2 · modified by Xezim Studio on 2026-10-22");
+    await expect(surferNotice).toContainText("EUPL-1.2 · modified by HDL Workbench on 2026-10-22");
     await expect(surferNotice.getByRole("link", { name: "License" })).toHaveAttribute("href", "/surfer/LICENSE-EUPL-1.2.txt");
     await expect(surferNotice.getByRole("link", { name: "Pinned upstream source" })).toHaveAttribute("href", "https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915");
     await expect(surferNotice.getByRole("link", { name: "Modified entrypoint source" })).toHaveAttribute("download", "surfer-index.html");
