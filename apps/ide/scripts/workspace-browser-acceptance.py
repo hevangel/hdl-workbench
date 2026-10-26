@@ -177,12 +177,12 @@ def main():
         # Rename and delete operate on project-relative paths and update the
         # visible tree/tabs after durable writes.
         second.once("dialog", lambda dialog: dialog.accept("rtl/counter-renamed.sv"))
-        second.get_by_role("button", name="File actions", exact=True).click()
-        second.get_by_role("button", name="Rename active file…").click()
+        second.get_by_role("button", name="Open rtl/counter.sv").click(button="right")
+        second.get_by_role("menuitem", name="Rename…").click()
         expect(second.get_by_role("button", name="Open rtl/counter-renamed.sv")).to_be_visible()
         second.once("dialog", lambda dialog: dialog.accept())
-        second.get_by_role("button", name="File actions", exact=True).click()
-        second.get_by_role("button", name="Delete active file…").click()
+        second.get_by_role("button", name="Open rtl/counter-renamed.sv").click(button="right")
+        second.get_by_role("menuitem", name="Delete…").click()
         expect(second.get_by_role("button", name="Open rtl/counter-renamed.sv")).to_have_count(0)
 
         assert not page_errors, f"Unexpected browser errors: {page_errors}"

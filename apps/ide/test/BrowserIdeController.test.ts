@@ -73,6 +73,26 @@ describe("BrowserIdeController one-shot execution", () => {
     expect(stored).toHaveLength(1);
   });
 
+  it("completes a run whose design never dumps a waveform", async () => {
+    const services = createMockServices();
+    const artifacts = { put: vi.fn(), get: vi.fn(), objectUrl: vi.fn(), dispose: vi.fn() } as unknown as OpfsWaveformStore;
+    const worker = vi.fn(async (input): Promise<WorkerResponse> => ({
+      id: "worker-1",
+      ok: true,
+      result: {
+        schemaVersion: 1, status: "completed", maxTimeNs: "1000", lastTimeTicks: "1000", finished: true, sawFatal: false,
+        stdout: "hello\n", diagnostics: [], snapshotId: input.snapshotId, fileOutputs: [],
+      },
+    }));
+    const workspace = stableWorkspace(services);
+    const controller = new BrowserIdeController(workspace, { runProjectWorker: worker, artifactStore: artifacts });
+    const result = await controller.execute(request({ snapshotId: (await workspace.snapshot()).snapshotId }));
+
+    expect(result).toMatchObject({ status: "finish", stdout: "hello\n", lastTime: { ticks: "1000", timescale: { magnitude: "1", unit: "ns" } } });
+    expect(result.waveform).toBeUndefined();
+    expect(artifacts.put).not.toHaveBeenCalled();
+  });
+
   it("does not claim separate compile or run handles", async () => {
     const controller = new BrowserIdeController(createMockServices().workspace);
     await expect(controller.compile({

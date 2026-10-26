@@ -23,6 +23,7 @@ export const WarningIcon = (props: IconProps) => <Icon {...props}><path d="M8 2.
 export const ChevronIcon = (props: IconProps) => <Icon {...props}><path d="m5.5 6.5 2.5 2.5 2.5-2.5" /></Icon>;
 export const FolderIcon = (props: IconProps) => <Icon {...props}><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z" /></Icon>;
 export const HelpIcon = (props: IconProps) => <Icon {...props}><circle cx="8" cy="8" r="6" /><path d="M6.4 6.3a1.7 1.7 0 1 1 2.3 1.6c-.45.2-.7.55-.7 1v.35" /><path d="M8 11.3v.1" /></Icon>;
+export const NewFileIcon = (props: IconProps) => <Icon {...props}><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6z" /><path d="M9 2v4h4M8 8.5v3.5M6.25 10.25h3.5" /></Icon>;
 export const MoreIcon = (props: IconProps) => <Icon {...props}><circle cx="4" cy="8" r=".6" fill="currentColor" /><circle cx="8" cy="8" r=".6" fill="currentColor" /><circle cx="12" cy="8" r=".6" fill="currentColor" /></Icon>;
 
 /** Brand mark: one clock period as a digital waveform. */

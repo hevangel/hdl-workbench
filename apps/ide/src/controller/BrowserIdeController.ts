@@ -308,7 +308,9 @@ export class BrowserIdeController implements IdeController {
     }
     const raw = response.result;
     if (raw.snapshotId !== request.snapshotId) throw new BrowserControllerError("INTERNAL_ERROR", "Xezim returned a result for a different source snapshot.");
-    const timescale = parseTimescale(raw.waveform?.timescale);
+    // Only designs that call $dumpfile/$dumpvars produce a VCD, and only a VCD carries a
+    // timescale. A run without a dump is still a valid run, so label it with the request's.
+    const timescale = raw.waveform ? parseTimescale(raw.waveform.timescale) : request.until.timescale;
     const diagnostics = raw.diagnostics.map((item) => DiagnosticSchema.parse({
       severity: item.severity,
       code: item.code,

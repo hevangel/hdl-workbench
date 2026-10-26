@@ -9,7 +9,7 @@ import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
 import type { BrowserIdeController } from "./controller/BrowserIdeController.js";
 import { McpBrowserClient, type BrowserBridgeState } from "./controller/McpBrowserClient.js";
 import { McpConnectionPanel } from "./controller/McpConnectionPanel.js";
-import { AgentIcon, BrandMark, ChevronIcon, CollapseLeftIcon, ExportIcon, FolderIcon, HelpIcon, ImportIcon, MoreIcon, PlayIcon, SaveIcon, SidebarIcon, SpinnerIcon, WarningIcon } from "./icons.js";
+import { AgentIcon, BrandMark, ChevronIcon, CollapseLeftIcon, ExportIcon, FolderIcon, HelpIcon, ImportIcon, NewFileIcon, PlayIcon, SaveIcon, SidebarIcon, SpinnerIcon, WarningIcon } from "./icons.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
 interface EditorFile {
@@ -78,7 +78,9 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
   const [pendingClose, setPendingClose] = useState<ProjectPath | null>(null);
   const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
   const [workspaceMessage, setWorkspaceMessage] = useState("");
-  const [fileActionsOpen, setFileActionsOpen] = useState(false);
+  const [fileMenu, setFileMenu] = useState<{ path: ProjectPath; x: number; y: number } | null>(null);
+  // The browser Xezim build only emits VCD; "off" runs the design without opening the waveform viewer.
+  const [dumpFormat, setDumpFormat] = useState<"vcd" | "off">("vcd");
   const [bridgePanelOpen, setBridgePanelOpen] = useState(false);
   const [bridgeState, setBridgeState] = useState<BrowserBridgeState>("disconnected");
   const [bridgeMessage, setBridgeMessage] = useState("");
@@ -485,10 +487,55 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     }
   };
 
-  const renameActiveFile = async () => {
-    if (!projectManager || !activeFile) return;
-    const proposed = window.prompt("New project-relative file path", activeFile.path);
-    if (!proposed || proposed === activeFile.path) return;
+  useEffect(() => {
+    if (!fileMenu) return;
+    const close = () => setFileMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [fileMenu]);
+
+  const createFile = async () => {
+    const proposed = window.prompt("New file path, relative to the project root", "rtl/new_module.sv")?.trim();
+    if (!proposed) return;
+    const parsed = ProjectPathSchema.safeParse(proposed);
+    if (!parsed.success) {
+      setWorkspaceMessage("File paths must be normalized project-relative paths without traversal segments.");
+      return;
+    }
+    const path = parsed.data;
+    if (filesRef.current.some((file) => file.path === path)) {
+      setWorkspaceMessage(`${path} already exists.`);
+      openFile(path);
+      return;
+    }
+    setBusy(true);
+    try {
+      const { revision } = await workspaceService.writeFile(path, new Uint8Array(), null);
+      revisionByPath.current.set(path, revision);
+      // The workspace change subscription may have added the file already.
+      setFiles((current) => current.some((file) => file.path === path) ? current : [...current, { path, content: "", revision, saveState: "saved" }]);
+      openFile(path);
+      setWorkspaceMessage(`Created ${path}.`);
+    } catch (error) {
+      setWorkspaceMessage(error instanceof Error ? error.message : "Could not create this file.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const renameFile = async (target: EditorFile) => {
+    if (!projectManager) return;
+    const proposed = window.prompt("New project-relative file path", target.path);
+    if (!proposed || proposed === target.path) return;
     const parsed = ProjectPathSchema.safeParse(proposed);
     if (!parsed.success) {
       setWorkspaceMessage("File paths must be normalized project-relative paths without traversal segments.");
@@ -497,10 +544,10 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     if (!await saveProject()) return;
     setBusy(true);
     try {
-      const revision = revisionByPath.current.get(activeFile.path);
+      const revision = revisionByPath.current.get(target.path);
       if (!revision) throw new Error("The current file revision is unavailable; reload the project before renaming it.");
-      const nextRevision = await projectManager.renameFile(activeProject.id, activeFile.path, parsed.data, revision);
-      const oldPath = activeFile.path;
+      const nextRevision = await projectManager.renameFile(activeProject.id, target.path, parsed.data, revision);
+      const oldPath = target.path;
       revisionByPath.current.delete(oldPath);
       revisionByPath.current.set(parsed.data, nextRevision);
       setFiles((current) => current.map((file) => file.path === oldPath ? { ...file, path: parsed.data, revision: nextRevision, saveState: "saved" } : file));
@@ -514,9 +561,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
     }
   };
 
-  const deleteActiveFile = async () => {
-    if (!activeFile) return;
-    const file = activeFile;
+  const deleteFile = async (file: EditorFile) => {
     if (!window.confirm(`Delete ${file.path} from ${activeProject.name}? Any editor draft for this file will be discarded.`)) return;
     setBusy(true);
     try {
@@ -642,7 +687,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
         });
         setDiagnostics(result.diagnostics);
         setLog([result.stdout, result.stderr].filter(Boolean).join("\n") || `Xezim WASM status: ${result.status}`);
-        if (result.waveform) {
+        if (result.waveform && dumpFormat === "vcd") {
           setActivePanel("waveforms");
           await controller.showWaveform({ artifactId: result.waveform.id });
         }
@@ -736,6 +781,14 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               onChange={(event) => void importProject(event.currentTarget.files?.[0])}
             />
           </div>}
+          <label className="dump-field" htmlFor="dump-format" title="Waveform dump format. The browser build of Xezim writes VCD only.">
+            <span className="top-module-prefix" aria-hidden="true">dump</span>
+            <select id="dump-format" aria-label="Waveform dump" value={dumpFormat} onChange={(event) => setDumpFormat(event.target.value === "off" ? "off" : "vcd")} disabled={busy}>
+              <option value="vcd">VCD</option>
+              <option value="fst" disabled>FST (not in browser build)</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
           <div className="run-group">
             <label className="top-module-field" htmlFor="top-module" title="Top module">
               <span className="top-module-prefix" aria-hidden="true">top</span>
@@ -765,7 +818,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
           <div className="sidebar-heading">
             <span>EXPLORER</span>
             <span className="sidebar-heading-actions">
-              <button type="button" className="subtle-icon" aria-label="More file actions"><MoreIcon /></button>
+              <button type="button" className="subtle-icon" aria-label="New file" title="New file" onClick={() => void createFile()} disabled={busy || bridgeState === "connected"}><NewFileIcon /></button>
               <button type="button" className="subtle-icon" aria-label="Collapse file explorer" title="Collapse file explorer (Ctrl+B)" onClick={toggleExplorer}><CollapseLeftIcon /></button>
             </span>
           </div>
@@ -777,13 +830,6 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               <option value="connected">Local MCP bridge project</option>
             </select>
           </div>}
-          {projectManager && <div className="file-actions">
-            <button type="button" className="secondary-button toolbar-button" onClick={() => setFileActionsOpen((open) => !open)} aria-expanded={fileActionsOpen} aria-label="File actions" disabled={!activeFile || busy || bridgeState === "connected"}>File actions</button>
-            {fileActionsOpen && <div className="file-actions-menu">
-              <button type="button" onClick={() => { setFileActionsOpen(false); void renameActiveFile(); }} disabled={!activeFile || busy || bridgeState === "connected"}>Rename active file…</button>
-              <button type="button" onClick={() => { setFileActionsOpen(false); void deleteActiveFile(); }} disabled={!activeFile || busy || bridgeState === "connected"}>Delete active file…</button>
-            </div>}
-          </div>}
           <div className="file-tree">
             {folders.map((folder) => <div className="folder-row" key={folder}><span className="tree-indent" /><ChevronIcon className="chevron" /><FolderIcon className="folder-icon" />{folder}</div>)}
             {sortedFiles.map((file) => (
@@ -793,6 +839,11 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
                 type="button"
                 aria-label={`Open ${file.path}`}
                 onClick={() => openFile(file.path)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  if (bridgeState === "connected") return;
+                  setFileMenu({ path: file.path, x: event.clientX, y: event.clientY });
+                }}
                 disabled={busy}
               >
                 <span className="tree-indent tree-indent-two" />
@@ -802,6 +853,18 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               </button>
             ))}
           </div>
+          {fileMenu && <div className="file-context-menu" role="menu" aria-label={`Actions for ${fileMenu.path}`} style={{ left: fileMenu.x, top: fileMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+            <button type="button" role="menuitem" disabled={!projectManager} title={projectManager ? undefined : "Renaming needs browser project storage"} onClick={() => {
+              const target = filesRef.current.find((file) => file.path === fileMenu.path);
+              setFileMenu(null);
+              if (target) void renameFile(target);
+            }}>Rename…</button>
+            <button type="button" role="menuitem" onClick={() => {
+              const target = filesRef.current.find((file) => file.path === fileMenu.path);
+              setFileMenu(null);
+              if (target) void deleteFile(target);
+            }}>Delete…</button>
+          </div>}
           <div className="sidebar-footer">
             <span className="storage-icon">▱</span>
             <span>{projectManager
@@ -820,7 +883,7 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
           className={`editor-workspace ${resizingPanel ? "resizing" : ""}`}
           style={{ "--bottom-panel-height": `${layout.bottomPanelHeight}px` } as CSSProperties}
         >
-          {projectManager && (workspaceMessage || conflictPath) && <div className={`workspace-notice ${conflictPath ? "conflict" : ""}`} role={conflictPath ? "alert" : "status"}>
+          {(workspaceMessage || conflictPath) && <div className={`workspace-notice ${conflictPath ? "conflict" : ""}`} role={conflictPath ? "alert" : "status"}>
             <span>{conflictPath ? `Storage conflict for ${conflictPath}. Your editor draft remains available.` : workspaceMessage}</span>
             {conflictPath && <div className="workspace-notice-actions">
               <button type="button" onClick={() => void resolveConflict("reload")}>Reload stored version</button>

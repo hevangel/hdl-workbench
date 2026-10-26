@@ -248,6 +248,60 @@ describe("IDE shell", () => {
     expect(help).toHaveAttribute("target", "_blank");
   });
 
+  it("creates a new file from the explorer header and opens it", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "prompt").mockReturnValue("rtl/fresh.sv");
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+
+    await user.click(screen.getByRole("button", { name: "New file" }));
+
+    expect(await screen.findByRole("button", { name: "Open rtl/fresh.sv" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /fresh\.sv/, selected: true })).toBeInTheDocument();
+    expect((screen.getByRole("textbox", { name: "SystemVerilog editor" }) as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("rejects a new file path that escapes the project", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "prompt").mockReturnValue("../outside.sv");
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    await user.click(screen.getByRole("button", { name: "New file" }));
+    expect(await screen.findByText(/normalized project-relative paths/)).toBeInTheDocument();
+  });
+
+  it("offers file actions in a right-click menu and deletes the clicked file", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    expect(screen.queryByRole("button", { name: "File actions" })).not.toBeInTheDocument();
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Open tb/counter_tb.sv" }));
+    expect(screen.getByRole("menu", { name: "Actions for tb/counter_tb.sv" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Rename…" })).toBeDisabled();
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Open tb/counter_tb.sv" })).not.toBeInTheDocument());
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("closes the file menu on Escape", async () => {
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Open tb/counter_tb.sv" }));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("offers VCD and Off dump choices and shows FST as unavailable", async () => {
+    renderDemo();
+    const dump = await screen.findByRole("combobox", { name: "Waveform dump" });
+    expect(dump).toHaveValue("vcd");
+    expect(screen.getByRole("option", { name: /FST/ })).toBeDisabled();
+  });
+
   it("ignores a malformed stored panel height but keeps the stored explorer state", async () => {
     window.localStorage.setItem("xezim-ide/layout-v1", JSON.stringify({ explorerCollapsed: true, bottomPanelHeight: "tall" }));
     renderDemo();
