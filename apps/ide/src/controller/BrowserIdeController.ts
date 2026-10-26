@@ -141,6 +141,13 @@ function toWorkerProject(files: Array<{ path: string; bytes: Uint8Array }>): {
   }
 }
 
+function decodeBase64(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
 function runId(): RunId {
   return RunIdSchema.parse(`run-${crypto.randomUUID()}`);
 }
@@ -296,6 +303,8 @@ export class BrowserIdeController implements IdeController {
         maxTimeNs: timeNs,
         maxOutputBytes: request.workBudget.maxOutputBytes,
         maxVcdBytes: request.workBudget.maxVcdBytes,
+        ...(request.plusargs?.length ? { plusargs: request.plusargs } : {}),
+        ...(request.waveformFormat ? { waveformFormat: request.waveformFormat } : {}),
       }, { timeoutMs: remainingWallTime() });
     } catch (error) {
       throw new BrowserControllerError("INTERNAL_ERROR", error instanceof Error ? error.message : "The Xezim Worker request failed.");
@@ -317,18 +326,20 @@ export class BrowserIdeController implements IdeController {
       message: item.message,
     }));
     let artifact: WaveformArtifact | undefined;
-    if (raw.vcd && raw.waveform?.complete && raw.waveform.sizeBytes > 0) {
+    const fst = raw.fstBase64 ? decodeBase64(raw.fstBase64) : undefined;
+    const dumped = fst ?? raw.vcd;
+    if (dumped && raw.waveform?.complete && raw.waveform.sizeBytes > 0) {
       const nextArtifact = {
         id: artifactId(),
         runId: currentRunId,
         snapshotId: request.snapshotId,
-        format: "vcd" as const,
-        sizeBytes: new TextEncoder().encode(raw.vcd).byteLength,
+        format: fst ? "fst" as const : "vcd" as const,
+        sizeBytes: typeof dumped === "string" ? new TextEncoder().encode(dumped).byteLength : dumped.byteLength,
         storage: "opfs" as const,
         timescale,
         complete: true,
       };
-      await this.artifacts.put(nextArtifact, raw.vcd);
+      await this.artifacts.put(nextArtifact, dumped);
       artifact = nextArtifact;
     }
     await this.applyFileOutputs(raw.fileOutputs ?? [], snapshot.files);

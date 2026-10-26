@@ -9,6 +9,7 @@ import { SurferWaveformPanel } from "./surfer/SurferWaveformPanel.js";
 import type { BrowserIdeController } from "./controller/BrowserIdeController.js";
 import { McpBrowserClient, type BrowserBridgeState } from "./controller/McpBrowserClient.js";
 import { McpConnectionPanel } from "./controller/McpConnectionPanel.js";
+import { parseRunArguments, RunArgumentsError } from "./runArguments.js";
 import { AgentIcon, BrandMark, ChevronIcon, CollapseLeftIcon, ExportIcon, FolderIcon, HelpIcon, ImportIcon, NewFileIcon, PlayIcon, SaveIcon, SidebarIcon, SpinnerIcon, WarningIcon } from "./icons.js";
 
 type SaveState = "dirty" | "saving" | "saved" | "save-failed";
@@ -79,8 +80,9 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
   const [conflictPath, setConflictPath] = useState<ProjectPath | null>(null);
   const [workspaceMessage, setWorkspaceMessage] = useState("");
   const [fileMenu, setFileMenu] = useState<{ path: ProjectPath; x: number; y: number } | null>(null);
-  // The browser Xezim build only emits VCD; "off" runs the design without opening the waveform viewer.
-  const [dumpFormat, setDumpFormat] = useState<"vcd" | "off">("vcd");
+  const [runArgs, setRunArgs] = useState("");
+  // "off" still captures the design's dump but does not open the waveform viewer.
+  const [dumpFormat, setDumpFormat] = useState<"vcd" | "fst" | "off">("vcd");
   const [bridgePanelOpen, setBridgePanelOpen] = useState(false);
   const [bridgeState, setBridgeState] = useState<BrowserBridgeState>("disconnected");
   const [bridgeMessage, setBridgeMessage] = useState("");
@@ -278,6 +280,8 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
       setOpenTabs(nextTabs);
       setActivePath(nextActive);
       setTopModule(session?.topModule || "counter_tb");
+      setRunArgs(session?.runArgs ?? "");
+      setDumpFormat(session?.dumpFormat ?? "vcd");
       loadedSessionProject.current = activeProject.id;
     };
     void loadWorkspace().catch((error: unknown) => {
@@ -359,12 +363,12 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
   useEffect(() => {
     if (!projectManager || loadedSessionProject.current !== activeProject.id) return;
     const timer = setTimeout(() => {
-      void projectManager.saveEditorState(activeProject.id, { openTabs, activePath, topModule }).catch((error: unknown) => {
+      void projectManager.saveEditorState(activeProject.id, { openTabs, activePath, topModule, runArgs, dumpFormat }).catch((error: unknown) => {
         setWorkspaceMessage(error instanceof Error ? error.message : "Could not save editor settings.");
       });
     }, 250);
     return () => clearTimeout(timer);
-  }, [activePath, activeProject.id, openTabs, projectManager, topModule]);
+  }, [activePath, activeProject.id, dumpFormat, openTabs, projectManager, runArgs, topModule]);
 
   const saveDraft = useCallback((path: ProjectPath, content: string): Promise<void> => {
     const previous = saveQueues.current.get(path);
@@ -672,6 +676,15 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
 
   const run = async () => {
     if (busy || !topModule.trim()) return;
+    let plusargs: string[];
+    try {
+      plusargs = parseRunArguments(runArgs);
+    } catch (error) {
+      if (!(error instanceof RunArgumentsError)) throw error;
+      setLog(error.message);
+      setActivePanel("output");
+      return;
+    }
     setBusy(true);
     setLog(controller ? "Saving current draft and freezing a project snapshot for Xezim WASM…" : "Saving current draft and freezing a project snapshot…");
     try {
@@ -684,10 +697,12 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
           topModule: topModule.trim(),
           until: { ticks: "1000", timescale: { magnitude: "1", unit: "ns" } },
           workBudget: { maxWallTimeMs: 5_000, maxOutputBytes: 1_048_576, maxVcdBytes: 64 * 1024 * 1024 },
+          ...(plusargs.length ? { plusargs } : {}),
+          ...(dumpFormat === "fst" ? { waveformFormat: "fst" as const } : {}),
         });
         setDiagnostics(result.diagnostics);
         setLog([result.stdout, result.stderr].filter(Boolean).join("\n") || `Xezim WASM status: ${result.status}`);
-        if (result.waveform && dumpFormat === "vcd") {
+        if (result.waveform && dumpFormat !== "off") {
           setActivePanel("waveforms");
           await controller.showWaveform({ artifactId: result.waveform.id });
         }
@@ -781,11 +796,11 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
               onChange={(event) => void importProject(event.currentTarget.files?.[0])}
             />
           </div>}
-          <label className="dump-field" htmlFor="dump-format" title="Waveform dump format. The browser build of Xezim writes VCD only.">
+          <label className="dump-field" htmlFor="dump-format" title="Waveform file format. FST is converted from the simulator's VCD in the browser. Off runs without opening the viewer.">
             <span className="top-module-prefix" aria-hidden="true">dump</span>
-            <select id="dump-format" aria-label="Waveform dump" value={dumpFormat} onChange={(event) => setDumpFormat(event.target.value === "off" ? "off" : "vcd")} disabled={busy}>
+            <select id="dump-format" aria-label="Waveform dump" value={dumpFormat} onChange={(event) => setDumpFormat(event.target.value === "off" ? "off" : event.target.value === "fst" ? "fst" : "vcd")} disabled={busy}>
               <option value="vcd">VCD</option>
-              <option value="fst" disabled>FST (not in browser build)</option>
+              <option value="fst">FST</option>
               <option value="off">Off</option>
             </select>
           </label>
@@ -793,6 +808,10 @@ export function App({ workspace, simulation = demoServices.simulation, controlle
             <label className="top-module-field" htmlFor="top-module" title="Top module">
               <span className="top-module-prefix" aria-hidden="true">top</span>
               <input id="top-module" aria-label="Top module" className="top-module-input" value={topModule} onChange={(event) => setTopModule(event.target.value)} disabled={busy} spellCheck={false} />
+            </label>
+            <label className="top-module-field args-field" htmlFor="run-args" title="Simulator arguments: +name[=value] plusargs read by $test$plusargs and $value$plusargs, and -sv_seed <n>">
+              <span className="top-module-prefix" aria-hidden="true">args</span>
+              <input id="run-args" aria-label="Simulator arguments" className="top-module-input" value={runArgs} placeholder="+name=value" onChange={(event) => setRunArgs(event.target.value)} disabled={busy} spellCheck={false} autoComplete="off" />
             </label>
             <button className="run-button" type="button" onClick={() => void run()} disabled={busy || !activeFile || !topModule.trim() || Boolean(controller && !controller.canExecute)} title={controller && !controller.canExecute ? runtime.detail : "Compile and simulate the top module"}>
               {busy ? <SpinnerIcon /> : <PlayIcon />} {busy ? "Running…" : "Run"}

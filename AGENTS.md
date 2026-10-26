@@ -80,7 +80,7 @@ All paths are project-relative POSIX paths (`rtl/top.sv`). Absolute paths, `..`,
 - `$readmemh`, `$readmemb`, `$fopen` and `$display` work against **project-relative** files from the snapshot. Host paths outside the project do not exist.
 - Make self-checking tests print one clear marker, such as `PASS` or `FAIL: <reason>`, so the result can be read from `stdout`.
 - **DPI (browser profile):** put C/C++ next to the SV (`.c`, `.cc`, `.cpp`, `.cxx`, plus headers). Only `import "DPI-C" function int f(input int a, …)` is supported, with an `int` return and scalar `input int` arguments only. C++ needs `extern "C"`. libc/libc++ calls, exceptions, RTTI, cross-file unresolved symbols, DPI tasks, `output`/`ref` arguments, strings, arrays, callbacks into SV and exported SV functions are unsupported. A C/C++ compile failure returns `DPI_COMPILATION_FAILED`.
-- Unsupported features include native DPI/VPI `.so`/`.dll`, Python/cocotb, full UVM, FST, pause/resume or stepping, and in-run cancellation. Don't suggest that they work, and don't infer browser support from native Xezim.
+- Unsupported features include native DPI/VPI `.so`/`.dll`, Python/cocotb, full UVM, FSDB, pause/resume or stepping, and in-run cancellation. Command-line flags other than `+plusargs` and `-sv_seed` do not exist in the browser; FST is produced by converting the simulator's VCD in the browser (`crates/xezim-web/src/fst.rs`), not by Xezim's native FST writer. Don't suggest that they work, and don't infer browser support from native Xezim.
 
 ### 5. Errors and what to do
 
@@ -122,7 +122,7 @@ Limits worth remembering: 4,096 files and 16 MiB of source per browser run (the 
 ### Invariants
 
 - **Browser simulation is Xezim WASM in a Worker.** Never add a native, server or JavaScript fallback, and never fake a capability. Report it as unavailable instead.
-- **Truthful capabilities.** A feature exists only when code and tests prove it. Unimplemented contract operations return `UNSUPPORTED_CAPABILITY` or `SIMULATOR_UNAVAILABLE`. Don't claim pause/resume, `getSignalNow`, historical queries from Surfer pixels, FST, or broader DPI.
+- **Truthful capabilities.** A feature exists only when code and tests prove it. Unimplemented contract operations return `UNSUPPORTED_CAPABILITY` or `SIMULATOR_UNAVAILABLE`. Don't claim pause/resume, `getSignalNow`, historical queries from Surfer pixels, FSDB, or broader DPI.
 - **Typed boundaries.** The IDE controller, WorkspaceAdapter, simulation Worker, SurferAdapter and MCP bridge talk only through `packages/protocol` contracts. Wire changes need a protocol `CHANGELOG.md` entry and regenerated schemas (`pnpm build`). Surfer's unstable `InjectMessage` payloads stay inside `SurferIframeAdapter.ts`.
 - **Data safety.** No write without an expected revision. Report saved only after persistence succeeds. Every run is bound to a snapshot ID that travels with its logs and waveform.
 - **Bridge security.** Bind to loopback only, require an exact origin, pairing code and session token on every message, confine operations to the selected root, reject traversal and symlink escape, and never execute arbitrary commands. Untrusted native code never loads in the browser.

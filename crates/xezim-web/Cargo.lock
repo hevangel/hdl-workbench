@@ -81,8 +81,6 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 [[package]]
 name = "fst-writer"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77be37fdc968866fa4f0cee73e42185e6d4699a761a51a54e6ebc9a3d73ed537"
 dependencies = [
  "lz4_flex",
  "miniz_oxide",
@@ -582,6 +580,7 @@ dependencies = [
 name = "xezim-web"
 version = "0.1.0"
 dependencies = [
+ "fst-writer",
  "serde",
  "serde_json",
  "wasm-bindgen",

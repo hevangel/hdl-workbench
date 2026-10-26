@@ -60,7 +60,7 @@ This is a bounded first release; these are deliberate, tested boundaries:
 | Project input | 4,096 files and 16 MiB total in the browser simulator. |
 | Waveforms | VCD only, up to 64 MiB each; 8 runs and 128 MiB retained. |
 | DPI | Functions only, returning `int` with scalar `input int` arguments. C++ functions need `extern "C"`. No `.so`/`.dll` loading. |
-| Not supported | Native DPI/VPI plugins, Python/cocotb, full UVM, FST, multithreaded or JIT simulation. |
+| Not supported | Native DPI/VPI plugins, Python/cocotb, full UVM, FSDB, command-line flags beyond `+plusargs` and `-sv_seed`, multithreaded or JIT simulation. |
 
 ## Repository layout
 

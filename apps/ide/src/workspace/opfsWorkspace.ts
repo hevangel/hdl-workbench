@@ -37,6 +37,9 @@ export interface EditorSessionState {
   openTabs: ProjectPath[];
   activePath: ProjectPath | null;
   topModule: string;
+  /** Simulator command-line fragment, for example `+verbose +N=4`. */
+  runArgs?: string;
+  dumpFormat?: "vcd" | "fst" | "off";
 }
 
 export interface BrowserStorageStatus {
@@ -635,7 +638,7 @@ class BrowserWorkspaceManager implements PersistentWorkspaceManager {
   async loadEditorState(projectId: ProjectId): Promise<EditorSessionState | null> {
     const state = await dbGet<StoredEditorState>(this.database, "editorState", validateProjectId(projectId));
     if (!state) return null;
-    return { openTabs: state.openTabs.filter((path) => ProjectPathSchema.safeParse(path).success), activePath: state.activePath, topModule: state.topModule };
+    return { openTabs: state.openTabs.filter((path) => ProjectPathSchema.safeParse(path).success), activePath: state.activePath, topModule: state.topModule, ...(typeof state.runArgs === "string" ? { runArgs: state.runArgs.slice(0, 4096) } : {}), ...(state.dumpFormat === "vcd" || state.dumpFormat === "fst" || state.dumpFormat === "off" ? { dumpFormat: state.dumpFormat } : {}) };
   }
 
   async saveEditorState(projectId: ProjectId, value: EditorSessionState): Promise<void> {
@@ -645,6 +648,8 @@ class BrowserWorkspaceManager implements PersistentWorkspaceManager {
       openTabs: value.openTabs.map(validatePath),
       activePath: value.activePath ? validatePath(value.activePath) : null,
       topModule: value.topModule.slice(0, 256),
+      ...(value.runArgs === undefined ? {} : { runArgs: value.runArgs.slice(0, 4096) }),
+      ...(value.dumpFormat === undefined ? {} : { dumpFormat: value.dumpFormat }),
     } satisfies StoredEditorState);
   }
 

@@ -85,6 +85,9 @@ button { color: inherit; }
 .top-module-prefix { color: var(--faint); font-family: var(--mono); font-size: 11px; }
 .top-module-input { width: 132px; height: 100%; border: 0; outline: none; padding: 0 8px 0 6px; color: var(--text); background: transparent; font-family: var(--mono); font-size: 12px; }
 .top-module-input:disabled { opacity: .55; }
+.args-field { border-left: 1px solid var(--border-strong); }
+.args-field .top-module-input { width: 120px; }
+.top-module-input::placeholder { color: var(--faint); }
 .dump-field { display: flex; align-items: center; height: 32px; border: 1px solid var(--border-strong); border-radius: 8px; padding-left: 9px; background: var(--bg); }
 .dump-field:focus-within { border-color: #3e6b62; }
 .dump-field select { width: 54px; height: 100%; appearance: none; border: 0; outline: none; padding: 0 8px 0 6px; color: var(--text); background: transparent; font-family: var(--mono); font-size: 12px; cursor: pointer; }
@@ -271,6 +274,7 @@ button { color: inherit; }
   .mode-pill, .status-project { display: none; }
   .agent-button { width: 30px; padding: 0; justify-content: center; font-size: 0; gap: 0; }
   .top-module-input { width: 100px; }
+  .args-field .top-module-input { width: 84px; }
   .panel-content { grid-template-columns: minmax(0, 1fr); }
   .output-preview { display: none; }
   .surfer-toolbar { gap: 4px; padding: 0 6px; }
@@ -286,6 +290,7 @@ button { color: inherit; }
   .button-group, .runtime-warning, .explorer-toggle { display: none; }
   .project-controls select { max-width: 120px; }
   .top-module-prefix { display: none; }
+  .args-field, .dump-field { display: none; }
   .top-module-input { width: 84px; }
   .run-button { padding: 0 9px; }
   .workspace-notice { top: 52px; left: 10px; right: 10px; max-width: none; }

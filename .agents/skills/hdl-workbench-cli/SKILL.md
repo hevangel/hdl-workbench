@@ -109,7 +109,8 @@ Report back with the top module, stop time, `status`, the relevant output lines 
 - `$readmemh`, `$fopen` and `$display` resolve **project-relative** paths only.
 - Stop time is whole nanoseconds, up to 10,000,000 ns (`--until` × `--magnitude` × `--unit`). Wall time is at most 300 s (`--wall-ms`; the default is 30 s), and simulator memory is 256 MiB.
 - DPI: `.c`/`.cpp` files in the project are compiled in the browser. Only `import "DPI-C" function int f(input int …)` works: an `int` return, scalar `input int` arguments, and `extern "C"` in C++. No libc/libc++ calls, DPI tasks, strings, arrays or `output` arguments.
-- Not available: native DPI/VPI libraries, cocotb, full UVM, FST, pause/resume.
+- `run_simulation` accepts `plusargs` (`+name`, `+name=value`, read by `$test$plusargs` and `$value$plusargs`) and `waveform_format` (`vcd` default, or `fst`, converted from the simulator's VCD in the browser). Other command-line flags do not exist in the browser build.
+- Not available: native DPI/VPI libraries, cocotb, full UVM, FSDB, pause/resume.
 
 ## 6. Errors
 

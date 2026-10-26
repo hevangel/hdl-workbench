@@ -28,6 +28,15 @@ type XezimModule = {
     maxOutputBytes: number,
     maxVcdBytes: number,
   ) => string;
+  compileAndRunProjectWithOptions?: (
+    filesJson: string,
+    snapshotId: string,
+    topModule: string,
+    maxTimeNs: bigint,
+    maxOutputBytes: number,
+    maxVcdBytes: number,
+    optionsJson: string,
+  ) => string;
 };
 
 let modulePromise: Promise<XezimModule> | undefined;
@@ -122,14 +131,25 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       }
       const uninstallDpiDispatcher = await installDpiWasmModules(request.dpiModules ?? []);
       try {
-        json = wasm.compileAndRunProject(
+        const wantsOptions = Boolean(request.plusargs?.length) || request.waveformFormat === "fst";
+        if (wantsOptions && !wasm.compileAndRunProjectWithOptions) {
+          workerScope.postMessage(fail(request.id, "UNSUPPORTED_CAPABILITY", "This Xezim WASM build predates plusargs and FST output. Rebuild it with pnpm build:browser."));
+          return;
+        }
+        const projectArguments = [
           JSON.stringify(request.files),
           request.snapshotId,
           request.topModule,
           BigInt(request.maxTimeNs),
           Math.min(request.maxOutputBytes ?? MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES),
           Math.min(request.maxVcdBytes ?? MAX_VCD_BYTES, MAX_VCD_BYTES),
-        );
+        ] as const;
+        json = wantsOptions && wasm.compileAndRunProjectWithOptions
+          ? wasm.compileAndRunProjectWithOptions(...projectArguments, JSON.stringify({
+            plusargs: request.plusargs ?? [],
+            waveformFormat: request.waveformFormat ?? "vcd",
+          }))
+          : wasm.compileAndRunProject(...projectArguments);
       } finally {
         uninstallDpiDispatcher();
       }

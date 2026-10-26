@@ -545,6 +545,22 @@
                 "maxVcdBytes"
               ],
               "additionalProperties": false
+            },
+            "plusargs": {
+              "maxItems": 64,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 1024,
+                "pattern": "^\\+\\S+$"
+              }
+            },
+            "waveformFormat": {
+              "type": "string",
+              "enum": [
+                "vcd",
+                "fst"
+              ]
             }
           },
           "required": [

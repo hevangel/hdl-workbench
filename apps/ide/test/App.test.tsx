@@ -295,11 +295,24 @@ describe("IDE shell", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
-  it("offers VCD and Off dump choices and shows FST as unavailable", async () => {
+  it("offers VCD, FST and Off dump choices", async () => {
+    const user = userEvent.setup();
     renderDemo();
     const dump = await screen.findByRole("combobox", { name: "Waveform dump" });
     expect(dump).toHaveValue("vcd");
-    expect(screen.getByRole("option", { name: /FST/ })).toBeDisabled();
+    expect(screen.getByRole("option", { name: "FST" })).toBeEnabled();
+    await user.selectOptions(dump, "fst");
+    expect(dump).toHaveValue("fst");
+  });
+
+  it("reports unsupported simulator arguments instead of running", async () => {
+    const user = userEvent.setup();
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    await user.type(screen.getByRole("textbox", { name: "Simulator arguments" }), "-gui +ok");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(await screen.findByText(/Unsupported argument '-gui'/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
   });
 
   it("ignores a malformed stored panel height but keeps the stored explorer state", async () => {

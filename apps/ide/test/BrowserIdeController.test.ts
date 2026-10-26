@@ -93,6 +93,49 @@ describe("BrowserIdeController one-shot execution", () => {
     expect(artifacts.put).not.toHaveBeenCalled();
   });
 
+  it("passes plusargs to the Worker and stores an FST result as an FST artifact", async () => {
+    const services = createMockServices();
+    const put = vi.fn();
+    const artifacts = { put, get: vi.fn(), objectUrl: vi.fn(), dispose: vi.fn() } as unknown as OpfsWaveformStore;
+    const fstBytes = Uint8Array.from([0, 1, 2, 250, 251, 252, 253]);
+    const worker = vi.fn(async (input): Promise<WorkerResponse> => ({
+      id: "worker-1",
+      ok: true,
+      result: {
+        schemaVersion: 1, status: "completed", maxTimeNs: "1000", lastTimeTicks: "1000", finished: true, sawFatal: false,
+        stdout: "", diagnostics: [], snapshotId: input.snapshotId, fileOutputs: [],
+        waveform: { format: "fst", sizeBytes: fstBytes.byteLength, complete: true, timescale: "1 ns" },
+        fstBase64: btoa(String.fromCharCode(...fstBytes)),
+      },
+    }));
+    const workspace = stableWorkspace(services);
+    const controller = new BrowserIdeController(workspace, { runProjectWorker: worker, artifactStore: artifacts });
+    const result = await controller.execute(request({
+      snapshotId: (await workspace.snapshot()).snapshotId,
+      plusargs: ["+verbose", "+N=42"],
+      waveformFormat: "fst",
+    }));
+
+    expect(worker).toHaveBeenCalledWith(expect.objectContaining({ plusargs: ["+verbose", "+N=42"], waveformFormat: "fst" }), expect.anything());
+    expect(result.waveform).toMatchObject({ format: "fst", sizeBytes: fstBytes.byteLength, complete: true });
+    expect(put).toHaveBeenCalledWith(result.waveform, fstBytes);
+  });
+
+  it("omits plusargs and format from the Worker request when none were asked for", async () => {
+    const services = createMockServices();
+    const artifacts = { put: vi.fn(), get: vi.fn(), objectUrl: vi.fn(), dispose: vi.fn() } as unknown as OpfsWaveformStore;
+    const worker = vi.fn(async (input): Promise<WorkerResponse> => ({
+      id: "worker-1",
+      ok: true,
+      result: { schemaVersion: 1, status: "completed", maxTimeNs: "1000", lastTimeTicks: "1000", finished: true, sawFatal: false, stdout: "", diagnostics: [], snapshotId: input.snapshotId },
+    }));
+    const workspace = stableWorkspace(services);
+    const controller = new BrowserIdeController(workspace, { runProjectWorker: worker, artifactStore: artifacts });
+    await controller.execute(request({ snapshotId: (await workspace.snapshot()).snapshotId }));
+    expect(worker.mock.calls[0]?.[0]).not.toHaveProperty("plusargs");
+    expect(worker.mock.calls[0]?.[0]).not.toHaveProperty("waveformFormat");
+  });
+
   it("does not claim separate compile or run handles", async () => {
     const controller = new BrowserIdeController(createMockServices().workspace);
     await expect(controller.compile({

@@ -59,10 +59,14 @@ export function createMcpServer(service: IdeMcpService): McpServer {
       max_output_bytes: z.number().int().nonnegative().max(16 * 1024 * 1024),
       max_vcd_bytes: z.number().int().nonnegative().max(64 * 1024 * 1024),
     }).optional(),
+    plusargs: z.array(z.string().regex(/^\+\S+$/).max(1024)).max(64).optional().describe("Simulator plusargs such as +verbose or +N=42, read by $test$plusargs and $value$plusargs."),
+    waveform_format: z.enum(["vcd", "fst"]).optional().describe("Waveform file format; defaults to vcd."),
   }), (input) => service.runSimulation({
     topModule: input.top_module,
     untilTicks: input.until_ticks,
     timescale: input.timescale,
+    ...(input.plusargs === undefined ? {} : { plusargs: input.plusargs }),
+    ...(input.waveform_format === undefined ? {} : { waveformFormat: input.waveform_format }),
     ...(input.work_budget === undefined ? {} : { workBudget: {
       maxWallTimeMs: input.work_budget.max_wall_time_ms,
       maxOutputBytes: input.work_budget.max_output_bytes,
@@ -77,7 +81,7 @@ export function createMcpServer(service: IdeMcpService): McpServer {
     ...(run_id === undefined ? {} : { runId: run_id }),
   }));
   tool(server, "list_runs", "List recent browser simulation runs.", z.strictObject({ limit: z.number().int().positive().max(100).default(20) }), ({ limit }) => service.listRuns(limit));
-  tool(server, "show_waveforms", "Open a VCD waveform artifact in the paired browser's Surfer panel.", z.strictObject({
+  tool(server, "show_waveforms", "Open a VCD or FST waveform artifact in the paired browser's Surfer panel.", z.strictObject({
     artifact_id: ArtifactIdSchema,
     signal_paths: z.array(z.string().min(1).max(1024)).max(4096).optional(),
     cursor: z.strictObject({ ticks: DecimalTicksSchema }).optional(),
