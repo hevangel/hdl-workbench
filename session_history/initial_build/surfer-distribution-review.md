@@ -10,8 +10,8 @@ This document records the shipped asset and the applicable text of the upstream 
 
 - The embedded viewer is Surfer v0.7.0 at commit `bd749b1f786c1c62cd67893ca71346cbe6983915`.
 - Upstream identifies Surfer as EUPL-1.2 licensed. Its pinned source tree is [available on GitLab](https://gitlab.com/surfer-project/surfer/-/tree/bd749b1f786c1c62cd67893ca71346cbe6983915).
-- The complete EUPL-1.2 text is bundled as [`LICENSE-EUPL-1.2.txt`](../../../apps/ide/public/surfer/LICENSE-EUPL-1.2.txt).
-- HDL Workbench modified the upstream `index.html` on 2026-10-22 to add a same-origin, nonce-based iframe readiness probe. The original and local hashes are recorded separately; all other listed assets match their upstream hashes. The [asset provenance note](../../../apps/ide/public/surfer/UPSTREAM.md) records the exact change and pin.
+- The complete EUPL-1.2 text is bundled as [`LICENSE-EUPL-1.2.txt`](../../apps/ide/public/surfer/LICENSE-EUPL-1.2.txt).
+- HDL Workbench modified the upstream `index.html` on 2026-10-22 to add a same-origin, nonce-based iframe readiness probe. The original and local hashes are recorded separately; all other listed assets match their upstream hashes. The [asset provenance note](../../apps/ide/public/surfer/UPSTREAM.md) records the exact change and pin.
 - The bundle is served inside a same-origin iframe. The application communicates with it through the version-specific adapter. This describes the architecture only; it does not establish the legal boundary between separate or combined works.
 
 ## License requirements relevant to deployment

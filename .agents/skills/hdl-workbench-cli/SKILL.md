@@ -123,6 +123,7 @@ Report back with the top module, stop time, `status`, the relevant output lines 
 | `TIMEOUT` | Fix hangs (missing `$finish`, zero-delay loops), shorten `--until`, or raise `--wall-ms` (≤ 300000). |
 | `RESOURCE_LIMIT` | Dump fewer scopes, shorten the run, or shrink the design. |
 | `SIMULATOR_UNAVAILABLE` | The IDE lacks WASM assets. Ask for `pnpm build:browser`, then reload the page. |
+| `UNSUPPORTED_CAPABILITY` saying the build "predates plusargs and FST output" | The WASM is older than this checkout. Ask for `pnpm build:browser`, then reload. Runs without plusargs or FST still work. |
 | `DPI_COMPILATION_FAILED` | Fix the C/C++ shown in `diagnostics`. |
 | `No running hdlwb session` (exit 2) | Run `hdlwb start --project-root …`. |
 | `already running` (exit 2) | Reuse the session, or run `hdlwb stop` first (or use `--session`). |

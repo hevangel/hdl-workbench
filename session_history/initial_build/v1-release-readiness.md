@@ -15,7 +15,7 @@ Status: feature, development and production browser integration, selected-workst
 | wasm-bindgen CLI | `0.2.129` |
 | Node / pnpm | Node `24` or newer in the supported range / pnpm `11.25.0` |
 
-Source pins and original licenses for Xezim are in [`vendor/UPSTREAM.md`](../../../vendor/UPSTREAM.md). Surfer's upstream asset hashes and retained EUPL-1.2 notice are in [`apps/ide/public/surfer/UPSTREAM.md`](../../../apps/ide/public/surfer/UPSTREAM.md) and `UPSTREAM-SHA256SUMS`.
+Source pins and original licenses for Xezim are in [`vendor/UPSTREAM.md`](../../vendor/UPSTREAM.md). Surfer's upstream asset hashes and retained EUPL-1.2 notice are in [`apps/ide/public/surfer/UPSTREAM.md`](../../apps/ide/public/surfer/UPSTREAM.md) and `UPSTREAM-SHA256SUMS`.
 
 ## Reproducible build and demo
 
@@ -61,7 +61,7 @@ pnpm demo
 | Native Xezim suite on current branch | Pass in Linux builder; 5,226 passed, 1 perf test ignored | `cargo test --manifest-path vendor/xezim/Cargo.toml`. |
 | Native xezim-web wrapper suite on current branch | Pass in Linux builder; 11 tests | `cargo test --manifest-path crates/xezim-web/Cargo.toml`. |
 | Official CI workflow | Pass on `ea45cec`; Chromium, Firefox, and native Xezim jobs all passed in [run 39910731328](https://github.com/hevangel/hdl-workbench/actions/runs/39910731328) | `.github/workflows/luna09-browser-e2e.yml`. |
-| License/distribution review | Compiler license texts and asset hashes are served; source is on `main` after [PR #1](https://github.com/hevangel/hdl-workbench/pull/1) merged. Component/build provenance, hosted production URL checks, and qualified review remain pending | See [Surfer distribution review](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../../../apps/ide/public/licenses/THIRD_PARTY.md). browsercc's WASI sysroot tar has no notice files, and its build container uses mutable Emscripten `latest`. |
+| License/distribution review | Compiler license texts and asset hashes are served; source is on `main` after [PR #1](https://github.com/hevangel/hdl-workbench/pull/1) merged. Component/build provenance, hosted production URL checks, and qualified review remain pending | See [Surfer distribution review](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../../apps/ide/public/licenses/THIRD_PARTY.md). browsercc's WASI sysroot tar has no notice files, and its build container uses mutable Emscripten `latest`. |
 
 ## Implemented bounds and remaining memory risk
 
@@ -85,4 +85,4 @@ pnpm demo
 
 1. For any subsequent source change, rerun `.github/workflows/luna09-browser-e2e.yml` and retain hosted logs.
 2. For the chosen public hosted website, publish the versioned source/provenance, configure the hosting project, record its canonical origin, and verify the license, source note, modified HTML entrypoint, and upstream source remain public while the viewer is served. No hosting manifest or canonical origin is configured in this checkout.
-3. Obtain qualified review of the Surfer bundle, compiler toolchain assets, and combined application's license position. The [technical inventories](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../../../apps/ide/public/licenses/THIRD_PARTY.md) are evidence for review, not legal approval.
+3. Obtain qualified review of the Surfer bundle, compiler toolchain assets, and combined application's license position. The [technical inventories](surfer-distribution-review.md) and [`apps/ide/public/licenses/THIRD_PARTY.md`](../../apps/ide/public/licenses/THIRD_PARTY.md) are evidence for review, not legal approval.

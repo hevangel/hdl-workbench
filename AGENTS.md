@@ -49,7 +49,7 @@ All paths are project-relative POSIX paths (`rtl/top.sv`). Absolute paths, `..`,
 | `list_project_files` | `{}` | Every file with its `revision` (`sha256:…`) |
 | `read_project_file` | `{ path }` | Content (base64) and current `revision` |
 | `write_project_file` | `{ path, expected_revision, content_base64 }` | Create (`expected_revision: null`) or replace (current revision). A stale revision returns `REVISION_CONFLICT`. |
-| `run_simulation` | `{ top_module, until_ticks, timescale, work_budget? }` | Sync the snapshot, then compile and run it in the browser. Returns a `RunResult`. |
+| `run_simulation` | `{ top_module, until_ticks, timescale, work_budget?, plusargs?, waveform_format? }` | Sync the snapshot, then compile and run it in the browser. Returns a `RunResult`. |
 | `get_simulation_log` | `{ run_id, tail_bytes? }` | Captured stdout/stderr (default tail 64 KiB, max 1 MiB) |
 | `get_diagnostics` | `{ run_id? }` | Structured diagnostics with file, line and code |
 | `list_runs` | `{ limit? }` | Recent runs (default 20, max 100) |
@@ -60,6 +60,8 @@ All paths are project-relative POSIX paths (`rtl/top.sv`). Absolute paths, `..`,
 
 - `until_ticks` is a **decimal string** (`"1000"`), not a number. With `timescale` `{ "magnitude": "1", "unit": "ns" }` it means 1000 ns. The total must be a whole number of nanoseconds and at most 10,000,000 ns.
 - `work_budget` defaults to `{ max_wall_time_ms: 30000, max_output_bytes: 1048576, max_vcd_bytes: 16777216 }`. The maximums are 300000 ms, 16 MiB and 64 MiB.
+- `plusargs` is an optional array of at most 64 strings such as `"+verbose"` or `"+N=42"`. The simulator reads them with `$test$plusargs` and `$value$plusargs`. Each must start with `+` and contain no spaces.
+- `waveform_format` is `"vcd"` (default) or `"fst"`. FST is converted from the simulator's VCD in the browser. Either way, `waveform` in the result points to the stored artifact.
 - The result contains `runId`, `snapshotId`, `status` (`completed`, `finish`, `failed`, `timeout` or `resource_limit`), `diagnostics`, `stdout`, `stderr`, `lastTime`, and `waveform` when a VCD was produced. Pass `waveform.id` to `show_waveforms` as `artifact_id`.
 - Only one simulation runs at a time; an overlapping call returns `SIMULATION_BUSY`.
 
@@ -117,7 +119,7 @@ Limits worth remembering: 4,096 files and 16 MiB of source per browser run (the 
 | `services/mcp-bridge/scripts/hdlwb.mjs` | Session CLI that keeps one paired bridge alive for shell-only agents |
 | `.agents/skills/` | Agent skills, such as `hdl-workbench-cli` for driving the web app through `hdlwb` |
 | `docs/index.html` | Public visual overview, which must stay accurate to the code |
-| `docs/session_history/initial_build/` | Historical ADRs, plan, task lanes and milestone reports. These are records: add new reports beside them rather than rewriting old results. |
+| `session_history/initial_build/` | Historical ADRs, plan, task lanes and milestone reports. These are records: add new reports beside them rather than rewriting old results. |
 
 ### Invariants
 

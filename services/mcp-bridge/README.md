@@ -31,7 +31,7 @@ pnpm --dir services/mcp-bridge exec mcp-inspector --cli node dist/main.js --proj
 - `read_project_file`: `{ "path": "rtl/top.sv" }`
 - `write_project_file`: `{ "path": "rtl/top.sv", "expected_revision": "sha256:…", "content_base64": "…" }`. Use `null` for `expected_revision` to create a file; a stale revision returns `REVISION_CONFLICT`.
 - `compile`: `{ "top_module": "top", "mode": "full" }` with optional `include_dirs` and `defines`.
-- `run_simulation`: `{ "top_module": "top", "until_ticks": "1000", "timescale": { "magnitude": "1", "unit": "ns" } }` with an optional `work_budget` of `max_wall_time_ms`, `max_output_bytes` and `max_vcd_bytes`. This is the one-shot browser compile-and-run; it does not take a compile ID.
+- `run_simulation`: `{ "top_module": "top", "until_ticks": "1000", "timescale": { "magnitude": "1", "unit": "ns" } }` with an optional `work_budget` of `max_wall_time_ms`, `max_output_bytes` and `max_vcd_bytes`, optional `plusargs` (`+name` or `+name=value`, at most 64), and optional `waveform_format` (`vcd` default, or `fst`). This is the one-shot browser compile-and-run; it does not take a compile ID.
 - `compile` currently reports `UNSUPPORTED_CAPABILITY` in the browser because the pinned binding has no separate compiled-design handle; use `run_simulation`.
 - `get_diagnostics`: optional `compile_id` and/or `run_id`.
 - `list_runs`: optional `limit`.

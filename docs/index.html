@@ -388,7 +388,7 @@
         </div>
         <div data-step="4" hidden>
           <h3>5 · Store the waveform</h3>
-          <p>The VCD is written into a bounded in-memory sink (up to 64 MiB) and persisted in OPFS as a waveform artifact with its run ID, snapshot ID and timescale. Waveform bytes never travel through MCP JSON; only artifact metadata does.</p>
+          <p>The VCD is written into a bounded in-memory sink (up to 64 MiB) and persisted in OPFS as a waveform artifact with its run ID, snapshot ID and timescale. If the person chose FST, the browser converts that VCD to FST before storage. Waveform bytes never travel through MCP JSON; only artifact metadata does.</p>
         </div>
         <div data-step="5" hidden>
           <h3>6 · View</h3>
@@ -505,17 +505,17 @@
           <tr><td><code>packages/wave-index/</code></td><td>VCD indexer for historical signal queries</td></tr>
           <tr><td><code>services/mcp-bridge/</code></td><td>MCP stdio server, project-file authority and loopback WebSocket pairing</td></tr>
           <tr><td><code>vendor/</code></td><td>Pinned Xezim sources with target-gated browser patches</td></tr>
-          <tr><td><code>docs/session_history/initial_build/</code></td><td>ADRs, original plan, task lanes and milestone reports from the first build</td></tr>
+          <tr><td><code>session_history/initial_build/</code></td><td>ADRs, original plan, task lanes and milestone reports from the first build</td></tr>
         </tbody>
       </table>
     </div>
-    <p style="margin-top:18px">Start here: <a href="../README.md">README</a> for setup, <a href="../AGENTS.md">AGENTS.md</a> for driving the workbench as an AI agent, <a href="session_history/initial_build/v1-release-readiness.md">release readiness</a> for recorded test evidence, and <a href="session_history/initial_build/v1-upgrade-notes.md">upgrade notes</a> for runtime limits.</p>
+    <p style="margin-top:18px">Start here: <a href="../README.md">README</a> for setup, <a href="../AGENTS.md">AGENTS.md</a> for driving the workbench as an AI agent, <a href="../session_history/initial_build/v1-release-readiness.md">release readiness</a> for recorded test evidence, and <a href="../session_history/initial_build/v1-upgrade-notes.md">upgrade notes</a> for runtime limits.</p>
   </div>
 </section>
 </main>
 
 <footer>
-  <div class="wrap">HDL Workbench is part of the AI Engineer project. Static page with no external scripts or tracking. Facts here reflect the pinned sources and the recorded results in <code>docs/session_history/initial_build/</code>.</div>
+  <div class="wrap">HDL Workbench is part of the AI Engineer project. Static page with no external scripts or tracking. Facts here reflect the pinned sources and the recorded results in <code>session_history/initial_build/</code>.</div>
 </footer>
 
 <script>

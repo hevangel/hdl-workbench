@@ -45,7 +45,7 @@ docker exec kb_camoufox python3 -c 'import os,sys,urllib.request; os.environ["DI
 
 Result: passed in Camoufox Firefox `152.0.4-beta.30` under Xvfb, same-origin HTTP, with no page or console errors. The app entry module required the same test-only import workaround documented by LUNA-06; ordinary page-entry startup remains a separate browser release gate. The run logged Surfer's non-fatal `ThreadPoolBuildError` warning in this container, as did the feasibility spike.
 
-Screenshots and the complete browser log are checked in under `apps/ide/test-artifacts/surfer/`, including [the zoomed waveform](../../../apps/ide/test-artifacts/surfer/04-zoomed.png) and [the reloaded viewer](../../../apps/ide/test-artifacts/surfer/05-reloaded-and-controlled.png).
+Screenshots and the complete browser log are checked in under `apps/ide/test-artifacts/surfer/`, including [the zoomed waveform](../../apps/ide/test-artifacts/surfer/04-zoomed.png) and [the reloaded viewer](../../apps/ide/test-artifacts/surfer/05-reloaded-and-controlled.png).
 
 ## Limits and follow-on work
 

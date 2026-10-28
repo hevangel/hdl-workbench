@@ -58,9 +58,12 @@ This is a bounded first release; these are deliberate, tested boundaries:
 | Wall time | 300 seconds per run, enforced by terminating the Worker. |
 | Simulator memory | 256 MiB WebAssembly linear memory. Exceeding it reports `RESOURCE_LIMIT`. |
 | Project input | 4,096 files and 16 MiB total in the browser simulator. |
-| Waveforms | VCD only, up to 64 MiB each; 8 runs and 128 MiB retained. |
+| Waveforms | VCD up to 64 MiB per run, or FST converted from that VCD in the browser. 8 runs and 128 MiB of VCD retained. |
+| Simulator arguments | `+name` and `+name=value` plusargs, and `-sv_seed <n>`. Other command-line flags are rejected. |
 | DPI | Functions only, returning `int` with scalar `input int` arguments. C++ functions need `extern "C"`. No `.so`/`.dll` loading. |
-| Not supported | Native DPI/VPI plugins, Python/cocotb, full UVM, FSDB, command-line flags beyond `+plusargs` and `-sv_seed`, multithreaded or JIT simulation. |
+| Not supported | Native DPI/VPI plugins, Python/cocotb, full UVM, FSDB, command-line flags beyond the plusargs and seed above, multithreaded or JIT simulation. |
+
+Plusargs and FST output need a WASM build from this checkout. If the IDE reports that the build "predates plusargs and FST output", rebuild it with `pnpm build:browser`.
 
 ## Repository layout
 
@@ -71,9 +74,10 @@ This is a bounded first release; these are deliberate, tested boundaries:
 | `packages/protocol/` | Versioned `xezim-ide/1` wire schemas shared by the IDE and the bridge |
 | `packages/wave-index/` | VCD indexer for historical signal queries |
 | `services/mcp-bridge/` | Local MCP stdio server and loopback WebSocket bridge to the browser |
-| `vendor/` | Pinned Xezim and xezim-core sources with documented browser patches |
+| `vendor/` | Pinned Xezim and xezim-core sources with documented browser patches, and the vendored `fst-writer` crate |
 | `spikes/` | Early feasibility experiments, kept for reference |
-| `docs/` | The visual overview (`index.html`) and the [initial build history](docs/session_history/initial_build/) |
+| `docs/` | The visual overview, `index.html` |
+| `session_history/initial_build/` | ADRs, the original plan, task lanes and milestone reports from the initial build |
 
 ## Development and tests
 
@@ -89,7 +93,7 @@ Some bridge tests bind to loopback ports, and the end-to-end suite needs the Pla
 
 ## History and design records
 
-The design decisions (ADRs), the original implementation plan, and every milestone report from the initial build are in [`docs/session_history/initial_build/`](docs/session_history/initial_build/). Start with [`v1-release-readiness.md`](docs/session_history/initial_build/v1-release-readiness.md) for the pinned versions and acceptance results, and [`v1-upgrade-notes.md`](docs/session_history/initial_build/v1-upgrade-notes.md) for runtime limits.
+The design decisions (ADRs), the original implementation plan, and every milestone report from the initial build are in [`session_history/initial_build/`](session_history/initial_build/). Start with [`v1-release-readiness.md`](session_history/initial_build/v1-release-readiness.md) for the pinned versions and acceptance results, and [`v1-upgrade-notes.md`](session_history/initial_build/v1-upgrade-notes.md) for runtime limits.
 
 ## Licensing
 

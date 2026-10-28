@@ -19,13 +19,13 @@ imports or unresolved cross-translation-unit references. Exceptions, RTTI,
 libc/libc++ runtime calls, DPI tasks, output/ref arguments, strings, arrays,
 callbacks into SV, and time-suspending calls are unsupported. Source, module,
 memory, and worker time limits are enforced; see
-[`docs/session_history/initial_build/luna-11-dpi-c-cpp-report.md`](../../docs/session_history/initial_build/luna-11-dpi-c-cpp-report.md).
+[`session_history/initial_build/luna-11-dpi-c-cpp-report.md`](../../session_history/initial_build/luna-11-dpi-c-cpp-report.md).
 
 The compiler's first-use assets total 94.4 MB before transport compression.
 On the selected Windows workstation, a real Chrome 156 profile completed the
 C/C++ compile-and-DPI fixture in about 2.5 seconds; peak browser-process memory
 and the exact workload are recorded in
-[`docs/session_history/initial_build/luna-12-dpi-memory-report.md`](../../docs/session_history/initial_build/luna-12-dpi-memory-report.md).
+[`session_history/initial_build/luna-12-dpi-memory-report.md`](../../session_history/initial_build/luna-12-dpi-memory-report.md).
 That single-machine measurement does not establish requirements for smaller
 devices or other browser engines. Public release review is still pending.
 
