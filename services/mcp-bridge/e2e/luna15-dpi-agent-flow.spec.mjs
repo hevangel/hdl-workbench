@@ -52,7 +52,7 @@ test("MCP project C/C++ files compile and execute through IDE Xezim DPI with rec
     cwd: packageRoot,
     stderr: "pipe",
   });
-  const client = new Client({ name: "xezim-studio-luna15-dpi-e2e", version: "0.1.0" });
+  const client = new Client({ name: "hdl-workbench-luna15-dpi-e2e", version: "0.1.0" });
 
   try {
     await client.connect(transport);

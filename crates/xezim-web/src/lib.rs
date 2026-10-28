@@ -3,6 +3,8 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
+mod fst;
+
 const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROJECT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_VCD_BYTES: usize = 64 * 1024 * 1024;
@@ -43,6 +45,9 @@ struct RunResult {
     waveform: Option<WaveformMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     vcd: Option<String>,
+    /// Base64 of the FST file when FST output was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fst_base64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_outputs: Option<Vec<FileOutput>>,
 }
@@ -88,6 +93,7 @@ impl RunResult {
             snapshot_id: None,
             waveform: None,
             vcd: None,
+            fst_base64: None,
             file_outputs: None,
         }
     }
@@ -163,13 +169,42 @@ fn vcd_timescale(bytes: &[u8]) -> Option<String> {
     )
 }
 
-fn run_project(
+/// Per-run options from the browser, mirroring the native command line.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct RunOptions {
+    /// `+name` / `+name=value` arguments for `$test$plusargs` and `$value$plusargs`.
+    plusargs: Vec<String>,
+    /// `"vcd"` (default) or `"fst"`.
+    waveform_format: Option<String>,
+}
+
+const MAX_PLUSARGS: usize = 64;
+const MAX_PLUSARG_BYTES: usize = 1024;
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[(value >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(value >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(value >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[value as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn run_project_with_options(
     files_json: &str,
     snapshot_id: &str,
     top_module: &str,
     max_time_ns: u64,
     max_output_bytes: usize,
     max_vcd_bytes: usize,
+    options: &RunOptions,
 ) -> String {
     let parse_error = |code, message: String| encode(RunResult::error(code, message, max_time_ns));
     if snapshot_id.is_empty() || snapshot_id.len() > 256 {
@@ -234,16 +269,41 @@ fn run_project(
         );
     }
 
+    let want_fst = match options.waveform_format.as_deref() {
+        None | Some("vcd") => false,
+        Some("fst") => true,
+        Some(other) => {
+            return parse_error(
+                "XEZIM_WEB_WAVEFORM_FORMAT",
+                format!("Unsupported waveform format '{other}'; use 'vcd' or 'fst'."),
+            );
+        }
+    };
+    if options.plusargs.len() > MAX_PLUSARGS
+        || options
+            .plusargs
+            .iter()
+            .any(|arg| arg.len() > MAX_PLUSARG_BYTES || !arg.starts_with('+'))
+    {
+        return parse_error(
+            "XEZIM_WEB_PLUSARGS",
+            format!(
+                "Plusargs must start with '+', be at most {MAX_PLUSARG_BYTES} bytes, and number at most {MAX_PLUSARGS}."
+            ),
+        );
+    }
+
     let output_limit = max_output_bytes.min(MAX_OUTPUT_BYTES);
     let vcd_limit = max_vcd_bytes.min(MAX_VCD_BYTES);
     let capture = VcdCapture::new(vcd_limit);
-    let mut sim = match xezim::simulate_project_inline_with_output_limit(
+    let mut sim = match xezim::simulate_project_inline_with_plusargs(
         &sources,
         &virtual_files,
         max_time_ns,
         Some(top_module),
         MAX_PROJECT_BYTES,
         Some(output_limit),
+        &options.plusargs,
         Box::new(BoundedVcdWriter(capture.clone())),
     ) {
         Ok(sim) => sim,
@@ -326,17 +386,38 @@ fn run_project(
         RunStatus::Completed
     };
     let timescale = vcd_timescale(&vcd_bytes);
-    let waveform = (!vcd_bytes.is_empty() || vcd_exceeded).then_some(WaveformMetadata {
-        format: "vcd",
-        size_bytes: vcd_bytes.len(),
-        complete: !vcd_exceeded,
-        timescale,
-    });
-    let vcd = if vcd_exceeded {
+    let mut format = "vcd";
+    let mut size_bytes = vcd_bytes.len();
+    let mut vcd = if vcd_exceeded {
         None
     } else {
         String::from_utf8(vcd_bytes).ok()
     };
+    let mut fst_base64 = None;
+    if want_fst && let Some(text) = vcd.as_deref().filter(|text| !text.is_empty()) {
+        match fst::vcd_to_fst(text) {
+            Ok(bytes) => {
+                format = "fst";
+                size_bytes = bytes.len();
+                fst_base64 = Some(encode_base64(&bytes));
+                vcd = None;
+            }
+            Err(message) => {
+                // Keep the VCD so the run is not lost, and say why FST was not produced.
+                diagnostics.push(Diagnostic {
+                    severity: "warning",
+                    code: "XEZIM_WEB_FST",
+                    message: format!("{message} Returning the VCD instead."),
+                });
+            }
+        }
+    }
+    let waveform = (size_bytes > 0 || vcd_exceeded).then_some(WaveformMetadata {
+        format,
+        size_bytes,
+        complete: !vcd_exceeded,
+        timescale,
+    });
     encode(RunResult {
         schema_version: 1,
         status,
@@ -349,8 +430,28 @@ fn run_project(
         snapshot_id: Some(snapshot_id.to_string()),
         waveform,
         vcd,
+        fst_base64,
         file_outputs: Some(file_outputs),
     })
+}
+
+fn run_project(
+    files_json: &str,
+    snapshot_id: &str,
+    top_module: &str,
+    max_time_ns: u64,
+    max_output_bytes: usize,
+    max_vcd_bytes: usize,
+) -> String {
+    run_project_with_options(
+        files_json,
+        snapshot_id,
+        top_module,
+        max_time_ns,
+        max_output_bytes,
+        max_vcd_bytes,
+        &RunOptions::default(),
+    )
 }
 
 /// One-shot browser simulation entry point. Call it from a dedicated Worker.
@@ -418,6 +519,39 @@ pub fn compile_and_run_project(
         max_time_ns,
         max_output_bytes,
         max_vcd_bytes,
+    )
+}
+
+/// Like `compileAndRunProject`, plus an options JSON object:
+/// `{"plusargs": ["+name=value"], "waveformFormat": "vcd" | "fst"}`.
+#[wasm_bindgen(js_name = compileAndRunProjectWithOptions)]
+pub fn compile_and_run_project_with_options(
+    files_json: &str,
+    snapshot_id: &str,
+    top_module: &str,
+    max_time_ns: u64,
+    max_output_bytes: usize,
+    max_vcd_bytes: usize,
+    options_json: &str,
+) -> String {
+    let options: RunOptions = match serde_json::from_str(options_json) {
+        Ok(options) => options,
+        Err(error) => {
+            return encode(RunResult::error(
+                "XEZIM_WEB_OPTIONS",
+                format!("Invalid run options: {error}"),
+                max_time_ns,
+            ));
+        }
+    };
+    run_project_with_options(
+        files_json,
+        snapshot_id,
+        top_module,
+        max_time_ns,
+        max_output_bytes,
+        max_vcd_bytes,
+        &options,
     )
 }
 
@@ -615,6 +749,79 @@ mod tests {
                         && diagnostic["code"] == "XEZIM_WEB_OUTPUT_LIMIT"
                 })
         );
+    }
+
+    const PLUSARG_TOP: &str = r#"
+module top;
+  integer n;
+  initial begin
+    if ($test$plusargs("verbose")) $display("VERBOSE=on"); else $display("VERBOSE=off");
+    if ($value$plusargs("N=%d", n)) $display("N=%0d", n); else $display("N=missing");
+    $finish;
+  end
+endmodule
+"#;
+
+    fn run_with_options(files_json: &str, top: &str, options: &str) -> serde_json::Value {
+        serde_json::from_str(&compile_and_run_project_with_options(
+            files_json,
+            "sha256:options",
+            top,
+            20,
+            MAX_OUTPUT_BYTES,
+            MAX_VCD_BYTES,
+            options,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn plusargs_reach_test_and_value_plusargs() {
+        let files = serde_json::json!([{ "path": "top.sv", "contents": PLUSARG_TOP }]).to_string();
+
+        let without = run_with_options(&files, "top", "{}");
+        let stdout = without["stdout"].as_str().unwrap();
+        assert!(stdout.contains("VERBOSE=off") && stdout.contains("N=missing"), "{without}");
+
+        let with = run_with_options(&files, "top", r#"{"plusargs":["+verbose","+N=42"]}"#);
+        let stdout = with["stdout"].as_str().unwrap();
+        assert!(stdout.contains("VERBOSE=on") && stdout.contains("N=42"), "{with}");
+    }
+
+    #[test]
+    fn rejects_plusargs_without_a_leading_plus_and_unknown_formats() {
+        let files = serde_json::json!([{ "path": "top.sv", "contents": PLUSARG_TOP }]).to_string();
+        let bad_arg = run_with_options(&files, "top", r#"{"plusargs":["verbose"]}"#);
+        assert_eq!(bad_arg["diagnostics"][0]["code"], "XEZIM_WEB_PLUSARGS", "{bad_arg}");
+        let bad_format = run_with_options(&files, "top", r#"{"waveformFormat":"fsdb"}"#);
+        assert_eq!(bad_format["diagnostics"][0]["code"], "XEZIM_WEB_WAVEFORM_FORMAT", "{bad_format}");
+        let bad_json = run_with_options(&files, "top", "not json");
+        assert_eq!(bad_json["diagnostics"][0]["code"], "XEZIM_WEB_OPTIONS", "{bad_json}");
+    }
+
+    #[test]
+    fn returns_an_fst_when_requested() {
+        let json = project_json();
+        let value = run_with_options(&json, "top", r#"{"waveformFormat":"fst"}"#);
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["waveform"]["format"], "fst", "{value}");
+        assert_eq!(value["waveform"]["complete"], true);
+        assert_eq!(value["vcd"], serde_json::Value::Null);
+        let encoded = value["fstBase64"].as_str().unwrap();
+        assert!(!encoded.is_empty());
+        assert_eq!(
+            value["waveform"]["sizeBytes"].as_u64().unwrap() as usize,
+            (encoded.len() / 4) * 3 - encoded.matches('=').count()
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_standard_alphabet_and_padding() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
     }
 
     #[test]

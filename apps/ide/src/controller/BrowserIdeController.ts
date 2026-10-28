@@ -141,6 +141,13 @@ function toWorkerProject(files: Array<{ path: string; bytes: Uint8Array }>): {
   }
 }
 
+function decodeBase64(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
 function runId(): RunId {
   return RunIdSchema.parse(`run-${crypto.randomUUID()}`);
 }
@@ -296,6 +303,8 @@ export class BrowserIdeController implements IdeController {
         maxTimeNs: timeNs,
         maxOutputBytes: request.workBudget.maxOutputBytes,
         maxVcdBytes: request.workBudget.maxVcdBytes,
+        ...(request.plusargs?.length ? { plusargs: request.plusargs } : {}),
+        ...(request.waveformFormat ? { waveformFormat: request.waveformFormat } : {}),
       }, { timeoutMs: remainingWallTime() });
     } catch (error) {
       throw new BrowserControllerError("INTERNAL_ERROR", error instanceof Error ? error.message : "The Xezim Worker request failed.");
@@ -308,25 +317,29 @@ export class BrowserIdeController implements IdeController {
     }
     const raw = response.result;
     if (raw.snapshotId !== request.snapshotId) throw new BrowserControllerError("INTERNAL_ERROR", "Xezim returned a result for a different source snapshot.");
-    const timescale = parseTimescale(raw.waveform?.timescale);
+    // Only designs that call $dumpfile/$dumpvars produce a VCD, and only a VCD carries a
+    // timescale. A run without a dump is still a valid run, so label it with the request's.
+    const timescale = raw.waveform ? parseTimescale(raw.waveform.timescale) : request.until.timescale;
     const diagnostics = raw.diagnostics.map((item) => DiagnosticSchema.parse({
       severity: item.severity,
       code: item.code,
       message: item.message,
     }));
     let artifact: WaveformArtifact | undefined;
-    if (raw.vcd && raw.waveform?.complete && raw.waveform.sizeBytes > 0) {
+    const fst = raw.fstBase64 ? decodeBase64(raw.fstBase64) : undefined;
+    const dumped = fst ?? raw.vcd;
+    if (dumped && raw.waveform?.complete && raw.waveform.sizeBytes > 0) {
       const nextArtifact = {
         id: artifactId(),
         runId: currentRunId,
         snapshotId: request.snapshotId,
-        format: "vcd" as const,
-        sizeBytes: new TextEncoder().encode(raw.vcd).byteLength,
+        format: fst ? "fst" as const : "vcd" as const,
+        sizeBytes: typeof dumped === "string" ? new TextEncoder().encode(dumped).byteLength : dumped.byteLength,
         storage: "opfs" as const,
         timescale,
         complete: true,
       };
-      await this.artifacts.put(nextArtifact, raw.vcd);
+      await this.artifacts.put(nextArtifact, dumped);
       artifact = nextArtifact;
     }
     await this.applyFileOutputs(raw.fileOutputs ?? [], snapshot.files);

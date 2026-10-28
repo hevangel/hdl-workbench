@@ -1058,6 +1058,33 @@ pub fn simulate_project_inline_with_output_limit(
     output_limit: Option<usize>,
     vcd_writer: Box<dyn std::io::Write + Send>,
 ) -> Result<compiler::Simulator, String> {
+    simulate_project_inline_with_plusargs(
+        sources,
+        virtual_files,
+        max_time,
+        top_module_name,
+        max_project_bytes,
+        output_limit,
+        &[],
+        vcd_writer,
+    )
+}
+
+/// Same as [`simulate_project_inline_with_output_limit`], with the run's
+/// plusargs (`+name`, `+name=value`, `+seed=n`) visible to `$test$plusargs`
+/// and `$value$plusargs`. This is the browser equivalent of the native
+/// command line's `+` arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_project_inline_with_plusargs(
+    sources: &[(String, String)],
+    virtual_files: &[(String, Vec<u8>)],
+    max_time: u64,
+    top_module_name: Option<&str>,
+    max_project_bytes: usize,
+    output_limit: Option<usize>,
+    plusargs: &[String],
+    vcd_writer: Box<dyn std::io::Write + Send>,
+) -> Result<compiler::Simulator, String> {
     let source_texts: Vec<String> = sources.iter().map(|(_, text)| text.clone()).collect();
     let source_paths: Vec<String> = sources.iter().map(|(path, _)| path.clone()).collect();
     let rewritten_sources: Vec<String> = source_texts
@@ -1085,7 +1112,7 @@ pub fn simulate_project_inline_with_output_limit(
         None,
         None,
         &[],
-        &[],
+        plusargs,
         None,
         &[],
         0,

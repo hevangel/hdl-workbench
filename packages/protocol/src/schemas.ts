@@ -99,13 +99,16 @@ export const ExecuteRequestSchema = z.strictObject({
     maxOutputBytes: z.number().int().nonnegative().max(16 * 1024 * 1024),
     maxVcdBytes: z.number().int().nonnegative().max(64 * 1024 * 1024),
   }),
+  // Command-line style options. Plusargs are visible to $test$plusargs and $value$plusargs.
+  plusargs: z.array(z.string().regex(/^\+\S+$/).max(1024)).max(64).optional(),
+  waveformFormat: z.enum(["vcd", "fst"]).optional(),
 });
 
 export const WaveformArtifactSchema = z.strictObject({
   id: ArtifactIdSchema,
   runId: RunIdSchema,
   snapshotId: SnapshotIdSchema,
-  format: z.literal("vcd"),
+  format: z.enum(["vcd", "fst"]),
   sizeBytes: z.number().int().nonnegative().max(256 * 1024 * 1024),
   storage: z.enum(["opfs", "bridge-file"]),
   timescale: TimescaleSchema,

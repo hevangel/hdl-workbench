@@ -100,6 +100,8 @@ export class IdeMcpService {
     untilTicks: string;
     timescale: { magnitude: string; unit: "s" | "ms" | "us" | "ns" | "ps" | "fs" };
     workBudget?: { maxWallTimeMs: number; maxOutputBytes: number; maxVcdBytes: number };
+    plusargs?: string[];
+    waveformFormat?: "vcd" | "fst";
   }): Promise<RunResult> {
     return this.withSimulation(async () => {
       const snapshot = await this.files.snapshot();
@@ -110,6 +112,8 @@ export class IdeMcpService {
         topModule: input.topModule,
         until: { ticks: input.untilTicks, timescale: input.timescale },
         workBudget: input.workBudget ?? { maxWallTimeMs: 30_000, maxOutputBytes: 1_048_576, maxVcdBytes: 16 * 1024 * 1024 },
+        ...(input.plusargs === undefined ? {} : { plusargs: input.plusargs }),
+        ...(input.waveformFormat === undefined ? {} : { waveformFormat: input.waveformFormat }),
       });
       const result = RunResultSchema.parse(await this.success(makeRpcRequest({ op: "simulation.execute", projectId: this.projectId, params: request })));
       if (result.snapshotId !== snapshot.snapshotId || result.projectId !== this.projectId) {

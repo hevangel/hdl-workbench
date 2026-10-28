@@ -1,0 +1,15 @@
+[package]
+name = "fst-writer"
+version = "0.3.1"
+edition = "2024"
+rust-version = "1.85.0"
+authors = ["Kevin Laeufer <laeufer@cornell.edu>"]
+description = "A Rust library for writing waveform traces in the FST format (patched: FstHeaderWriter::new takes any seekable writer)."
+license = "BSD-3-Clause"
+repository = "https://github.com/ekiwi/fst-writer"
+publish = false
+
+[dependencies]
+lz4_flex = "0.11"
+miniz_oxide = "0.8.2"
+thiserror = "2.0"

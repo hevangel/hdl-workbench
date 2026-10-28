@@ -378,7 +378,10 @@
                     },
                     "format": {
                       "type": "string",
-                      "const": "vcd"
+                      "enum": [
+                        "vcd",
+                        "fst"
+                      ]
                     },
                     "sizeBytes": {
                       "type": "integer",
@@ -649,7 +652,10 @@
                           },
                           "format": {
                             "type": "string",
-                            "const": "vcd"
+                            "enum": [
+                              "vcd",
+                              "fst"
+                            ]
                           },
                           "sizeBytes": {
                             "type": "integer",

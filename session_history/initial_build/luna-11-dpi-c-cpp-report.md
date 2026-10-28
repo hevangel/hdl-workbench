@@ -54,7 +54,7 @@ error and a successful compile/simulation after that error.
   `apps/ide/public/licenses/browsercc-MIT.txt`.
 - The identified LLVM, WASI SDK, wasi-libc, and Emscripten license texts and
   generated asset hashes are served from `/licenses/`; see
-  [`apps/ide/public/licenses/THIRD_PARTY.md`](../apps/ide/public/licenses/THIRD_PARTY.md).
+  [`apps/ide/public/licenses/THIRD_PARTY.md`](../../apps/ide/public/licenses/THIRD_PARTY.md).
 
 The packed `browsercc` npm tarball includes LLVM and a WASI sysroot but does not
 include a component manifest. The sysroot archive contains no notice files, and
