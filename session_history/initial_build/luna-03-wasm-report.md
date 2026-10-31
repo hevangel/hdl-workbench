@@ -14,7 +14,7 @@ Status: debug and optimized wasm builds plus real Chromium Worker acceptance pas
 | wasm-bindgen / CLI | `0.2.129` |
 | Browser acceptance | Chromium `155.0.8059.79` on Debian 13 |
 
-The source pair and upstream licenses are recorded in [`vendor/UPSTREAM.md`](../vendor/UPSTREAM.md). The wrapper lockfile is `crates/xezim-web/Cargo.lock`; the browser clock shim resolves `web-time 1.1.0`.
+The source pair and upstream licenses are recorded in [`vendor/UPSTREAM.md`](../../vendor/UPSTREAM.md). The wrapper lockfile is `crates/xezim-web/Cargo.lock`; the browser clock shim resolves `web-time 1.1.0`.
 
 ## Changes and portability findings
 

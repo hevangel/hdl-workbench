@@ -54,7 +54,7 @@ async function startIde(): Promise<void> {
       <main className="storage-startup-error" role="alert">
         <h1>Browser storage is unavailable</h1>
         <p>{error instanceof Error ? error.message : "The persistent workspace could not be opened."}</p>
-        <p>Xezim Studio did not switch to an in-memory workspace. Try a supported browser on localhost or HTTPS, then reload.</p>
+        <p>HDL Workbench did not switch to an in-memory workspace. Try a supported browser on localhost or HTTPS, then reload.</p>
         <button type="button" onClick={() => void startIde()}>Retry storage setup</button>
       </main>,
     );

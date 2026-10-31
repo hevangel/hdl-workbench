@@ -13,7 +13,7 @@ Status: implementation and browser acceptance passed on the pinned Xezim source 
 | Rust / Cargo | `1.99.1` |
 | wasm-bindgen / CLI | `0.2.129` |
 
-The vendored sources are the pinned archives documented in [`vendor/UPSTREAM.md`](../vendor/UPSTREAM.md); LUNA-03 portability changes and this VFS patch are applied in place. The native APIs remain filesystem-backed by default.
+The vendored sources are the pinned archives documented in [`vendor/UPSTREAM.md`](../../vendor/UPSTREAM.md); LUNA-03 portability changes and this VFS patch are applied in place. The native APIs remain filesystem-backed by default.
 
 ## Implemented surface
 

@@ -61,7 +61,7 @@ describe("IDE shell", () => {
     await waitFor(() => {
       expect(setModelMarkers).toHaveBeenCalledWith(
         expect.any(Object),
-        "xezim-studio",
+        "hdl-workbench",
         expect.arrayContaining([
           expect.objectContaining({
             severity: 8,
@@ -71,7 +71,7 @@ describe("IDE shell", () => {
         ]),
       );
     });
-    expect(screen.getByRole("status")).toHaveTextContent("MOCK SERVICES");
+    expect(screen.getByRole("status")).toHaveTextContent("Mock services · no HDL simulation");
   });
 
   it("asks before closing a dirty tab and can discard the draft", async () => {
@@ -191,5 +191,134 @@ describe("IDE shell", () => {
 
     renderDemo();
     expect(await screen.findByRole("button", { name: "Show file explorer" })).toBeInTheDocument();
+  });
+
+  it("collapses the explorer from its header and toggles it with Ctrl+B", async () => {
+    const user = userEvent.setup();
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const sidebar = screen.getByRole("complementary", { name: "Project files" });
+
+    await user.click(screen.getByRole("button", { name: "Collapse file explorer" }));
+    expect(sidebar).toHaveClass("collapsed");
+    expect(screen.getByRole("button", { name: "Show file explorer" })).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true });
+    expect(sidebar).not.toHaveClass("collapsed");
+    // Other modifier combinations are left to the editor.
+    fireEvent.keyDown(window, { key: "b", ctrlKey: true, shiftKey: true });
+    expect(sidebar).not.toHaveClass("collapsed");
+  });
+
+  it("resizes the bottom panel from the keyboard and keeps the height across reloads", async () => {
+    const firstRender = renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const resizer = screen.getByRole("separator", { name: "Resize bottom panel" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "220");
+
+    fireEvent.keyDown(resizer, { key: "ArrowUp" });
+    fireEvent.keyDown(resizer, { key: "ArrowUp" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "260");
+    expect(screen.getByRole("main")).toHaveStyle({ "--bottom-panel-height": "260px" });
+    await waitFor(() => expect(window.localStorage.getItem("xezim-ide/layout-v1")).toContain('"bottomPanelHeight":260'));
+    firstRender.unmount();
+
+    renderDemo();
+    expect(await screen.findByRole("separator", { name: "Resize bottom panel" })).toHaveAttribute("aria-valuenow", "260");
+  });
+
+  it("clamps the bottom panel to its minimum and resets it on double-click", async () => {
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    const resizer = screen.getByRole("separator", { name: "Resize bottom panel" });
+
+    fireEvent.keyDown(resizer, { key: "Home" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "80");
+    fireEvent.keyDown(resizer, { key: "ArrowDown" });
+    expect(resizer).toHaveAttribute("aria-valuenow", "80");
+
+    fireEvent.doubleClick(resizer);
+    expect(resizer).toHaveAttribute("aria-valuenow", "220");
+  });
+
+  it("links the help button to the user guide in a new tab", async () => {
+    renderDemo();
+    const help = await screen.findByRole("link", { name: "How HDL Workbench works" });
+    expect(help).toHaveAttribute("href", "/docs/index.html");
+    expect(help).toHaveAttribute("target", "_blank");
+  });
+
+  it("creates a new file from the explorer header and opens it", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "prompt").mockReturnValue("rtl/fresh.sv");
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+
+    await user.click(screen.getByRole("button", { name: "New file" }));
+
+    expect(await screen.findByRole("button", { name: "Open rtl/fresh.sv" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /fresh\.sv/, selected: true })).toBeInTheDocument();
+    expect((screen.getByRole("textbox", { name: "SystemVerilog editor" }) as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("rejects a new file path that escapes the project", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "prompt").mockReturnValue("../outside.sv");
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    await user.click(screen.getByRole("button", { name: "New file" }));
+    expect(await screen.findByText(/normalized project-relative paths/)).toBeInTheDocument();
+  });
+
+  it("offers file actions in a right-click menu and deletes the clicked file", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    expect(screen.queryByRole("button", { name: "File actions" })).not.toBeInTheDocument();
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Open tb/counter_tb.sv" }));
+    expect(screen.getByRole("menu", { name: "Actions for tb/counter_tb.sv" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Rename…" })).toBeDisabled();
+    await user.click(screen.getByRole("menuitem", { name: "Delete…" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Open tb/counter_tb.sv" })).not.toBeInTheDocument());
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("closes the file menu on Escape", async () => {
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Open tb/counter_tb.sv" }));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("offers VCD, FST and Off dump choices", async () => {
+    const user = userEvent.setup();
+    renderDemo();
+    const dump = await screen.findByRole("combobox", { name: "Waveform dump" });
+    expect(dump).toHaveValue("vcd");
+    expect(screen.getByRole("option", { name: "FST" })).toBeEnabled();
+    await user.selectOptions(dump, "fst");
+    expect(dump).toHaveValue("fst");
+  });
+
+  it("reports unsupported simulator arguments instead of running", async () => {
+    const user = userEvent.setup();
+    renderDemo();
+    await screen.findByRole("textbox", { name: "SystemVerilog editor" });
+    await user.type(screen.getByRole("textbox", { name: "Simulator arguments" }), "-gui +ok");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    expect(await screen.findByText(/Unsupported argument '-gui'/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
+  });
+
+  it("ignores a malformed stored panel height but keeps the stored explorer state", async () => {
+    window.localStorage.setItem("xezim-ide/layout-v1", JSON.stringify({ explorerCollapsed: true, bottomPanelHeight: "tall" }));
+    renderDemo();
+    expect(await screen.findByRole("button", { name: "Show file explorer" })).toBeInTheDocument();
+    expect(screen.getByRole("separator", { name: "Resize bottom panel" })).toHaveAttribute("aria-valuenow", "220");
   });
 });

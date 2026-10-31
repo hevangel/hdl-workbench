@@ -3,7 +3,7 @@
 ## Browser C/C++ compiler assets
 
 The IDE ships the `browsercc` 0.1.1 npm artifact. Its exact package integrity
-is recorded in `docs/luna-11-dpi-c-cpp-report.md`. The generated build assets
+is recorded in `session_history/initial_build/luna-11-dpi-c-cpp-report.md`. The generated build assets
 identified below are from that locked package; their SHA-256 values provide a
 check against accidental asset changes.
 
@@ -37,4 +37,4 @@ not make the upstream build recipe reproducible.
 This is a technical asset and notice inventory, not a qualified legal review.
 The remaining per-component inventory and the combined application's
 distribution position require the release review tracked in
-`docs/surfer-distribution-review.md` in the source repository.
+`session_history/initial_build/surfer-distribution-review.md` in the source repository.

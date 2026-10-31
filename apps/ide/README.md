@@ -1,6 +1,6 @@
-# Xezim Studio IDE
+# HDL Workbench IDE
 
-Xezim Studio is a browser SystemVerilog IDE. The production entry point opens a
+HDL Workbench is a browser SystemVerilog IDE. The production entry point opens a
 persistent browser workspace and runs the pinned Xezim WebAssembly build in a
 dedicated Worker. If the WASM assets are missing, simulation is disabled; the
 browser does not fall back to native Xezim. Mock services are used by component
@@ -19,13 +19,13 @@ imports or unresolved cross-translation-unit references. Exceptions, RTTI,
 libc/libc++ runtime calls, DPI tasks, output/ref arguments, strings, arrays,
 callbacks into SV, and time-suspending calls are unsupported. Source, module,
 memory, and worker time limits are enforced; see
-[`docs/luna-11-dpi-c-cpp-report.md`](../../docs/luna-11-dpi-c-cpp-report.md).
+[`session_history/initial_build/luna-11-dpi-c-cpp-report.md`](../../session_history/initial_build/luna-11-dpi-c-cpp-report.md).
 
 The compiler's first-use assets total 94.4 MB before transport compression.
 On the selected Windows workstation, a real Chrome 156 profile completed the
 C/C++ compile-and-DPI fixture in about 2.5 seconds; peak browser-process memory
 and the exact workload are recorded in
-[`docs/luna-12-dpi-memory-report.md`](../../docs/luna-12-dpi-memory-report.md).
+[`session_history/initial_build/luna-12-dpi-memory-report.md`](../../session_history/initial_build/luna-12-dpi-memory-report.md).
 That single-machine measurement does not establish requirements for smaller
 devices or other browser engines. Public release review is still pending.
 

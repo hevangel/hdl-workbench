@@ -14,9 +14,9 @@ import {
 } from "@xezim-ide/protocol";
 import { exportProjectZip, importProjectZip, type ArchiveFile } from "./projectArchive.js";
 
-const DATABASE_NAME = "xezim-studio-workspace";
+const DATABASE_NAME = "hdl-workbench-workspace";
 const DATABASE_VERSION = 1;
-const STORAGE_ROOT = "xezim-studio";
+const STORAGE_ROOT = "hdl-workbench";
 const PROJECTS_DIRECTORY = "projects";
 const TEMP_DIRECTORY = "pending";
 const ACTIVE_PROJECT_KEY = "activeProjectId";
@@ -37,6 +37,9 @@ export interface EditorSessionState {
   openTabs: ProjectPath[];
   activePath: ProjectPath | null;
   topModule: string;
+  /** Simulator command-line fragment, for example `+verbose +N=4`. */
+  runArgs?: string;
+  dumpFormat?: "vcd" | "fst" | "off";
 }
 
 export interface BrowserStorageStatus {
@@ -124,7 +127,7 @@ function openDatabase(): Promise<IDBDatabase> {
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new WorkspaceStorageError("INDEXEDDB_OPEN_FAILED", "Could not open workspace metadata storage."));
-    request.onblocked = () => reject(new WorkspaceStorageError("INDEXEDDB_BLOCKED", "Close older Xezim Studio tabs to upgrade workspace storage."));
+    request.onblocked = () => reject(new WorkspaceStorageError("INDEXEDDB_BLOCKED", "Close older HDL Workbench tabs to upgrade workspace storage."));
   });
 }
 
@@ -230,7 +233,7 @@ function storageError(error: unknown): never {
 
 async function withProjectLock<T>(projectId: ProjectId, action: () => Promise<T>): Promise<T> {
   if (!navigator.locks) throw new WorkspaceStorageError("CROSS_TAB_LOCK_UNAVAILABLE", "This browser lacks cross-tab workspace locks; writes are disabled to avoid overwriting another tab.");
-  return navigator.locks.request(`xezim-studio:${projectId}`, { mode: "exclusive" }, action);
+  return navigator.locks.request(`hdl-workbench:${projectId}`, { mode: "exclusive" }, action);
 }
 
 async function requestPersistentStorage(): Promise<boolean> {
@@ -261,7 +264,7 @@ export class OpfsWorkspace implements WorkspaceAdapter {
     private readonly projectRoot: FileSystemDirectoryHandle,
     private readonly storageRoot: FileSystemDirectoryHandle,
   ) {
-    this.channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("xezim-studio-workspace-v1");
+    this.channel = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("hdl-workbench-workspace-v1");
     this.channel?.addEventListener("message", (event: MessageEvent<FileChange & { projectId?: string }>) => {
       if (event.data?.projectId !== this.project.id) return;
       const { projectId: _projectId, ...change } = event.data;
@@ -635,7 +638,7 @@ class BrowserWorkspaceManager implements PersistentWorkspaceManager {
   async loadEditorState(projectId: ProjectId): Promise<EditorSessionState | null> {
     const state = await dbGet<StoredEditorState>(this.database, "editorState", validateProjectId(projectId));
     if (!state) return null;
-    return { openTabs: state.openTabs.filter((path) => ProjectPathSchema.safeParse(path).success), activePath: state.activePath, topModule: state.topModule };
+    return { openTabs: state.openTabs.filter((path) => ProjectPathSchema.safeParse(path).success), activePath: state.activePath, topModule: state.topModule, ...(typeof state.runArgs === "string" ? { runArgs: state.runArgs.slice(0, 4096) } : {}), ...(state.dumpFormat === "vcd" || state.dumpFormat === "fst" || state.dumpFormat === "off" ? { dumpFormat: state.dumpFormat } : {}) };
   }
 
   async saveEditorState(projectId: ProjectId, value: EditorSessionState): Promise<void> {
@@ -645,6 +648,8 @@ class BrowserWorkspaceManager implements PersistentWorkspaceManager {
       openTabs: value.openTabs.map(validatePath),
       activePath: value.activePath ? validatePath(value.activePath) : null,
       topModule: value.topModule.slice(0, 256),
+      ...(value.runArgs === undefined ? {} : { runArgs: value.runArgs.slice(0, 4096) }),
+      ...(value.dumpFormat === undefined ? {} : { dumpFormat: value.dumpFormat }),
     } satisfies StoredEditorState);
   }
 

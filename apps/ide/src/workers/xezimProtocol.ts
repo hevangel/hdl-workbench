@@ -28,6 +28,9 @@ export interface CompileAndRunProjectRequest {
   maxTimeNs: number;
   maxOutputBytes?: number;
   maxVcdBytes?: number;
+  /** `+name` or `+name=value` arguments for $test$plusargs and $value$plusargs. */
+  plusargs?: string[];
+  waveformFormat?: "vcd" | "fst";
 }
 
 export type WorkerRequest = CompileAndRunRequest | CompileAndRunProjectRequest;
@@ -42,8 +45,10 @@ export interface WorkerResult {
   stdout: string;
   diagnostics: Array<{ severity: "error" | "warning"; code: string; message: string }>;
   snapshotId?: string;
-  waveform?: { format: "vcd"; sizeBytes: number; complete: boolean; timescale?: string | null };
+  waveform?: { format: "vcd" | "fst"; sizeBytes: number; complete: boolean; timescale?: string | null };
   vcd?: string;
+  /** The FST file, base64-encoded, when `waveformFormat` was "fst". */
+  fstBase64?: string;
   fileOutputs?: Array<{ path: string; contents: string }>;
 }
 

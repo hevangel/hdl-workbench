@@ -87,6 +87,20 @@ describe("protocol schemas", () => {
     expect(ExecuteRequestSchema.safeParse({ ...valid, compileId: "pretend-compile" }).success).toBe(false);
     expect(ExecuteRequestSchema.safeParse({ ...valid, workBudget: { ...valid.workBudget, maxSteps: 1 } }).success).toBe(false);
   });
+
+  it("accepts plusargs and an FST request, and rejects arguments the simulator would ignore", () => {
+    const base = {
+      projectId: "local-project",
+      snapshotId: "snap-0123456789abcdef0123456789abcdef",
+      topModule: "counter_tb",
+      until: { ticks: "1000", timescale },
+      workBudget: { maxWallTimeMs: 5000, maxOutputBytes: 1048576, maxVcdBytes: 64 * 1024 * 1024 },
+    };
+    expect(ExecuteRequestSchema.safeParse({ ...base, plusargs: ["+verbose", "+N=42"], waveformFormat: "fst" }).success).toBe(true);
+    expect(ExecuteRequestSchema.safeParse({ ...base, plusargs: ["verbose"] }).success).toBe(false);
+    expect(ExecuteRequestSchema.safeParse({ ...base, plusargs: ["+has space"] }).success).toBe(false);
+    expect(ExecuteRequestSchema.safeParse({ ...base, waveformFormat: "fsdb" }).success).toBe(false);
+  });
 });
 
 describe("snapshot provenance and tick arithmetic", () => {
