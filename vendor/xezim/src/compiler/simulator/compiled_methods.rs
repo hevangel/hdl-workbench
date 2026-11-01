@@ -234,7 +234,13 @@ impl Simulator {
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
                     .unwrap_or(false);
-                if unpacked || !integral_or_handle {
+                // Virtual interfaces carry an instance-name binding outside
+                // the heap Value. A typedef or type parameter may hide that
+                // shape; copying the numeric cell alone loses the binding.
+                // This admission set is shared across specializations, so a
+                // type parameter that may carry a vif must keep the AST path.
+                let vif_capable = Self::static_is_vif_capable(cd, p);
+                if unpacked || vif_capable || !integral_or_handle {
                     bad.insert(p.clone());
                 }
             }
@@ -269,6 +275,12 @@ impl Simulator {
             let crate::ast::types::DataType::TypeReference { name: tn, .. } = cur else {
                 return None;
             };
+            // A typedef of an unpacked collection of class handles is a
+            // collection, not a handle to its element class. Following only
+            // typedef_types discards those unpacked dimensions.
+            if self.fn_ret_coll_dims(cur).is_some() {
+                return None;
+            }
             if self.module.classes.contains_key(&tn.name.name) {
                 return Some(tn.name.name.clone());
             }
@@ -736,6 +748,83 @@ impl Simulator {
         out
     }
 
+    /// LRM 11.6 / 11.8.2: the declared input-port widths of every method
+    /// visible from `cname`, keyed by method name.
+    ///
+    /// A call ACTUAL is CONTEXT-determined by the callee's declared formal,
+    /// exactly like the operand of a comparison: with
+    /// `function bit wide9(logic [8:0] v)`, the call site `wide9(a + b)`
+    /// must evaluate `a + b` at 9 bits (300), not at its 8-bit self width
+    /// (44).  The inline path already binds actuals with
+    /// `port_effective_width`; the `CallMethod` / `CallScopedMethod`
+    /// lowerings have no class table in scope and compiled every actual
+    /// against `ctx_width = 0`, so the widths have to be resolved here.
+    ///
+    /// Non-input, dimensioned, or non-scalar-integral ports contribute 0,
+    /// which is the "keep the source width" sentinel the compiler already
+    /// uses — those calls behave exactly as before this resolution existed.
+    /// First definition in the lexical chain wins: §8.20 binds a non-virtual
+    /// bare call to the first defining class, and a virtual override may only
+    /// redeclare the same prototype.
+    pub(super) fn class_method_formal_widths(&self, cname: &str) -> HashMap<String, Vec<u32>> {
+        let mut out = self.chain_method_formal_widths(cname);
+        // `super.m` calls the PARENT's `m`, so its widths come from the
+        // parent's chain, kept under `super.<m>` apart from an `m` this class
+        // hides (§13.5.1).
+        if let Some(parent) = self
+            .module
+            .classes
+            .get(cname)
+            .and_then(|cd| cd.extends.as_deref())
+        {
+            for (m, w) in self.chain_method_formal_widths(parent) {
+                out.insert(format!("super.{m}"), w);
+            }
+        }
+        out
+    }
+
+    /// `class_method_formal_widths` of the class chain from `cname` up.
+    fn chain_method_formal_widths(&self, cname: &str) -> HashMap<String, Vec<u32>> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        use crate::ast::types::PortDirection;
+        let mut out: HashMap<String, Vec<u32>> = HashMap::default();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for (mname, md) in cd.methods.iter() {
+                if out.contains_key(mname.as_str()) {
+                    continue;
+                }
+                let ports = match &md.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => &f.ports,
+                    Kind::Task(t) => &t.ports,
+                };
+                let widths = ports
+                    .iter()
+                    .map(|p| {
+                        if p.direction == PortDirection::Input && p.dimensions.is_empty() {
+                            self.scalar_formal_integral(&p.data_type)
+                                .map(|(w, _)| w)
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    })
+                    .collect();
+                out.insert(mname.clone(), widths);
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// class-perf Step 9f: the `super.m(...)` admission set — method
     /// names visible in the PARENT chain of `cname` (the class lexically
     /// containing the call), plus `new` (super.new is ctor chaining, always
@@ -899,7 +988,12 @@ impl Simulator {
                 }
             }
             let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
-            bincode::serialize_into(&mut writer, &self.module).ok()?;
+            bincode::serde::encode_into_std_write(
+                &self.module,
+                &mut writer,
+                xezim_core::xez_bincode_config(),
+            )
+            .ok()?;
             let mut signals: Vec<_> = self.signal_name_to_id.iter().collect();
             signals.sort_unstable_by(|a, b| a.0.cmp(b.0));
             signals.hash(&mut writer.0);
@@ -934,7 +1028,7 @@ impl Simulator {
     ) -> Option<super::bytecode::PersistedMethodOutcome> {
         let dir = method_cache_dir()?;
         let bytes = std::fs::read(dir.join(format!("m{:016x}.bin", key))).ok()?;
-        bincode::deserialize(&bytes).ok()
+        super::bytecode::decode_persisted_method_outcome(&bytes)
     }
 
     /// Best-effort atomic store (tmp file + rename; the pid suffix keeps
@@ -951,7 +1045,8 @@ impl Simulator {
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
-        let Ok(bytes) = bincode::serialize(outcome) else {
+        let Ok(bytes) = bincode::serde::encode_to_vec(outcome, xezim_core::xez_bincode_config())
+        else {
             return;
         };
         let tmp = dir.join(format!("m{:016x}.tmp.{}", key, std::process::id()));
@@ -1079,6 +1174,49 @@ impl Simulator {
     /// would — and a body that touches `this`-relative names was never
     /// compilable anyway (the compiler's handle-chain gates require a
     /// class-typed root, which no free-function frame provides).
+    /// Whether a subroutine's formals or body variables declare an explicit
+    /// packed range other than `[N-1:0]` (a non-zero low bound or an
+    /// ascending range), or whose right bound is not a constant.
+    fn declares_offset_packed_range(
+        &self,
+        ports: &[crate::ast::decl::FunctionPort],
+        body: &[crate::ast::stmt::Statement],
+    ) -> bool {
+        use crate::ast::stmt::StatementKind;
+        use crate::ast::types::{DataType, PackedDimension};
+        let offset = |dt: &DataType| {
+            let dims = match dt {
+                DataType::IntegerVector { dimensions, .. }
+                | DataType::Implicit { dimensions, .. }
+                | DataType::TypeReference { dimensions, .. } => dimensions,
+                _ => return false,
+            };
+            dims.iter().any(|d| match d {
+                PackedDimension::Range { left, right, .. } => {
+                    let c = |e| {
+                        super::elaborate::const_eval_i64_with_params(
+                            e,
+                            Some(&self.module.parameters),
+                        )
+                    };
+                    // `[W-1:0]` keeps compiling whatever `W` is.
+                    c(right) != Some(0) || c(left).is_some_and(|l| l < 0)
+                }
+                PackedDimension::Unsized(_) => false,
+            })
+        };
+        fn walk(s: &crate::ast::stmt::Statement, f: &dyn Fn(&DataType) -> bool) -> bool {
+            match &s.kind {
+                StatementKind::VarDecl { data_type, .. } => f(data_type),
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().any(|s| walk(s, f))
+                }
+                _ => false,
+            }
+        }
+        ports.iter().any(|p| offset(&p.data_type)) || body.iter().any(|s| walk(s, &offset))
+    }
+
     pub(super) fn try_run_compiled_free_function(
         &mut self,
         fd: &crate::ast::decl::FunctionDeclaration,
@@ -1236,6 +1374,15 @@ impl Simulator {
                 self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             }
+            // §7.4.1, §11.5.1: a formal or local declared with a packed range
+            // that is not `[N-1:0]` (`input logic [12:1] a`) is selected by
+            // its labels, which the compiled selects do not rebase: `a[i]`
+            // read bit i, so a hot function read the wrong bit or x (#650).
+            if self.declares_offset_packed_range(ports, body) {
+                trace_decline("offset-packed-range");
+                self.compiled_method_skip.insert((cid, mid, spec_id));
+                return None;
+            }
             // A wait-free TASK compiles exactly like a `function void`: the
             // compiler bails on any timing control (allow_waits=false), so a
             // task whose body compiles is purely sequential and the
@@ -1260,6 +1407,7 @@ impl Simulator {
                         return None;
                     }
                     task_fd_storage = crate::ast::decl::FunctionDeclaration {
+                        default_args: false,
                         lifetime: t.lifetime.clone(),
                         specifier: t.specifier.clone(),
                         return_type: crate::ast::types::DataType::Void(crate::ast::Span::dummy()),
@@ -1609,6 +1757,10 @@ impl Simulator {
                 // Step 9e: method-name admission set for bare this-bounded
                 // calls.
                 let method_name_set = self.class_method_name_set(cname);
+                // LRM 11.6/11.8.2: declared input widths of every callee
+                // visible from this class, so the CallMethod lowerings can
+                // give each ACTUAL its formal's context width.
+                let method_formal_widths = self.class_method_formal_widths(cname);
                 // Step 9f: parent-chain method names for `super.m` admission.
                 let super_method_set = self.super_method_name_set(cname);
                 // Step 9f: baked dispatch inputs — the defining class's
@@ -1928,6 +2080,14 @@ impl Simulator {
                     for (class, declaration) in &self.module.classes {
                         let mut fields = self.class_member_access_safe_names(class);
                         fields.extend(self.class_string_member_names(class));
+                        let widths = fields
+                            .iter()
+                            .filter_map(|f| match self.class_prop_width_fixed(class, f) {
+                                Some(Some(w)) if w > 0 => Some((f.clone(), w)),
+                                _ => None,
+                            })
+                            .collect();
+                        facts.instance_field_widths.insert(class.clone(), widths);
                         facts.instance_fields.insert(class.clone(), fields);
                         // Direct superclass (spec args stripped): the
                         // writeback-hierarchy walk in
@@ -2060,6 +2220,7 @@ impl Simulator {
                     // parameters against this receiver's specialization.
                     let mut local_typedef_types = HashMap::default();
                     let mut unresolved_type_names = HashSet::default();
+                    let mut method_enum_constants = HashMap::default();
                     let mut cur = Some(cname.to_string());
                     let mut seen = HashSet::default();
                     while let Some(cn) = cur {
@@ -2084,6 +2245,19 @@ impl Simulator {
                             }
                         }
                         for (name, dt) in &cd.typedef_targets {
+                            if matches!(dt, DataType::Enum(_)) {
+                                if let Some(members) = self.module.enum_members.get(name) {
+                                    for (member, _) in members {
+                                        if !instance_props.contains(member)
+                                            && !static_members.contains(member)
+                                            && !const_names.contains(member)
+                                            && let Some(value) = self.class_enum_member(cname, member)
+                                        {
+                                            method_enum_constants.entry(member.clone()).or_insert(value);
+                                        }
+                                    }
+                                }
+                            }
                             // Keep the declaring class when an inherited alias
                             // is reached by a bare name from a derived method.
                             local_typedef_types.entry(name.clone()).or_insert_with(|| {
@@ -2121,6 +2295,7 @@ impl Simulator {
                     );
                     compiler.set_typedefs(&self.module.typedefs, &self.module.typedef_elem_widths);
                     compiler.set_typedef_types(&self.module.typedef_types);
+                    compiler.method_enum_constants = method_enum_constants;
                     compiler.set_method_formal_types(ports);
                     if let CompiledBodyKind::Function(function) = kind {
                         compiler.set_method_return_type(&function.return_type);
@@ -2173,6 +2348,7 @@ impl Simulator {
                         &super_method_set,
                         &class_parent,
                         &bare_targets,
+                        &method_formal_widths,
                         &static_members,
                         &const_names,
                         &new_type_map,

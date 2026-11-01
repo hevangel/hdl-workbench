@@ -233,6 +233,26 @@ impl Simulator {
         }
     }
 
+    /// §11.4.13: an unpacked array in an inside set contributes its values,
+    /// including associative arrays with sparse or string keys.
+    pub(super) fn inside_operand_keys(&mut self, expr: &Expression) -> Option<Vec<String>> {
+        if let Some(name) = self.expr_assoc_name(expr)
+            && self.is_associative_array(&name)
+        {
+            return Some(
+                self.assoc_top_level_keys(&name)
+                    .into_iter()
+                    .map(|key| format!("{}[{}]", name, key))
+                    .collect(),
+            );
+        }
+        self.array_operand_name(expr).map(|name| {
+            (0..self.get_queue_size(&name))
+                .map(|i| format!("{}[{}]", name, i))
+                .collect()
+        })
+    }
+
     pub(super) fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &expr.kind
             && !self.ident_shadowed_by_non_collection(h)
@@ -552,6 +572,21 @@ impl Simulator {
         Some(format!("{}[{}]", an, key))
     }
 
+    /// The text of key `kv` selecting into `level` of the nested associative
+    /// array rooted at `root`: a row registered as an associative array of
+    /// its own (`ensure_assoc_row`) uses its declared key type, a queue or
+    /// dynamic row takes an element index, and an unregistered level (a row
+    /// a whole copy made) is keyed like the root.
+    fn nested_level_key(&self, level: &str, root: &str, kv: &Value) -> String {
+        if self.module.associative_arrays.contains_key(level) {
+            self.assoc_key_str(level, kv)
+        } else if level != root && self.module.dynamic_arrays.contains(level) {
+            kv.to_i64().unwrap_or(0).to_string()
+        } else {
+            self.assoc_key_str(root, kv)
+        }
+    }
+
     pub(super) fn nested_index_name(&mut self, expr: &Expression) -> Option<String> {
         // Peel every Index level: `expr` is `Index(...Index(base, k1),...,kn)`.
         // Collect indices leaf-first, then resolve the root `Ident` to its
@@ -617,14 +652,18 @@ impl Simulator {
                 .inner_assoc_compound_key(start, &rev, 1)
                 .map(|(_, k)| k);
         }
-        let mut name = bn.clone();
-        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`.
+        let mut name = bn.to_string();
+        // Build root→leaf so the string reads `base[K1][K2]...[Kn]`. Each key
+        // takes the key type of the array it selects into: a row registered
+        // as an associative array of its own (`ensure_assoc_row`) has its
+        // declared one; an unregistered level (a row a whole copy made, say)
+        // is keyed like the root.
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&bn, &kv);
-            name = std::borrow::Cow::Owned(format!("{}[{}]", name, ks));
+            let ks = self.nested_level_key(&name, &bn, &kv);
+            name = format!("{}[{}]", name, ks);
         }
-        Some(name.to_string())
+        Some(name)
     }
 
     /// Resolve a base expression to its associative-array STORAGE name if it
@@ -712,11 +751,16 @@ impl Simulator {
         {
             return None;
         }
-        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn].
+        // Build the compound key inner→outer so it reads base[K1][K2]...[Kn],
+        // each key in the key type of the array it selects into (see
+        // `nested_index_name`; an unregistered level is keyed like the
+        // root). Below a queue row (`q["x"][5][0]` of
+        // `int q[string][int][$]`) the last key is the element index, and
+        // the compound key is that row's element name.
         let mut key = base_name.clone();
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
-            let ks = self.assoc_key_str(&base_name, &kv);
+            let ks = self.nested_level_key(&key, &base_name, &kv);
             key = format!("{}[{}]", key, ks);
         }
         Some((base_name, key))
@@ -2454,7 +2498,12 @@ impl Simulator {
                         }
                     }
                     let saved = self.bind_loop_vars(binds);
-                    let ok = self.check_constraint_item_impl(body);
+                    // The body may itself be a `foreach` over the next
+                    // dimension (`foreach (a[i]) foreach (a[i][j]) …`, #519)
+                    // or a block of them: check it through this function so
+                    // its loop variables are bound too; the member-foreach
+                    // check has no object here and passed it vacuously.
+                    let ok = self.inline_constraint_item_ok(body);
                     self.unbind_loop_vars(saved);
                     if !ok {
                         return false;
@@ -3430,7 +3479,7 @@ impl Simulator {
                     _ => ConstraintRange::Value(r.clone()),
                 })
                 .collect();
-            let (choices, ws) = self.cons_ranges_i128_ws(&cr, target.width);
+            let (choices, ws) = self.cons_ranges_i128_typed(&cr, target.width, target.is_signed);
             if ws.is_some() {
                 let choices =
                     Self::fit_cons_ranges_for_target(choices, ws, target.width, target.is_signed);

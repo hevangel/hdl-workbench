@@ -1,6 +1,6 @@
 [package]
 name = "xezim"
-version = "0.11.2"
+version = "0.11.4"
 build = "src/build.rs"
 edition = "2024"
 rust-version = "1.92"
@@ -24,7 +24,7 @@ xezim-core = { path = "../xezim-core", default-features = false }
 sv-parser = { path = "../xezim-core/xezim-parser" }
 libc = "0.2"
 serde = { version = "1", features = ["derive", "rc"] }
-bincode = "1.3"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 once_cell = "1.18"
 # JIT: enabled with `--features jit`. Kept optional to avoid adding the
 # cranelift build dependency to users who only want the interpreter.
@@ -79,7 +79,7 @@ fst-reader = "0.17"
 # `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
 # check that its header declares the compression (XTrace §6.8). Same version
 # xezim-core writes the stream with.
-zstd = "0.13"
+zstd = "0.14"
 
 [build-dependencies]
 cc = "1"

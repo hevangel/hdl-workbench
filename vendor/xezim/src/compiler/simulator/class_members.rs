@@ -735,6 +735,17 @@ impl Simulator {
         if let Some(k) = self.static_fixed_key_for_name(name) {
             return Some(k);
         }
+        // §23.9 / §13.5 (#534): an unpacked-array FORMAL of the running
+        // method is bound under its bare name (a module-array row plus a
+        // frame marker) and shadows a same-named class member; it must not
+        // be lifted to the object's storage. The array-row test keeps the
+        // marker probe off the common path.
+        if self.module.arrays.contains_key(name)
+            && let Some(frame) = self.local_stack.last()
+            && frame.contains_key(&format!("\u{1}array_formal:{name}"))
+        {
+            return None;
+        }
         // This guard sees every call (22M+ on a UVM run): keep the ORIGINAL
         // vectorizable one-pass `any` for the overwhelmingly common bare
         // names (a manual classify loop here measured +0.5% instructions on
@@ -1155,9 +1166,14 @@ impl Simulator {
         while let Some(cn) = cur {
             match self.module.classes.get(cn) {
                 Some(cd) => {
+                    // §7.4.2: a fixed multi-dimensional member (`int m [2][3]`)
+                    // stores under `<handle>#m` as a 1-D one does; without
+                    // it every whole-member write (`c.m = a`, a pattern, a
+                    // row `c.m[1] = '{..}`) resolved nowhere and was dropped.
                     if cd.assoc_properties.contains_key(member)
                         || cd.queue_properties.contains_key(member)
                         || cd.array_properties.contains_key(member)
+                        || cd.array_nd_properties.contains_key(member)
                     {
                         return true;
                     }
@@ -1555,16 +1571,23 @@ impl Simulator {
             }
             // Flattened nested OBJECT handle: `a.mid.base` (path.len() >= 3).
             // The receiver is an object chain (`a.mid`), not a static handle.
-            // Evaluate the receiver to a handle and scope the leaf member to it.
+            // Evaluate the complete receiver, including intermediate selects
+            // (`sys.targets[i].ports`), and scope the leaf collection to it.
+            // §12.7.3: foreach must use that collection's bounds, not the
+            // bounds of an earlier array in the receiver chain.
             ExprKind::Ident(h)
                 if h.path.len() >= 3
                     && !self.module.classes.contains_key(&h.path[0].name.name)
-                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+                    && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
             {
                 let n = h.path.len();
                 let member = h.path[n - 1].name.name.clone();
                 let recv = hier_prefix(h);
-                let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
+                let recv_expr = if recv.path.iter().any(|s| !s.selects.is_empty()) {
+                    Self::hier_select_chain(&recv, h.span)
+                } else {
+                    Expression::new(ExprKind::Ident(recv), h.span)
+                };
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
                 if hh != 0 {
                     if let Some(cn) = self
@@ -3558,7 +3581,19 @@ impl Simulator {
                 dfrag.to_string()
             };
             let dfrag_resolved = dfrag_resolved.trim().to_string();
-            if canon(&dfrag_resolved) != canon(sval) {
+            // A typedef spelling and the class it stands for are the same
+            // type (§6.18): the dest fragment may come from the
+            // specialization signature's canonical spelling while the
+            // instance binding records the source spelling (`gp_t` vs
+            // `uvm_tlm_generic_payload`), or vice versa. Follow typedefs
+            // on both sides before comparing.
+            let dfrag_resolved = self
+                .typedef_alias_frag(&dfrag_resolved)
+                .unwrap_or(dfrag_resolved);
+            let sval_resolved = self
+                .typedef_alias_frag(sval)
+                .unwrap_or_else(|| sval.to_string());
+            if canon(&dfrag_resolved) != canon(&sval_resolved) {
                 return false;
             }
         }
@@ -3720,6 +3755,46 @@ impl Simulator {
             },
             _ => None,
         }
+    }
+
+    /// §8.25: the `(base, sig)` specialization a variable's DECLARED type
+    /// names — a direct `C#(args)` (with named arguments normalized to
+    /// positional order), or a typedef for a specialization. None for a
+    /// plain class or an unresolvable type. Used to seed `current_spec`
+    /// when a static method is dispatched through a null receiver whose
+    /// declared type is specialized, so the method body's bare
+    /// self-references denote the current specialization.
+    pub(super) fn spec_from_declared_type(&self, decl: &str) -> Option<(String, String)> {
+        let cand = self
+            .positional_spec_text(decl)
+            .unwrap_or_else(|| decl.to_string());
+        if let Some((b, s)) = self.extract_spec_from_string(&cand) {
+            return Some((b, s));
+        }
+        let (b, s) = self.resolve_typedef_spec(decl)?;
+        let full = format!("{}#({})", b, s);
+        let norm = self.positional_spec_text(&full).unwrap_or(full);
+        self.extract_spec_from_string(&norm)
+    }
+
+    /// §8.25: the specialization a NULL receiver's declared type names, for
+    /// seeding `current_spec` around a static-method dispatch. A procedural
+    /// local's `var_class_types` entry holds the BARE class name (its `#(...)`
+    /// arguments live in `var_type_args`), so for a variable receiver
+    /// `declared_class_own_spec` — which spells the declaration's own
+    /// specialization — is authoritative; the declared-type TEXT fallback
+    /// covers `this.member` property types that carry `base#(sig)` spellings.
+    pub(super) fn spec_for_null_receiver(
+        &self,
+        var: Option<&str>,
+        decl: &str,
+    ) -> Option<(String, String)> {
+        if let Some(v) = var {
+            if let Some((_, Some(spec))) = self.declared_class_own_spec(v, None) {
+                return Some(spec);
+            }
+        }
+        self.spec_from_declared_type(decl)
     }
 
     /// `Name.method(args)` where `Name` names a CLASS-scope entity — the

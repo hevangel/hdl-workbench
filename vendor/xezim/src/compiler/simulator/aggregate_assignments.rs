@@ -14,9 +14,16 @@ impl Simulator {
         if items.is_empty() {
             return false;
         }
-        let Some(scoped) = self.expr_assoc_name(lvalue) else {
+        // §7.4.2: a selected ROW of a multi-dimensional member
+        // (`c.m[1] = '{..}`) takes the pattern over the remaining dimensions.
+        let (base_expr, row_selects) = Self::split_row_selects(lvalue);
+        let Some(scoped) = self.expr_assoc_name(&base_expr) else {
             return false;
         };
+        let row: Vec<i64> = row_selects
+            .iter()
+            .map(|e| self.eval_expr(e).to_i64().unwrap_or(0))
+            .collect();
         let Some((handle_text, member)) = scoped.split_once('#') else {
             return false;
         };
@@ -72,8 +79,66 @@ impl Simulator {
         if descending.len() != dimensions.len() {
             descending.clear();
         }
+        if !row.is_empty() {
+            if row.len() >= dimensions.len() {
+                return false;
+            }
+            let mut target = scoped.clone();
+            for i in &row {
+                target.push_str(&format!("[{i}]"));
+            }
+            let rest = dimensions[row.len()..].to_vec();
+            let rest_desc = if descending.is_empty() {
+                Vec::new()
+            } else {
+                descending[row.len()..].to_vec()
+            };
+            self.assign_pattern_array(&target, &rest, &data_type, items, &rest_desc);
+            return true;
+        }
         self.assign_pattern_array(&scoped, &dimensions, &data_type, items, &descending);
         true
+    }
+
+    /// `c.m[1]` / `c.m[1][2]` (either parse shape) as the unselected member
+    /// expression and its index selects, outermost first. Range selects and
+    /// anything else come back whole, with no selects.
+    fn split_row_selects(e: &Expression) -> (Expression, Vec<Expression>) {
+        let is_range =
+            |x: &Expression| matches!(x.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. });
+        let mut sels: Vec<Expression> = Vec::new();
+        let mut cur = e;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            if is_range(index) {
+                return (e.clone(), Vec::new());
+            }
+            sels.push((**index).clone());
+            cur = expr;
+        }
+        sels.reverse();
+        if let ExprKind::Ident(h) = &cur.kind
+            && let Some(last) = h.path.last()
+            && !last.selects.is_empty()
+            && h.path[..h.path.len() - 1]
+                .iter()
+                .all(|s| s.selects.is_empty())
+        {
+            if last.selects.iter().any(is_range) {
+                return (e.clone(), Vec::new());
+            }
+            let mut bare = h.clone();
+            let lsel = bare
+                .path
+                .last_mut()
+                .map(|s| std::mem::take(&mut s.selects))
+                .unwrap_or_default();
+            bare.cached_signal_id = std::cell::Cell::new(None);
+            bare.cached_resolved_name = std::cell::OnceCell::new();
+            let mut all = lsel;
+            all.extend(sels);
+            return (Expression::new(ExprKind::Ident(bare), cur.span), all);
+        }
+        (cur.clone(), sels)
     }
 
     /// Whole-assignment pattern to a CLASS COLLECTION property accessed by
@@ -134,14 +199,23 @@ impl Simulator {
         else {
             return false;
         };
-        let Some(cd) = self.module.classes.get(&cn) else {
-            return false;
-        };
         let member = &member;
         let scoped = format!("{}#{}", handle, member);
         if items.is_empty() {
+            // `'{}` leaves the queue or dynamic array with no elements.
+            // `class_queue_prop` also finds one the class inherits.
+            if self.class_queue_prop(&scoped) {
+                self.set_queue_size(&scoped, 0);
+                return true;
+            }
             return false;
         }
+        // §8.3: inherited properties use their declaring class's collection
+        // metadata. Stop at the first declaration so a shadow remains local.
+        let owners = self.prop_owners(&cn);
+        let Some((_, cd)) = owners.get(member) else {
+            return false;
+        };
         // Associative array: `'{k:v,...}` — keyed items.
         if cd.assoc_properties.contains_key(member) {
             let val_w = cd.properties.get(member).map(|s| s.width).unwrap_or(32);
@@ -1373,6 +1447,12 @@ impl Simulator {
         for (target, source) in targets.into_iter().zip(sources) {
             let lhs = Self::append_leaf_path(lvalue, &target[dst.len()..]);
             let rhs = Self::append_leaf_path(rvalue, &source[src.len()..]);
+            if self.queue_elem_struct(&src).is_some()
+                && let Some(member_leaves) = self.unpacked_struct_nba_leaves(&lhs, &rhs)
+            {
+                leaves.extend(member_leaves);
+                continue;
+            }
             let value = self.eval_expr(&rhs);
             leaves.push((lhs, value));
         }
@@ -2334,6 +2414,36 @@ impl Simulator {
         Some(Value::concat(&elems))
     }
 
+    /// §7.5.1/§7.6: copy the dynamic array or queue at `src` into `dst`,
+    /// a row that is itself a dynamic array or queue (`int d[][]`,
+    /// `int q[][$]`, deeper too) with its own size and elements. `dst`'s
+    /// rows are registered like the source's and start empty.
+    pub(super) fn copy_dyn_tree(&mut self, dst: &str, src: &str) {
+        let n = self.get_queue_size(src);
+        for i in 0..n {
+            let (srow, drow) = (format!("{src}[{i}]"), format!("{dst}[{i}]"));
+            if self.module.dynamic_arrays.contains(&srow) {
+                self.register_dyn_row_like(&drow, &srow);
+                self.copy_dyn_tree(&drow, &srow);
+            } else {
+                self.queue_copy_elem(src, i, dst, i);
+            }
+        }
+        self.set_queue_size(dst, n);
+    }
+
+    /// Register `row` as an empty dynamic row shaped like `like`.
+    pub(super) fn register_dyn_row_like(&mut self, row: &str, like: &str) {
+        self.clear_dyn_row(row);
+        self.module.dynamic_arrays.insert(row.to_string());
+        let shape = self.module.arrays.get(like).copied().unwrap_or((0, 63, 32));
+        self.module.arrays.insert(row.to_string(), shape);
+        if self.module.queue_vars.contains(like) {
+            self.module.queue_vars.insert(row.to_string());
+        }
+        self.set_queue_size(row, 0);
+    }
+
     pub(super) fn copy_whole_queue(&mut self, dst: &str, src: &str) {
         let n = self.get_queue_size(src);
         for i in 0..n {
@@ -2787,11 +2897,24 @@ impl Simulator {
         // elements at `q[i][j]` — evaluating the row to one packed value
         // would land in a phantom scalar `q[i]` that no read ever visits.
         if let Some(&(_, (jlo, jhi), _)) = self.module.arrays_2d.get(obj_name) {
+            // §10.9.1 / §7.6: the row pairs by position from its declared
+            // left bound (`int q[$][3:1]` takes `'{1,2,3}` as q[i][3] = 1).
+            let order = |me: &Self, name: &str, lo: i64, hi: i64, nth: usize| -> Vec<i64> {
+                match me
+                    .unpacked_decl_dims_of(name)
+                    .and_then(|d| d.get(nth).copied())
+                {
+                    Some((l, r)) if l > r => (r..=l).rev().collect(),
+                    _ => (lo..=hi).collect(),
+                }
+            };
+            let dst = order(self, obj_name, jlo, jhi, 1);
             if let Some(src) = self.flat_member_name(arg) {
-                if let Some(&(slo, _, _)) = self.module.arrays.get(&src) {
-                    for (k, j) in (jlo..=jhi).enumerate() {
+                if let Some(&(slo, shi, _)) = self.module.arrays.get(&src) {
+                    let from = order(self, &src, slo, shi, 0);
+                    for (j, si) in dst.iter().zip(from.iter()) {
                         let v = self
-                            .get_signal_value_by_name(&format!("{}[{}]", src, slo + k as i64))
+                            .get_signal_value_by_name(&format!("{}[{}]", src, si))
                             .unwrap_or_else(|| Value::zero(32));
                         self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
                     }
@@ -2800,7 +2923,7 @@ impl Simulator {
             }
             if let ExprKind::AssignmentPattern(items) = &arg.kind {
                 let vals: Vec<Value> = items.iter().map(|it| self.eval_expr(it.expr())).collect();
-                for (k, j) in (jlo..=jhi).enumerate() {
+                for (k, j) in dst.iter().enumerate() {
                     let v = vals.get(k).cloned().unwrap_or_else(|| Value::zero(32));
                     self.set_signal_value_by_name(&format!("{}[{}]", elem, j), v);
                 }
@@ -3992,7 +4115,151 @@ impl Simulator {
     /// LRM §21.2.1.7 `%p` on the variable `name`: recursively render nested
     /// structs, unpacked arrays, enums, strings and reals in assignment-pattern
     /// form. `None` if neither the variable nor its base has a declared type.
+    /// The rows of the dynamic array `name` (`sz` of them) when each row is
+    /// itself an unpacked array: a fixed tail (`T a[][N]`, registered with a
+    /// 2-D or N-D shape) or dynamic rows (`T a[][]`, each row with its own
+    /// size). `None` for a dynamic array of scalars.
+    /// Declared (left, right) bounds of each unpacked dimension of the array
+    /// stored at `name`: a module or local array's, or a class member's
+    /// (`<handle>#prop`). A dynamic dimension may be listed or left out.
+    fn unpacked_decl_dims_of(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        if let Some(d) = self.module.unpacked_decl_dims.get(name) {
+            return Some(d.clone());
+        }
+        let (h, prop) = name.split_once('#')?;
+        let handle = h.parse::<usize>().ok()?;
+        let cd = self.class_prop_declarer(handle, prop)?;
+        if let Some(d) = cd.array_prop_decl_dims.get(prop) {
+            return Some(d.clone());
+        }
+        // A dynamic outer dimension over fixed rows (`int a[][1:0]`): the
+        // rows' declared bounds, evaluated here.
+        let tail = cd.dynamic_tail_properties.get(prop)?;
+        let p = Some(&self.module.parameters);
+        tail.iter()
+            .map(|d| match d {
+                crate::ast::types::UnpackedDimension::Range { left, right, .. } => Some((
+                    super::elaborate::const_eval_i64_with_params(left, p)?,
+                    super::elaborate::const_eval_i64_with_params(right, p)?,
+                )),
+                crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                    let n = super::elaborate::const_eval_i64_with_params(expr, p)?;
+                    (n > 0).then_some((0, n - 1))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn render_p_dyn_rows(&mut self, name: &str, sz: u64) -> Option<Vec<String>> {
+        let inner: Option<Vec<(i64, i64)>> = self
+            .module
+            .arrays_2d
+            .get(name)
+            .map(|&(_, d2, _)| vec![d2])
+            .or_else(|| {
+                self.module
+                    .arrays_nd
+                    .get(name)
+                    .map(|(sh, _)| sh[1..].to_vec())
+            });
+        let dyn_rows = inner.is_none()
+            && (0..sz).any(|i| {
+                let row = format!("{}[{}]", name, i);
+                self.module.dynamic_arrays.contains(&row)
+                    || self
+                        .signals
+                        .contains_key(&Self::name_with_suffix(&row, ".size"))
+            });
+        if inner.is_none() && !dyn_rows {
+            return None;
+        }
+        let elem_dt = match self.class_member_coll_type(name) {
+            Some(dt) if !matches!(self.resolve_dt_ref(dt), DataType::TypeReference { .. }) => {
+                Some(dt.clone())
+            }
+            Some(_) => None,
+            None => self.p_elem_type(name),
+        };
+        let mut leaf = |me: &mut Self, key: &str| -> String {
+            match &elem_dt {
+                Some(dt) => me.render_p_typed(key, dt),
+                None => {
+                    let v = me
+                        .get_signal_value_by_name(key)
+                        .unwrap_or_else(|| Value::zero(32));
+                    Self::render_p_value(&v, false)
+                }
+            }
+        };
+        // §21.2.1.7 / §10.9.1: each fixed dimension prints from its declared
+        // left bound to its right one (`[1:0]` gives element 1 first), as a
+        // fixed array does; the normalized (lo, hi) printed it upward (#597).
+        let inner = inner.map(|dims| {
+            let decl = self.unpacked_decl_dims_of(name);
+            match decl {
+                Some(d) if d.len() == dims.len() + 1 => d[1..].to_vec(),
+                Some(d) if d.len() == dims.len() => d,
+                _ => dims,
+            }
+        });
+        fn fixed(
+            me: &mut Simulator,
+            key: &str,
+            dims: &[(i64, i64)],
+            leaf: &mut dyn FnMut(&mut Simulator, &str) -> String,
+        ) -> String {
+            let Some((&(l, r), rest)) = dims.split_first() else {
+                return leaf(me, key);
+            };
+            let order: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            let parts: Vec<String> = order
+                .into_iter()
+                .map(|i| fixed(me, &format!("{}[{}]", key, i), rest, leaf))
+                .collect();
+            format!("'{{{}}}", parts.join(", "))
+        }
+        let mut out = Vec::with_capacity(sz as usize);
+        for i in 0..sz {
+            let row = format!("{}[{}]", name, i);
+            out.push(match &inner {
+                Some(dims) => fixed(self, &row, dims, &mut leaf),
+                None => {
+                    let m = self.get_queue_size(&row);
+                    let parts: Vec<String> = (0..m)
+                        .map(|j| leaf(self, &format!("{}[{}]", row, j)))
+                        .collect();
+                    format!("'{{{}}}", parts.join(", "))
+                }
+            });
+        }
+        Some(out)
+    }
+
+    /// Whether the element `elem` of an associative array is itself a
+    /// collection with its own store (a queue, dynamic or associative row).
+    fn p_elem_is_collection(&self, elem: &str) -> bool {
+        self.module.dynamic_arrays.contains(elem)
+            || self.is_associative_array(elem)
+            || self
+                .get_signal_value_by_name(&Self::name_with_suffix(elem, ".size"))
+                .is_some()
+    }
+
     pub(super) fn render_p_var(&mut self, name: &str) -> Option<String> {
+        // Elements of a collection are nested leaves (`p_top_level`).
+        if self.module.dynamic_arrays.contains(name)
+            || self.module.associative_arrays.contains_key(name)
+            || self.module.arrays.contains_key(name)
+            || self.module.arrays_2d.contains_key(name)
+            || self.module.arrays_nd.contains_key(name)
+        {
+            self.p_top_level = false;
+        }
         // A queue / dynamic array prints exactly its `size()` elements — not the
         // fixed 64-slot buffer it is backed by. Its ELEMENTS (`q[i]` of an
         // array of queues) have no declared type of their own. A static
@@ -4005,6 +4272,11 @@ impl Simulator {
                     .contains_key(&Self::name_with_suffix(name, ".size")))
         {
             let sz = self.get_queue_size(name);
+            // §7.4.5/§21.2.1.7: a dynamic outer dimension over unpacked rows
+            // (`T a[][N]`, `T a[][]`) lists each row as a nested list.
+            if let Some(rows) = self.render_p_dyn_rows(name, sz) {
+                return Some(format!("'{{{}}}", rows.join(", ")));
+            }
             // A LOCAL queue has no entry in `var_decl_types`, so `p_elem_type`
             // returns None; fall back to rendering each element from its stored
             // value (string elements quoted) instead of bailing to `x`.
@@ -4082,12 +4354,21 @@ impl Simulator {
         // Element type comes from the declared type when known, else each
         // element renders from its raw value.
         if self.module.associative_arrays.contains_key(name) {
+            // A class member (`<h>#mem`) has its element type on its class;
+            // without it the elements printed untyped, in decimal (§21.2.1.7).
             let dt = self
                 .module
                 .var_decl_types
                 .get(name)
                 .cloned()
-                .or_else(|| self.flat_path_type(name).map(|(d, _)| d));
+                .or_else(|| self.flat_path_type(name).map(|(d, _)| d))
+                .or_else(|| {
+                    self.class_member_coll_type(name)
+                        .filter(|d| {
+                            !matches!(self.resolve_dt_ref(d), DataType::TypeReference { .. })
+                        })
+                        .cloned()
+                });
             let prefix = format!("{}[", name);
             let registered = self.signal_name_to_id.names_with_prefix(&prefix);
             let mut keys: Vec<String> = self
@@ -4111,6 +4392,12 @@ impl Simulator {
                 .map(|k| {
                     let elem = format!("{}[{}]", name, k);
                     let v = match &dt {
+                        // §21.2.1.7: an element that is itself a queue,
+                        // dynamic or associative array (`int aq[int][$]`,
+                        // `int aa[int][int]`) prints as a nested list.
+                        _ if self.p_elem_is_collection(&elem) => self
+                            .render_p_var(&elem)
+                            .unwrap_or_else(|| "'{}".to_string()),
                         Some(d) => self.render_p_typed(&elem, d),
                         None => {
                             let ev = self
@@ -4126,7 +4413,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{} }}", parts.join(", ")));
+            return Some(format!("'{{{}}}", parts.join(", ")));
         }
         let decl = self.module.var_decl_types.get(name).cloned().or_else(|| {
             // §8.9: a static fixed-array member's store (`Cls::S`).
@@ -4168,7 +4455,12 @@ impl Simulator {
                 .iter()
                 .map(|k| {
                     let elem = format!("{}[{}]", name, k);
-                    let v = self.render_p_typed(&elem, &dt);
+                    let v = if self.p_elem_is_collection(&elem) {
+                        self.render_p_var(&elem)
+                            .unwrap_or_else(|| "'{}".to_string())
+                    } else {
+                        self.render_p_typed(&elem, &dt)
+                    };
                     if string_keyed {
                         format!("\"{}\":{}", k, v)
                     } else {
@@ -4176,7 +4468,7 @@ impl Simulator {
                     }
                 })
                 .collect();
-            return Some(format!("'{{{} }}", parts.join(", ")));
+            return Some(format!("'{{{}}}", parts.join(", ")));
         }
         // Fixed unpacked array -> element list. An element may itself be a
         // collection (`int q[3][$]`), so it goes back through `render_p_var`.

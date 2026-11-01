@@ -1105,8 +1105,12 @@ impl Simulator {
                     }
                     _ => dt,
                 };
+                // §8.25: the state domain of a type parameter belongs to
+                // this object, including when another specialization calls it.
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
                 return super::elaborate::is_type_two_state_resolved(
-                    dt,
+                    bound.as_ref().unwrap_or(dt),
                     &self.module.typedef_types,
                 );
             }
@@ -1182,7 +1186,7 @@ impl Simulator {
         );
         self.record_output(m.clone());
         self.stdout_writeln(&m);
-        self.finished = true;
+        self.abort_run();
         true
     }
 

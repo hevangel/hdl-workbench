@@ -465,3 +465,60 @@ fn nearest_hierarchical_head_is_not_replaced_by_an_outer_match() {
         );
     }
 }
+
+/// §23.8: an interface modport port remains a declared hierarchical component.
+#[test]
+fn interface_port_member_elaborates_with_its_declared_name() {
+    let source = r#"interface bus_if;
+ logic [8:0] state;
+ modport slv (output state);
+endinterface
+module regs (bus_if.slv bus);
+ initial #1 bus.state = 9'h1A;
+endmodule
+module dut;
+ bus_if b();
+ regs u_regs (.bus(b));
+endmodule
+module top;
+ dut u_dut();
+ initial begin
+ wait (u_dut.u_regs.bus.state === 9'h1A);
+ $display("T|state=%h at %0t",u_dut.u_regs.bus.state,$time);
+ $finish;
+ end
+endmodule
+"#;
+    let (ok, text) = run("interface_port_compile", source, &["--compile"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("Elaboration successful"), "{text}");
+}
+
+/// Underscores belong to an identifier; they do not separate hierarchy levels.
+#[test]
+fn missing_identifier_beside_interface_port_is_reported_verbatim() {
+    let source = r#"interface bus_if;
+ logic [8:0] state;
+ modport slv (output state);
+endinterface
+module regs (bus_if.slv bus);
+ initial #1 bus.state = 9'h1A;
+endmodule
+module dut;
+ bus_if b();
+ regs u_regs (.bus(b));
+endmodule
+module top;
+ dut u_dut();
+ initial begin
+ wait (u_dut.u_regs.bus_state === 9'h1A);
+ $display("T|state=%h at %0t",u_dut.u_regs.bus_state,$time);
+ $finish;
+ end
+endmodule
+"#;
+    let (ok, text) = run("interface_port_underscore", source, &["--compile"]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("hierarchical name 'u_dut.u_regs.bus_state' does not resolve: 'bus_state' is not declared in 'top.u_dut.u_regs'"), "{text}");
+    assert!(!text.contains("'bus' is not declared"), "{text}");
+}

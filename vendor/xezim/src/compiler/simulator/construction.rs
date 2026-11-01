@@ -5,6 +5,65 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Register the object-scoped dynamic or queue member `scoped` in the
+    /// array tables with the shape a module-scope declaration of the same
+    /// form gets: a fixed tail (`T a[][N]`, `T a[][N][M]`) makes it a 2-D or
+    /// N-D array whose outer dimension is the dynamic one, so `a[i][j]`
+    /// names an element instead of a bit of a scalar row (§7.4.5); any other
+    /// member is a 1-D collection, rows of a dynamic tail (`T a[][]`) being
+    /// collections of their own once `a[i] = new[n]` sizes them.
+    pub(super) fn register_dyn_member_shape(
+        &mut self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        params: &HashMap<String, Value>,
+        prop: &str,
+        scoped: &str,
+        width: u32,
+    ) {
+        let fixed_tail: Option<Vec<(i64, i64)>> =
+            cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
+                tail.iter()
+                    .map(|d| match d {
+                        crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                            let l =
+                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
+                            let r =
+                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            Some((l.min(r), l.max(r)))
+                        }
+                        crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                                Some(n) if n > 0 => Some((0, n - 1)),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+        match fixed_tail.as_deref() {
+            Some([d2]) => {
+                self.module.arrays.remove(scoped);
+                self.module
+                    .arrays_2d
+                    .insert(scoped.to_string(), ((0, 63), *d2, width));
+            }
+            Some(dims) if dims.len() >= 2 => {
+                self.module.arrays.remove(scoped);
+                let mut shape = vec![(0, 63)];
+                shape.extend_from_slice(dims);
+                self.module
+                    .arrays_nd
+                    .insert(scoped.to_string(), (shape, width));
+            }
+            _ => {
+                self.module
+                    .arrays
+                    .insert(scoped.to_string(), (0, 63, width));
+            }
+        }
+    }
+
     /// Shallow copy constructor: clone `src_handle`'s instance (scalar
     /// properties plus instance-scoped queue/assoc members) into a fresh heap
     /// object. Returns the new handle.
@@ -32,7 +91,13 @@ impl Simulator {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
                 self.module.dynamic_arrays.insert(n_name.clone());
-                self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                if let Some(&t) = self.module.arrays_2d.get(&s_name) {
+                    self.module.arrays_2d.insert(n_name.clone(), t);
+                } else if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
+                    self.module.arrays_nd.insert(n_name.clone(), t);
+                } else {
+                    self.module.arrays.insert(n_name.clone(), (0, 63, w));
+                }
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(n_name.clone(), m);
                 }
@@ -43,6 +108,27 @@ impl Simulator {
                         self.set_signal_value_by_name(&format!("{}[{}]", n_name, i), v);
                     }
                 }
+                // §8.12/§7.4.5: rows of a dynamic outer dimension over unpacked
+                // arrays (`a[i][j]`, a dynamic row's own size) are copied too,
+                // each dynamic row registered under the copy.
+                if cd.dynamic_tail_properties.contains_key(prop) {
+                    for k in self.signals.keys_with_elem_prefix(&format!("{}[", s_name)) {
+                        let Some(v) = self.signals.get(&k).cloned() else {
+                            continue;
+                        };
+                        let nk = format!("{}{}", n_name, &k[s_name.len()..]);
+                        if let Some(row) = k.strip_suffix(".size") {
+                            let nrow = format!("{}{}", n_name, &row[s_name.len()..]);
+                            if self.module.dynamic_arrays.contains(row) {
+                                self.module.dynamic_arrays.insert(nrow.clone());
+                            }
+                            if let Some(&t) = self.module.arrays.get(row) {
+                                self.module.arrays.insert(nrow, t);
+                            }
+                        }
+                        self.signals.insert(nk, v);
+                    }
+                }
             }
             for (prop, &is_str) in &cd.assoc_properties {
                 let s_pre = format!("{}#{}[", src_handle, prop);
@@ -50,6 +136,10 @@ impl Simulator {
                 self.module
                     .associative_arrays
                     .insert(n_name.clone(), is_str);
+                let widths = &mut self.module.assoc_index_widths;
+                if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
+                    widths.insert(n_name.clone(), kw);
+                }
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
@@ -811,6 +901,16 @@ impl Simulator {
                     &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
+                    // `param_order` interleaves value parameters so a TYPE
+                    // parameter's fragment index is right. The name itself
+                    // still has to be a type parameter. A value parameter's
+                    // fragment is a number (`H` -> `32` on `my_seq #(32, 194)`).
+                    // Returning it made `is_definite_type_arg` treat
+                    // `item #(H, D)` as a type-argument list, the values were
+                    // dropped, and `new` built the default specialization.
+                    if !cd.type_param_names.iter().any(|t| t == tn) {
+                        return None;
+                    }
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
@@ -1008,6 +1108,29 @@ impl Simulator {
     /// through the ENCLOSING spec, so `resource#(T)::get_type()` invoked
     /// from inside `config_db#(int)` keys `resource#(int)` — the same
     /// per-spec cell the concrete resource uses.
+    /// §8.25: the specialization against which a `C#(T)` written in the
+    /// running code resolves its parameter names — the lexical class's. While
+    /// a specialized static call's actuals are evaluated, `current_spec` is
+    /// already the CALLEE's (`eval_call`), so `registry#(B)::add(seq#(T)::cb)`
+    /// in `drv#(byte)` read `T` as `registry`'s parameter; the caller's spec
+    /// is the nearest one on `spec_scope_stack` that applies to the lexical
+    /// class.
+    pub(super) fn lexical_spec(&self) -> Option<(String, String)> {
+        let Some(Some(lex)) = self.class_context_stack.last() else {
+            return self.current_spec.clone();
+        };
+        let applies = |(b, _): &(String, String)| b == lex || self.class_is_a(lex, b);
+        if self.current_spec.as_ref().is_none_or(|c| applies(c)) {
+            return self.current_spec.clone();
+        }
+        self.spec_scope_stack
+            .iter()
+            .rev()
+            .find(|s| applies(s))
+            .cloned()
+            .or_else(|| self.current_spec.clone())
+    }
+
     pub(super) fn resolve_call_spec_params(
         &self,
         spec: Option<(String, String)>,
@@ -1230,14 +1353,41 @@ impl Simulator {
     pub(super) fn typedef_alias_frag(&self, name: &str) -> Option<String> {
         use crate::ast::types::DataType;
         let name = name.trim();
-        if !self.class_member_names().alias_typedefs.contains(name) {
+        // §6.18: a typedef stands for its target type — including one
+        // declared at MODULE scope (`typedef my_pkg::Cfg CfgTQ;`), not
+        // only a class-member alias. Restrict the module-table opening to
+        // plain class targets so builtin-type typedefs keep their
+        // existing (verbatim) keying.
+        let module_class_alias = self
+            .module
+            .typedef_types
+            .get(name)
+            .map(|dt| {
+                matches!(
+                    dt,
+                    DataType::TypeReference {
+                        dimensions,
+                        type_args,
+                        ..
+                    } if dimensions.is_empty() && type_args.is_empty()
+                )
+            })
+            .unwrap_or(false);
+        if !self.class_member_names().alias_typedefs.contains(name)
+            && !module_class_alias
+        {
             return None;
         }
         let mut cur = name.to_string();
         for _ in 0..8 {
-            if self.module.classes.contains_key(&cur)
-                || self.module.typedef_unpacked_dims.contains_key(&cur)
-            {
+            if self.module.classes.contains_key(&cur) {
+                // The chain reached a CLASS. The original name already
+                // spells that class (nothing to rewrite); an alias step
+                // in, though, stands for the class it names — spell it
+                // so the caller canonicalizes it like a direct naming.
+                return if cur != name { Some(cur) } else { None };
+            }
+            if self.module.typedef_unpacked_dims.contains_key(&cur) {
                 return None;
             }
             let dt = self.lookup_typedef_target(&cur)?;
@@ -1280,11 +1430,19 @@ impl Simulator {
                     dimensions,
                     type_args,
                     ..
-                } if dimensions.is_empty() && type_args.is_empty() && !tn.has_scope() => {
-                    if tn.name.name == cur {
+                } if dimensions.is_empty() && type_args.is_empty() => {
+                    // Follow the target whether it is bare (`Cfg`) or
+                    // scoped (`my_pkg::Cfg`): both are class keys in
+                    // `module.classes`.
+                    let target = if tn.has_scope() {
+                        tn.qualified()
+                    } else {
+                        tn.name.name.clone()
+                    };
+                    if target == cur {
                         return None;
                     }
-                    cur = tn.name.name.clone();
+                    cur = target;
                 }
                 _ => return None,
             }
@@ -1593,50 +1751,6 @@ impl Simulator {
         out
     }
 
-    /// Evaluate an instance-property initializer that contains a function call
-    /// (`uvm_root r = uvm_root::get()`, `uvm_factory f = cs.get_factory()`,
-    /// etc.) at CONSTRUCTION time and store the result on the instance.
-    ///
-    /// Field initializers legally run at every construction (as if the first
-    /// statements of `new()`), but the main property-init loop skips
-    /// call-bearing initializers to avoid recursion. Singleton getter
-    /// initializers like these MUST run here: their elaborate-time value is
-    /// always null (the singletons don't exist during elaboration), so
-    /// skipping left every UVM test that caches `uvm_root::get()` /
-    /// `uvm_coreservice_t::get()` / `cs.get_factory()` as a field null, and
-    /// the factory-based tests (type/instance aliases + overrides) silently
-    /// registered nothing.
-    pub(super) fn evaluate_call_init_at_construct(
-        &mut self,
-        handle: usize,
-        pname: &str,
-        init: &Expression,
-        fit: bool,
-    ) -> bool {
-        // Guard: evaluating a field initializer may itself construct objects.
-        // Cap the depth so a pathological self-referential field init can't
-        // recurse without bound. 64 is far beyond any legitimate chain.
-        if self.construct_init_depth >= 64 {
-            return false;
-        }
-        self.construct_init_depth += 1;
-        let mut v = self.eval_expr(init);
-        self.construct_init_depth -= 1;
-        // An initializer is an assignment to the property (§8.7, §10.7): it
-        // takes the property's width in this specialization, as a store from
-        // a method body does — `bit [W-1:0] pc = W'(5)` is W bits wide.
-        // Only a parameterized chain (`fit`) can need it: elsewhere the
-        // stores were never fitted here and the common UVM handle
-        // initializers stay on the cheap path.
-        if fit && !v.is_real && !pname.contains("::") {
-            v = self.fit_class_prop(handle, pname, &v);
-        }
-        if let Some(Some(inst)) = self.heap.get_mut(handle) {
-            inst.properties.insert(pname.to_string(), v);
-        }
-        true
-    }
-
     pub(super) fn instantiate_class(
         &mut self,
         class_def: &crate::compiler::elaborate::ElaboratedClass,
@@ -1866,6 +1980,54 @@ impl Simulator {
         self.this_stack.pop();
         self.current_spec = saved_spec;
         out
+    }
+
+    /// Value parameters of the running instance, for a specialization
+    /// argument evaluated in that instance's scope (`item #(H, D)` inside
+    /// `my_seq #(32, 194)`). A static/free frame is a boundary: its caller's
+    /// object does not supply the callee's lexical parameters.
+    pub(super) fn enclosing_value_params(&mut self) -> Option<HashMap<String, Value>> {
+        let lexical = self.class_context_stack.last()?.as_ref()?.clone();
+        let mut map: HashMap<String, Value> = HashMap::default();
+        let mut names = Vec::new();
+        let instance = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h))
+            .and_then(|o| o.as_ref());
+        let mut cn: Option<&str> = Some(&lexical);
+        for _ in 0..64 {
+            let Some(cd) = cn.and_then(|c| self.module.classes.get(c)) else {
+                break;
+            };
+            for (n, _) in &cd.param_defaults {
+                if cd.type_param_names.iter().any(|t| t == n) {
+                    continue;
+                }
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+                if let Some(v) = instance.and_then(|inst| {
+                    inst.properties
+                        .get(&format!("{}::{}", cd.name, n))
+                        .or_else(|| inst.properties.get(n))
+                }) {
+                    map.entry(n.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            cn = cd.extends.as_deref();
+        }
+        let saved = self.current_spec.clone();
+        self.current_spec = self.lexical_value_spec();
+        for name in names {
+            if let Some(value) = self.resolve_value_param_in_current(&name) {
+                map.insert(name, value);
+            }
+        }
+        self.current_spec = saved;
+        (!map.is_empty()).then_some(map)
     }
 
     /// IEEE 1800-2017 §6.20.2 / §8.25: the value of the declared default `e`
@@ -2198,13 +2360,22 @@ impl Simulator {
         let ancestor_value_args: HashMap<String, HashMap<String, Value>> = if !chain_has_params {
             HashMap::default()
         } else {
+            // An actual `#(...)` argument is an expression in the
+            // specialization site's scope. Inside a method that is the
+            // running instance, so `item #(H, D)` sees this object's
+            // value parameters. Evaluating it with an empty map used the
+            // global default (32) and the new object's properties
+            // disagreed with the specialization `$cast` checks.
+            let enclosing_params = self.enclosing_value_params();
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
                 // An actual argument belongs to the specialization site's
                 // scope; a default to the class's, where the parameters
                 // before it are visible (§6.20.2, `int B = A*2`).
                 let v = match (arg_map.get(pname), pdefault) {
-                    (Some(e), _) => crate::elaborate::const_eval_i64_with_params(e, None),
+                    (Some(e), _) => {
+                        crate::elaborate::const_eval_i64_with_params(e, enclosing_params.as_ref())
+                    }
                     (None, Some(e)) => {
                         crate::elaborate::const_eval_i64_with_params(e, Some(&leaf_params))
                     }
@@ -2541,6 +2712,16 @@ impl Simulator {
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
             }
+            // §8.25: a key sized by a class parameter takes this object's
+            // specialization, not the default `assoc_index_props` holds.
+            for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
+                    let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
+                    self.module
+                        .assoc_index_widths
+                        .insert(format!("{}#{}", handle, prop), (kw, signed));
+                }
+            }
             // Per-instance queue / dynamic-array members. Register the instance-
             // scoped name `<handle>#<member>` in the array tables (mirroring the
             // package/module array path) so push_back/size/index/foreach resolve
@@ -2556,7 +2737,15 @@ impl Simulator {
                     self.signed_class_colls.insert(scoped.clone());
                 }
                 self.module.dynamic_arrays.insert(scoped.clone());
-                self.module.arrays.insert(scoped.clone(), (0, 63, width));
+                // The object is not on the heap yet: its value parameters
+                // are read from the instance being built.
+                let mut params = self.module.parameters.clone();
+                for (pn, _) in &cdef.param_defaults {
+                    if let Some(v) = instance.properties.get(pn) {
+                        params.insert(pn.clone(), v.clone());
+                    }
+                }
+                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }
@@ -2801,7 +2990,7 @@ impl Simulator {
                 }
             }
         }
-        self.heap.push(Some(instance));
+        self.heap.push(Some(Box::new(instance)));
         // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
         // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
         // The per-instance storage registered above used the class table's
@@ -2943,416 +3132,55 @@ impl Simulator {
                 }
             }
         }
-        for cdef in classes_to_init.iter().rev() {
-            if cdef.property_inits.is_empty() {
-                continue;
-            }
-            // An initializer is evaluated IN the declaring class's scope, so a
-            // bare reference to that class's own enum member must resolve
-            // there (§6.19). Only `this_stack` was pushed, leaving the class
-            // context unset, so `e_a v = DUP;` fell through to the flat
-            // design-wide map and picked up an unrelated class's `DUP`.
-            self.class_context_stack.push(Some(cdef.name.clone()));
-            let inits: Vec<(String, &Expression)> = cdef
-                .property_inits
-                .iter()
-                .map(|(k, v)| (k.clone(), v))
-                .collect();
-            let mut deferred_call_inits: Vec<(String, Expression, String)> = Vec::new();
-            for (pname, init) in inits {
-                // A STATIC member is shared across all instances (it lives in
-                // `class_statics`, not per-instance), so it must NOT be
-                // re-initialized / re-allocated per instance. Doing so gave each
-                // phase instance its OWN `static mailbox m_phase_hopper`
-                // (a fresh handle) — so `execute_phase` (this=phase) put the next
-                // phase into a different mailbox than the one `m_run_phases`
-                // (this=null) was parked on, and execution stalled after the
-                // first phase. The static-init path (compile()) allocates the
-                // single shared instance once.
-                if cdef.static_properties.contains(&pname) {
-                    continue;
-                }
-                // §8.10: a property this class declares but a derived class
-                // redeclares lives under `<Class>::<name>` (seeded above);
-                // its initializer must land there, not in the derived copy.
-                let slot = {
-                    let mut q = std::mem::take(&mut self.inst_key_scratch);
-                    q.clear();
-                    q.push_str(&cdef.name);
-                    q.push_str("::");
-                    q.push_str(&pname);
-                    let shadowed = self
-                        .heap
-                        .get(handle)
-                        .and_then(|o| o.as_ref())
-                        .is_some_and(|i| i.properties.contains_key(q.as_str()));
-                    let slot = if shadowed { q.clone() } else { pname.clone() };
-                    self.inst_key_scratch = q;
-                    slot
-                };
-                // A mailbox/semaphore member with an inline `= new()` must be
-                // ALLOCATED here. The `expr_contains_call` skip below leaves it
-                // null otherwise (the constructor has no explicit `mb = new()`),
-                // so try_put/get silently fail when member mailboxes are initialized.
-                let cont_kind = cdef
-                    .properties
-                    .get(&pname)
-                    .and_then(|s| s.type_name.as_deref())
-                    .and_then(Self::container_base);
-                let (is_new, ctor_args): (bool, &[Expression]) = match &init.kind {
-                    ExprKind::Call { func, args } if matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new") => {
-                        (true, args.as_slice())
-                    }
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" => {
-                        (true, &[])
-                    }
-                    _ => (false, &[]),
-                };
-                if let (Some(kind), true) = (cont_kind, is_new) {
-                    // `semaphore s = new(1);`: the argument is the initial
-                    // key count (§15.3.1) or the mailbox bound (§15.4.1).
-                    let ch = self.alloc_builtin_container(kind, ctor_args);
-                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                        inst.properties.insert(slot, Value::from_u64(ch as u64, 32));
-                    }
-                    continue;
-                }
-                // A class-typed property with an inline `= new(...)` must be
-                // CONSTRUCTED here, mirroring the statement-assignment path
-                // (`lvalue = new(args)` -> instantiate_class_with_type_args).
-                // The expr_contains_call skip below leaves it null otherwise,
-                // so a property like `my_catcher catcher = new(14);` (whose
-                // constructor is never explicitly called in the enclosing
-                // new()) stays null -- surfacing as null object handle failures.
-                // Only fires for a property whose declared type is a user class
-                // (containers are handled above).
-                if is_new {
-                    let prop_tn = cdef
-                        .properties
-                        .get(&pname)
-                        .and_then(|s| s.type_name.clone());
-                    if let Some(tn) = prop_tn {
-                        // A typedef alias to a parameterized class (UVM's
-                        // `uvm_event_pool events = new("events");` in every
-                        // transaction): build THAT specialization. The base
-                        // lookup below dropped the type arguments, so the
-                        // pool made plain `uvm_object`s and every
-                        // `wait_trigger` on one returned at once.
-                        if let Some((base, sig)) = self.resolve_typedef_spec(&tn) {
-                            if let Some(cd2) = self.module.classes.get(&base).cloned() {
-                                self.ensure_spec_statics(&base, &sig);
-                                let saved_spec = self.current_spec.clone();
-                                self.current_spec = Some((base, sig));
-                                let v = self.instantiate_class(&cd2, ctor_args);
-                                self.current_spec = saved_spec;
-                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                    inst.properties.insert(slot, v);
-                                }
-                                continue;
-                            }
-                        }
-                        let concrete_tn =
-                            if let Some(crate::ast::types::DataType::TypeReference {
-                                name, ..
-                            }) = self.lookup_typedef_target(&tn)
-                            {
-                                name.name.name.clone()
-                            } else {
-                                tn
-                            };
-                        if self.module.classes.contains_key(&concrete_tn) {
-                            if let Some(cd2) = self.module.classes.get(&concrete_tn).cloned() {
-                                // Resolve any type-parameter bindings the
-                                // ctor args may need from the active spec.
-                                let ta = self.this_property_type_args(&pname);
-                                let v = self.instantiate_class_with_type_args(
-                                    &cd2,
-                                    ctor_args,
-                                    ta.as_deref(),
-                                );
-                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                    inst.properties.insert(slot, v);
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-                // §8.7, §7.5.1: a dynamic-array property initialized with its
-                // constructor (`int da[] = new[4];`) is sized here, like the
-                // same assignment as the first statement of `new()`. The
-                // call-bearing deferral below evaluated it as a scalar and
-                // left the array empty.
-                if let Some((n_expr, src_expr)) = Self::sized_new_parts(init) {
-                    let scoped = format!("{}#{}", handle, pname);
-                    if self.module.dynamic_arrays.contains(scoped.as_str()) {
-                        self.fill_sized_new(&scoped, n_expr, src_expr);
-                        continue;
-                    }
-                }
-                // §7.9.11: an associative-array property's pattern
-                // initializer (`int m[int] = '{1: 5, default: -1}`) fills the
-                // per-instance store and records its default.
-                if let ExprKind::AssignmentPattern(items) = &init.kind
-                    && cdef.assoc_properties.contains_key(&pname)
-                {
-                    let scoped = format!("{}#{}", handle, pname);
-                    let val_w = cdef.properties.get(&pname).map(|s| s.width).unwrap_or(32);
-                    self.assign_class_assoc_pattern(&scoped, val_w, items);
-                    continue;
-                }
-                // Only re-evaluate side-effect-free initializers. Ones that call
-                // a function or constructor (`= new`, `= f()`) can recurse or
-                // mutate state and are the constructor's job; leave their
-                // elaborate-time value in place.
-                if Self::expr_contains_call(&init) {
-                    // Scalar (non-collection) call-bearing initializers are
-                    // re-evaluated at construction in a fixed point below so
-                    // field-order dependencies resolve (a later-declared field
-                    // can read an earlier one). Collected here and run after
-                    // the non-call initializers so singletons are up.
-                    deferred_call_inits.push((pname.clone(), init.clone(), slot));
-                    continue;
-                }
-                // Queue / dynamic-array member initializer (`int q[$] =
-                // '{1,2,3}`): the per-instance storage lives at
-                // `<handle>#member`, NOT in the scalar `properties` map.
-                // Evaluate the initializer and populate the queue namespace.
-                let is_queue_init = cdef.queue_properties.contains_key(&pname) || {
-                    use std::fmt::Write as _;
-                    let mut q = std::mem::take(&mut self.inst_key_scratch);
-                    q.clear();
-                    let _ = write!(q, "{}#{}", handle, pname);
-                    let hit = self.module.dynamic_arrays.contains(q.as_str());
-                    self.inst_key_scratch = q;
-                    hit
-                };
-                if is_queue_init {
-                    let scoped_q = format!("{}#{}", handle, pname);
-                    self.populate_queue_from_init(&scoped_q, &init);
-                    continue;
-                }
-                // Fixed-size UNPACKED array member initializer
-                // (`int fa[4] = '{1,2,3,4}`): per-instance storage is the
-                // element signals `<handle>#fa[i]` (registered above as a real
-                // fixed array), NOT a scalar slot in the property map. Expand
-                // the assignment pattern over the DECLARED index range, so the
-                // replication form `'{4{9}}` and the `default:` fill
-                // (`'{default:7}`) reach EVERY element instead of collapsing
-                // into `fa[0]` as one packed value (LRM §10.9.1 / §10.10). The
-                // positional `'{1,2,3,4}` path is unchanged, and non-zero lower
-                // bounds (`fa[1:4]`) keep their declared indices. This shares
-                // `pattern_elems`, the same expansion the general array-pattern
-                // spread (`assign_pattern_array`) uses.
-                if let Some(&(lo, hi, _w)) = cdef.array_properties.get(&pname) {
-                    let (lo, hi) = self.inst_fixed_bounds(cdef, handle, &pname, (lo, hi));
-                    let scoped = format!("{}#{}", handle, pname);
-                    if let ExprKind::AssignmentPattern(items) = &init.kind {
-                        let indices: Vec<i64> = (lo..=hi).collect();
-                        // §7.2/§18.4: an UNPACKED-STRUCT element has no single
-                        // cell — its members live as `<prop>[i].<m>` in the
-                        // instance property map, which is where the read path
-                        // (`class_unpacked_leaf`) looks. Storing the element as
-                        // one packed value under the signal name `<h>#<prop>[i]`
-                        // wrote something nothing reads, so every element of a
-                        // `localparam`/`const` array of unpacked structs came
-                        // back 0 — the shape a directed-stimulus table uses.
-                        // Decompose into the same cells the runtime element
-                        // write now uses.
-                        if let Some(su) = self.class_prop_struct(handle, &pname) {
-                            if Self::spreads_member_wise(&su) {
-                                let base = Expression::new(
-                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![crate::ast::expr::HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: pname.clone(),
-                                                span: crate::ast::Span::dummy(),
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: crate::ast::Span::dummy(),
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
-                                    }),
-                                    crate::ast::Span::dummy(),
-                                );
-                                let elems = self.pattern_elems(items, &indices);
-                                let owned: Vec<(usize, Option<Expression>)> =
-                                    elems.into_iter().map(|e| e.cloned()).enumerate().collect();
-                                for (k, e) in owned {
-                                    if let Some(e) = e {
-                                        let elem = Self::index_expr(&base, indices[k]);
-                                        self.assign_class_unpacked_elem(&elem, &e, &su);
-                                    }
-                                }
-                                continue;
-                            }
-                        }
-                        let elems = self.pattern_elems(items, &indices);
-                        for (k, e) in elems.into_iter().enumerate() {
-                            if let Some(e) = e {
-                                let en = format!("{}[{}]", scoped, indices[k]);
-                                let mut v = self.eval_expr(e);
-                                // Each element is assigned (§10.9.1): it
-                                // takes the element's width — an unsized
-                                // fill `'1` too (§5.7.1).
-                                if !v.is_real && !self.is_string_collection(&scoped) {
-                                    if let Some(&w) = self.widths.get(&en) {
-                                        if w > 0 && w != v.width {
-                                            v = v.resize_for_assign(w);
-                                        }
-                                    }
-                                }
-                                self.set_signal_value_by_name(&en, v);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if let ExprKind::AssignmentPattern(items) = &init.kind
-                    && let Some(su) = self
-                        .class_prop_struct(handle, &pname)
-                        .filter(Self::spreads_member_wise)
-                {
-                    let base =
-                        Self::hier_ident_expr(Self::iface_path_segs(&pname, init.span), init.span);
-                    self.assign_class_unpacked_elem(&base, init, &su);
-                    // §7.2.1: the DYNAMIC members take their items as whole
-                    // collections, under the instance (`<h>#s.q`).
-                    if self.struct_colls_possible() {
-                        for (mname, _, dims, e, explicit) in
-                            self.bind_struct_pattern_items(&su, items)
-                        {
-                            if let (Some(e), true) = (
-                                e,
-                                explicit && dims.len() == 1 && Self::coll_kind_of(&dims).is_some(),
-                            ) {
-                                let lhs = Self::append_member_expr(&base, &mname);
-                                self.assign_struct_member_coll(&lhs, e);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // §7.9.11/§8.7: an associative-array property initializer
-                // (`int m[string] = '{"a": 1}`) fills the instance's own
-                // entries; evaluated whole it became one scalar nobody reads.
-                if matches!(init.kind, ExprKind::AssignmentPattern(_))
-                    && cdef.assoc_properties.contains_key(&pname)
-                {
-                    let scoped = format!("{}#{}", handle, pname);
-                    if self.is_associative_array(&scoped) {
-                        self.assign_whole_coll(&scoped, None, init);
-                        continue;
-                    }
-                }
-                let mut val = self.eval_expr(&init);
-                // §11.8.1: the re-evaluated initializer must be stamped with
-                // the PROPERTY's declared signedness and width, not the
-                // literal's. `bit [15:0] u = -1;` otherwise stored a signed
-                // value and `c.u > 0` compared as -1 rather than 65535.
-                //
-                // §8.25 / §6.20.2: the width is THIS specialization's —
-                // `bit [W-1:0] pv = '1` in `pbase #(8)` is 8 bits of 1s
-                // (§5.7.1 fills to the target), and `T data = '1` follows the
-                // type `T` is bound to — not the default-parameter width the
-                // class table records.
-                if let Some(sig) = cdef.properties.get(&pname) {
-                    if !sig.is_real && !val.is_real {
-                        let w = if chain_is_param {
-                            self.class_prop_width_impl(&cdef.name, Some(handle), &pname)
-                                .unwrap_or(sig.width)
-                        } else {
-                            sig.width
-                        };
-                        if w > 0 && val.width != w {
-                            val = val.resize(w);
-                        }
-                        val.is_signed = if sig
-                            .type_name
-                            .as_ref()
-                            .is_some_and(|t| cdef.type_param_names.contains(t))
-                        {
-                            self.class_prop_signed_of(handle, &pname)
-                        } else {
-                            sig.is_signed
-                        };
-                    }
-                }
-                if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                    inst.properties.insert(slot, val);
-                }
-            }
-            // Fixed point over the deferred call-bearing instance property
-            // initializers. Field initializers legally run in DECLARATION order
-            // at construction; a later field may read an earlier one (e.g.
-            // `uvm_coreservice_t cs = uvm_coreservice_t::get();` then
-            // `uvm_factory factory = cs.get_factory();`). `property_inits` is an
-            // unordered map, so repeat the pass until a full round changes
-            // nothing — dependency chains settle regardless of iteration order.
-            // §8.7: field initializers run ONCE each, in DECLARATION order (as
-            // if they were the first statements of `new()`), so a later field
-            // may read an earlier one and an initializer with side effects
-            // (`int id = counter::take();`) fires exactly once. A fixed-point
-            // loop over the unordered map re-ran every initializer up to N+1
-            // times (reference: ids 1/2 3/4 5/6; the loop gave 5/6 11/12 17/18).
-            if !deferred_call_inits.is_empty() {
-                let order = &cdef.property_order;
-                deferred_call_inits.sort_by_key(|(pname, _, _)| {
-                    order.iter().position(|p| p == pname).unwrap_or(usize::MAX)
-                });
-                for (_, init, slot) in &deferred_call_inits {
-                    self.evaluate_call_init_at_construct(handle, slot, init, chain_is_param);
-                }
-            }
-            self.class_context_stack.pop();
-        }
+        self.pending_class_initializers
+            .insert(handle, classes_to_init.to_vec());
         self.this_stack.pop();
-        // §8.7: implicit `super.new(...)` chaining. If the constructor that
-        // will run does not call super.new explicitly, run its base-class
-        // constructor(s) first (base-most first), passing the `extends
-        // Base(args)` value arguments. Only fires when NO explicit super.new
-        // exists, so designs that chain explicitly are unaffected. A class
-        // WITHOUT its own `new` inherits the base new via the dispatch walk-up
-        // (handled by exec_method_call), so it must not also be chained here.
-        {
-            let mut chain: Vec<(String, Vec<Expression>)> = Vec::new();
-            let mut cur = class_def.name.clone();
-            let mut guard = 0;
-            loop {
-                guard += 1;
-                if guard > 64 {
-                    break;
-                }
-                let Some(cdef) = self.module.classes.get(&cur).cloned() else {
-                    break;
-                };
-                if !cdef.methods.contains_key("new") {
-                    break;
-                }
-                let Some(base) = cdef.extends.clone() else {
-                    break;
-                };
-                if self.constructor_calls_super_new(&cur) {
-                    break;
-                }
-                chain.push((base.clone(), cdef.extends_args.clone()));
-                cur = base;
-            }
-            for (cls, cargs) in chain.iter().rev() {
-                self.this_stack.push(Some(handle));
-                self.exec_method_in_class_hierarchy(handle, cls, "new", cargs);
-                self.this_stack.pop();
-            }
-        }
         let saved_spec = self.clone_spec_pooled();
         if computed_spec.is_some() {
             self.current_spec = computed_spec.clone();
         }
         self.exec_method_call(handle, "new", args);
+        // A declaration without an executable constructor still initializes
+        // its fields. Normal constructor dispatch drains the pending classes.
+        while let Some(class) = self
+            .pending_class_initializers
+            .get(&handle)
+            .and_then(|classes| classes.last())
+            .map(|cd| cd.name.clone())
+        {
+            self.initialize_pending_class_properties(handle, &class);
+        }
         self.restore_spec_pooled(saved_spec);
         Value::from_u64(handle as u64, 32)
+    }
+
+    /// §8.4: a method call on a null handle. At the top level (a module or
+    /// testbench process body) the run aborts, like the reference simulator;
+    /// inside class code (deep library code, where an emulation gap can leave
+    /// a handle null) the call is reported once per site and skipped, the
+    /// policy `blocking_call_on_null_receiver` and the property-read path
+    /// apply.
+    pub(super) fn report_null_handle_call(&mut self, method_name: &str) {
+        let in_method = self.this_stack.last().copied().flatten().is_some()
+            || self.class_context_stack.last().cloned().flatten().is_some()
+            || !self.local_stack.is_empty();
+        let m = format!(
+            "[xezim][error] null handle at time {} — method `{}` called on a null \
+             class handle (§8.4); the call runs nothing{}",
+            self.time,
+            method_name,
+            if in_method { "" } else { ", aborting" }
+        );
+        if in_method {
+            if self.null_call_reported.insert(method_name.to_string()) {
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
+            }
+            return;
+        }
+        self.record_output(m.clone());
+        self.stdout_writeln(&m);
+        self.abort_run();
     }
 
     pub(super) fn exec_method_call(
@@ -3601,6 +3429,21 @@ impl Simulator {
         let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
             inst.class_name.clone()
         } else {
+            // §8.4: calling a method through a null handle dereferences
+            // null; the reference simulator reports it and aborts. This
+            // ran nothing and returned 0 silently, so a test whose handle
+            // was never constructed printed no trace at all. A static
+            // method needs no object (§8.7) — the receiver's declared
+            // class dispatches it earlier; any static method of that name
+            // keeps the silent path for the shapes that still reach here.
+            if !self
+                .module
+                .classes
+                .values()
+                .any(|cd| cd.static_methods.contains(method_name))
+            {
+                self.report_null_handle_call(method_name);
+            }
             return Value::zero(32);
         };
         // LRM §8.7/§8.23: a STATIC method is resolved/stored separately from

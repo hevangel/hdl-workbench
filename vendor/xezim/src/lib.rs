@@ -201,6 +201,11 @@ fn design_cache_key(
     hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
     // §6.21: the accepted initializer's lifetime changes elaboration.
     hash.bytes(&[xezim_core::elaborate::relax_implicit_static() as u8]);
+    // An opt-in parser relaxation or keyword set accepts other source.
+    for f in sv_parser::relax_flags() {
+        hash.bytes(&[f.get() as u8]);
+    }
+    hash.bytes(&[sv_parser::lexer::scanner::default_keywords_key()]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.
@@ -502,33 +507,19 @@ const ELAB_CONST_SYSFUNCS: &[&str] = &[
 /// Does the expression contain a system call that elaboration-time const-eval
 /// cannot actually evaluate (i.e. one that needs simulation-time state)?
 fn contains_simtime_syscall(e: &ast::expr::Expression) -> bool {
-    use ast::expr::ExprKind;
-    match &e.kind {
-        ExprKind::SystemCall { name, args } => {
-            !ELAB_CONST_SYSFUNCS.contains(&name.as_str())
-                || args.iter().any(contains_simtime_syscall)
+    let mut found = false;
+    type_lint::visit_expr(e, &mut |e| {
+        if let ast::expr::ExprKind::SystemCall { name, .. } = &e.kind
+            && !ELAB_CONST_SYSFUNCS.contains(&name.as_str())
+            && !matches!(
+                name.as_str(),
+                "$__xz_named_cast" | "$__xz_type_cast" | "$__xz_size_cast"
+            )
+        {
+            found = true;
         }
-        ExprKind::Unary { operand, .. } => contains_simtime_syscall(operand),
-        ExprKind::Binary { left, right, .. } => {
-            contains_simtime_syscall(left) || contains_simtime_syscall(right)
-        }
-        ExprKind::Conditional {
-            condition,
-            then_expr,
-            else_expr,
-        } => {
-            contains_simtime_syscall(condition)
-                || contains_simtime_syscall(then_expr)
-                || contains_simtime_syscall(else_expr)
-        }
-        ExprKind::Concatenation(parts) => parts.iter().any(contains_simtime_syscall),
-        ExprKind::Paren(inner) => contains_simtime_syscall(inner),
-        ExprKind::MemberAccess { expr, .. } => contains_simtime_syscall(expr),
-        ExprKind::Index { expr, index } => {
-            contains_simtime_syscall(expr) || contains_simtime_syscall(index)
-        }
-        _ => false,
-    }
+    });
+    found
 }
 
 /// Mirror of xezim-core's `is_const_expr` classification (elaborate.rs,
@@ -609,73 +600,172 @@ fn make_bare_ident(name: &str, span: ast::Span) -> ast::expr::Expression {
     )
 }
 
+/// Bare (single-segment, unselected) identifiers an expression READS.
+/// Hierarchical references (`u.x`, `pkg.y`) are deliberately not collected:
+/// they name another scope, and a declaration pulled in because of one would
+/// have its initializer run a second time for no benefit.
+fn collect_bare_reads(e: &ast::expr::Expression, out: &mut Vec<String>) {
+    type_lint::visit_expr(e, &mut |e| {
+        if let ast::expr::ExprKind::Ident(h) = &e.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+        {
+            out.push(h.path[0].name.name.clone());
+        }
+    });
+}
+
+/// This scope's declarators that could be re-issued, in declaration order,
+/// skipping unpacked-array declarators (elaboration's assignment-pattern path
+/// makes those always procedural).  A `generate` region shares the enclosing
+/// scope, so its declarations are collected too.
+fn collect_static_init_candidates<'a>(
+    items: &'a [ast::decl::ModuleItem],
+    out: &mut Vec<(&'a ast::stmt::VarDeclarator, &'a ast::expr::Expression)>,
+    depth: u32,
+) {
+    use ast::decl::ModuleItem;
+    if depth > 64 {
+        return;
+    }
+    for item in items {
+        if let ModuleItem::DataDeclaration(dd) = item {
+            for d in &dd.declarators {
+                if !d.dimensions.is_empty() {
+                    continue;
+                }
+                if let Some(init) = &d.init {
+                    out.push((d, init));
+                }
+            }
+        } else if let ModuleItem::GenerateRegion(gr) = item {
+            collect_static_init_candidates(&gr.items, out, depth + 1);
+        }
+    }
+}
+
 fn walk_module_static_inits(
     items: &[ast::decl::ModuleItem],
-    defs: &xezim_core::hasher::HashMap<String, SourceDefinition>,
     elab: &elaborate::ElaboratedModule,
     scope: &str,
     depth: u32,
     out: &mut Vec<elaborate::InitialBlock>,
+    replaced: &mut xezim_core::hasher::HashSet<String>,
 ) {
-    use ast::decl::ModuleItem;
     use ast::stmt::{Statement, StatementKind};
     if depth > 64 {
         return; // defensive recursion cap
     }
-    for item in items {
-        match item {
-            ModuleItem::DataDeclaration(dd) => {
-                for d in &dd.declarators {
-                    // Unpacked-array declarators take elaboration's
-                    // assignment-pattern path (always procedural) — skip.
-                    if !d.dimensions.is_empty() {
-                        continue;
-                    }
-                    let Some(init) = &d.init else { continue };
-                    if contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope) {
-                        out.push(elaborate::InitialBlock {
-                            stmt: Statement::new(
-                                StatementKind::BlockingAssign {
-                                    lvalue: make_bare_ident(&d.name.name, d.name.span),
-                                    rvalue: init.clone(),
-                                },
-                                d.name.span,
-                            ),
-                            scope: scope.to_string(),
-                        });
-                    }
-                }
+    // Gather the whole scope first (a `generate` region is the same scope):
+    // deciding what to re-issue is a property of the scope, not of one item.
+    let mut cand: Vec<(&ast::stmt::VarDeclarator, &ast::expr::Expression)> = Vec::new();
+    collect_static_init_candidates(items, &mut cand, depth);
+    if cand.is_empty() {
+        return;
+    }
+    // Seed: the initializer itself calls a simulation-time system function that
+    // elaboration folded to 0/"".
+    let is_seed = |init: &ast::expr::Expression| -> bool { contains_simtime_syscall(init) };
+    // §6.21 companion: a declaration that merely READS a re-issued declaration
+    // was folded while that name still held its placeholder, so it must be
+    // re-issued too — after it.  Take the readers to a fixpoint (`t2` reads
+    // `t1`, `t3` reads `t2`). Existing runtime assignments are removed when
+    // these replacements are installed, so calls still execute exactly once.
+    let mut reissue: Vec<String> = cand
+        .iter()
+        .filter(|(_, init)| is_seed(init))
+        .map(|(d, _)| d.name.name.clone())
+        .collect();
+    if reissue.is_empty() {
+        return;
+    }
+    loop {
+        let mut changed = false;
+        for (d, init) in &cand {
+            if reissue.iter().any(|r| r == &d.name.name) {
+                continue;
             }
-            // Unconditional `generate ... endgenerate` region — same scope.
-            ModuleItem::GenerateRegion(gr) => {
-                walk_module_static_inits(&gr.items, defs, elab, scope, depth + 1, out);
+            let mut reads = Vec::new();
+            collect_bare_reads(init, &mut reads);
+            if reads.iter().any(|n| reissue.iter().any(|r| r == n)) {
+                reissue.push(d.name.name.clone());
+                changed = true;
             }
-            ModuleItem::ModuleInstantiation(mi) => {
-                if let Some(SourceDefinition::Module(child)) = defs.get(&mi.module_name.name) {
-                    for inst in &mi.instances {
-                        // Instance arrays get per-element scopes ("u[i]") —
-                        // out of scope here; leave elaboration behavior.
-                        if !inst.dimensions.is_empty() {
-                            continue;
-                        }
-                        let child_scope = if scope.is_empty() {
-                            inst.name.name.clone()
-                        } else {
-                            format!("{}.{}", scope, inst.name.name)
-                        };
-                        walk_module_static_inits(
-                            &child.items,
-                            defs,
-                            elab,
-                            &child_scope,
-                            depth + 1,
-                            out,
-                        );
-                    }
-                }
-            }
-            _ => {}
         }
+        if !changed {
+            break;
+        }
+    }
+    for (d, init) in &cand {
+        if !elab_classifies_const(init, elab, scope) && !reissue.iter().any(|r| r == &d.name.name) {
+            reissue.push(d.name.name.clone());
+        }
+    }
+    // §23.8: an instance's initializer calls its own subroutine. A bare
+    // callee can otherwise hit another instance's unqualified function alias.
+    fn scope_calls(
+        items: &[ast::decl::ModuleItem],
+        scope: &str,
+        depth: u32,
+        bindings: &mut xezim_core::hasher::HashMap<String, ast::expr::Expression>,
+    ) {
+        use ast::decl::ModuleItem;
+        if depth > 64 {
+            return;
+        }
+        for item in items {
+            let name = match item {
+                ModuleItem::FunctionDeclaration(f)
+                    if f.name.scopes.is_empty() && f.name.name.name != "new" =>
+                {
+                    Some(&f.name.name)
+                }
+                ModuleItem::TaskDeclaration(t) if t.name.scopes.is_empty() => Some(&t.name.name),
+                ModuleItem::GenerateRegion(g) => {
+                    scope_calls(&g.items, scope, depth + 1, bindings);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                bindings.insert(
+                    name.name.clone(),
+                    make_bare_ident(&format!("{scope}.{}", name.name), name.span),
+                );
+            }
+        }
+    }
+    let mut bindings = xezim_core::hasher::HashMap::default();
+    if !scope.is_empty() {
+        scope_calls(items, scope, 0, &mut bindings);
+    }
+    let locals = std::collections::HashSet::new();
+    let interfaces = xezim_core::hasher::HashMap::default();
+    // Emit in DECLARATION order, so every re-issued reader follows the names it
+    // reads (the blocks run in this order at time 0).
+    for (d, init) in &cand {
+        if !is_seed(init) && !reissue.iter().any(|r| r == &d.name.name) {
+            continue;
+        }
+        replaced.insert(if scope.is_empty() {
+            d.name.name.clone()
+        } else {
+            format!("{scope}.{}", d.name.name)
+        });
+        out.push(elaborate::InitialBlock {
+            stmt: Statement::new(
+                StatementKind::BlockingAssign {
+                    lvalue: make_bare_ident(&d.name.name, d.name.span),
+                    rvalue: if bindings.is_empty() {
+                        (*init).clone()
+                    } else {
+                        elaborate::rewrite_expr(init, "", &bindings, &locals, &interfaces)
+                    },
+                },
+                d.name.span,
+            ),
+            scope: scope.to_string(),
+        });
     }
 }
 
@@ -687,21 +777,39 @@ pub fn defer_static_syscall_inits(
     elab: &mut elaborate::ElaboratedModule,
 ) {
     let mut out: Vec<elaborate::InitialBlock> = Vec::new();
-    if let Some(SourceDefinition::Module(top)) = defs.get(&elab.name) {
-        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
-    }
-    // §6.21 / §25.3: interface variables have static lifetime too. The module
-    // walk above only descends through module definitions, so it never sees
-    // an interface's initializers. Use the elaborated instance paths here:
-    // they include generated and arrayed interfaces, with the actual scope
-    // needed by `%m`, and exclude inactive generate branches.
-    if let Some(SourceDefinition::Interface(top)) = defs.get(&elab.name) {
-        walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
-    }
-    for inst in &elab.instances {
-        if let Some(SourceDefinition::Interface(iface)) = defs.get(&inst.def_name) {
-            walk_module_static_inits(&iface.items, defs, elab, &inst.path, 0, &mut out);
+    let mut replaced = xezim_core::hasher::HashSet::default();
+    // The top module/interface/program is not listed in `elab.instances`
+    // (instance paths are relative to it), so walk it separately at "".
+    if let Some(top) = defs.get(&elab.name) {
+        let top_items = match top {
+            SourceDefinition::Module(m) => Some(&m.items),
+            SourceDefinition::Interface(i) => Some(&i.items),
+            SourceDefinition::Program(p) => Some(&p.items),
+            _ => None,
+        };
+        if let Some(items) = top_items {
+            walk_module_static_inits(items, elab, "", 0, &mut out, &mut replaced);
         }
+    }
+    // §6.21 / §23.11 / §24 / §26.5: walk every ELABORATED instance rather than
+    // the AST instantiation tree. `ElabInstance::path` is exactly the scope
+    // `%m` needs, so this reaches what an AST walk cannot:
+    //   * instances inside `generate for` / `generate if` bodies (`g[0].u`) —
+    //     the AST has no trip count or taken branch without redoing
+    //     elaboration, and inactive branches must NOT be emitted;
+    //   * instance-array elements (`u[0]`, `u[1]`), which the AST walk skipped
+    //     whenever `inst.dimensions` was nonempty;
+    //   * `bind`-inserted instances (§23.11) and everything below them — a bind
+    //     is not an AST item in its host, so an AST walk never sees them;
+    //   * `program` instances (§24), which are not `SourceDefinition::Module`.
+    for inst in &elab.instances {
+        let items = match defs.get(&inst.def_name) {
+            Some(SourceDefinition::Module(m)) => &m.items,
+            Some(SourceDefinition::Interface(i)) => &i.items,
+            Some(SourceDefinition::Program(p)) => &p.items,
+            _ => continue,
+        };
+        walk_module_static_inits(items, elab, &inst.path, 0, &mut out, &mut replaced);
     }
     // Package-scope variables too (`string n = $sformatf("%m.notifier")` in
     // UVM's polling package). The assignment runs inside a block named with
@@ -714,51 +822,160 @@ pub fn defer_static_syscall_inits(
         })
         .collect();
     pkgs.sort_by(|a, b| a.name.name.cmp(&b.name.name));
-    for p in pkgs {
-        for item in &p.items {
-            let ast::decl::PackageItem::Data(dd) = item else {
-                continue;
-            };
-            for d in &dd.declarators {
-                let Some(init) = &d.init else { continue };
-                if !d.dimensions.is_empty()
-                    || !contains_simtime_syscall(init)
-                    || !elab_classifies_const(init, elab, "")
-                {
-                    continue;
-                }
-                use ast::stmt::{Statement, StatementKind};
-                let assign = Statement::new(
-                    StatementKind::BlockingAssign {
-                        lvalue: make_bare_ident(&d.name.name, d.name.span),
-                        rvalue: init.clone(),
-                    },
-                    d.name.span,
-                );
-                let scoped = Statement::new(
-                    StatementKind::SeqBlock {
-                        name: Some(ast::Identifier {
-                            name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
-                            span: d.name.span,
-                        }),
-                        stmts: vec![assign],
-                    },
-                    d.name.span,
-                );
-                out.push(elaborate::InitialBlock {
-                    stmt: Statement::new(
-                        StatementKind::SeqBlock {
-                            name: None,
-                            stmts: vec![scoped],
-                        },
-                        d.name.span,
-                    ),
-                    scope: String::new(),
-                });
-            }
+    // Match the runtime's package storage: unique exports use the bare
+    // cell; only contested names get a separate qualified signal (§26.3).
+    let mut owners: xezim_core::hasher::HashMap<&str, usize> = Default::default();
+    for name in elab.pkg_var_decls.keys() {
+        if let Some((_, leaf)) = name.split_once("::") {
+            *owners.entry(leaf).or_default() += 1;
         }
     }
-    elab.static_init_blocks.extend(out);
+    let contested: xezim_core::hasher::HashSet<&str> = owners
+        .into_iter()
+        .filter(|(name, count)| {
+            *count >= 2
+                || elab.wildcard_shadowed.contains(*name)
+                || elab.foreign_displaced.contains(*name)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    let mut package_out = Vec::new();
+    for p in pkgs {
+        let items: Vec<_> = p
+            .items
+            .iter()
+            .filter_map(|i| {
+                if let ast::decl::PackageItem::Data(d) = i {
+                    Some(ast::decl::ModuleItem::DataDeclaration(d.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut blocks = Vec::new();
+        let mut names = xezim_core::hasher::HashSet::default();
+        walk_module_static_inits(&items, elab, "", 0, &mut blocks, &mut names);
+        for name in names {
+            replaced.insert(format!("{}::{name}", p.name.name));
+        }
+        let mut bindings = xezim_core::hasher::HashMap::default();
+        let qualify = |name: &ast::Identifier| {
+            ast::expr::Expression::new(
+                ast::expr::ExprKind::MemberAccess {
+                    expr: Box::new(make_bare_ident(&p.name.name, name.span)),
+                    member: name.clone(),
+                },
+                name.span,
+            )
+        };
+        for item in &p.items {
+            match item {
+                ast::decl::PackageItem::Data(d) => {
+                    for decl in &d.declarators {
+                        let storage = if contested.contains(decl.name.name.as_str()) {
+                            format!("{}::{}", p.name.name, decl.name.name)
+                        } else {
+                            decl.name.name.clone()
+                        };
+                        bindings.insert(
+                            decl.name.name.clone(),
+                            make_bare_ident(&storage, decl.name.span),
+                        );
+                    }
+                }
+                ast::decl::PackageItem::Function(f)
+                    if f.name.scopes.is_empty() && f.name.name.name != "new" =>
+                {
+                    bindings.insert(f.name.name.name.clone(), qualify(&f.name.name));
+                }
+                ast::decl::PackageItem::Task(t) if t.name.scopes.is_empty() => {
+                    bindings.insert(t.name.name.name.clone(), qualify(&t.name.name));
+                }
+                _ => {}
+            }
+        }
+        for mut block in blocks {
+            use ast::stmt::{Statement, StatementKind};
+            if let StatementKind::BlockingAssign { lvalue, rvalue } = &mut block.stmt.kind {
+                let locals = std::collections::HashSet::new();
+                let interfaces = xezim_core::hasher::HashMap::default();
+                *lvalue = elaborate::rewrite_expr(lvalue, "", &bindings, &locals, &interfaces);
+                *rvalue = elaborate::rewrite_expr(rvalue, "", &bindings, &locals, &interfaces);
+            }
+            let span = block.stmt.span;
+            let scoped = Statement::new(
+                StatementKind::SeqBlock {
+                    name: Some(ast::Identifier {
+                        name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
+                        span,
+                    }),
+                    stmts: vec![block.stmt],
+                },
+                span,
+            );
+            // Static scheduling unwraps the outer block; retain the named one.
+            block.stmt = Statement::new(
+                StatementKind::SeqBlock {
+                    name: None,
+                    stmts: vec![scoped],
+                },
+                span,
+            );
+            package_out.push(block);
+        }
+    }
+    package_out.append(&mut out);
+    out = package_out;
+    // §6.21: replace an already scheduled initializer, rather than running
+    // it again. Preserve unrelated statements in shared initialization blocks.
+    fn remove_replaced(
+        stmt: &mut ast::stmt::Statement,
+        scope: &str,
+        replaced: &xezim_core::hasher::HashSet<String>,
+    ) -> bool {
+        use ast::{expr::ExprKind, stmt::StatementKind};
+        match &mut stmt.kind {
+            StatementKind::BlockingAssign { lvalue, .. } => {
+                if let ExprKind::Ident(h) = &lvalue.kind {
+                    let name = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    return !replaced.contains(&name)
+                        && (scope.is_empty() || !replaced.contains(&format!("{scope}.{name}")));
+                }
+                true
+            }
+            StatementKind::SeqBlock { stmts, .. } => {
+                stmts.retain_mut(|s| remove_replaced(s, scope, replaced));
+                !stmts.is_empty()
+            }
+            _ => true,
+        }
+    }
+    // Package initializer indices refer to the old list. Retain their owner
+    // identity while pruning/reordering; a module homonym is a different target.
+    let package_inits: xezim_core::hasher::HashMap<usize, String> =
+        elab.pkg_var_init_blocks.drain(..).collect();
+    for (idx, mut block) in std::mem::take(&mut elab.static_init_blocks)
+        .into_iter()
+        .enumerate()
+    {
+        let keep = if let Some(owner) = package_inits.get(&idx) {
+            !replaced.contains(owner)
+        } else {
+            remove_replaced(&mut block.stmt, &block.scope, &replaced)
+        };
+        if keep {
+            if let Some(owner) = package_inits.get(&idx) {
+                elab.pkg_var_init_blocks.push((out.len(), owner.clone()));
+            }
+            out.push(block);
+        }
+    }
+    elab.static_init_blocks = out;
 }
 
 /// IEEE 1800-2017 §18.5.1 — re-install out-of-class constraint bodies
@@ -847,12 +1064,19 @@ fn reinstall_ooc_constraint_bodies(
     }
 }
 
+/// The encoded size of a value in the artifact format, for the memory
+/// diagnostics: counted through a sink, never buffered.
+pub(crate) fn serialized_len<T: serde::Serialize>(v: &T) -> usize {
+    bincode::serde::encode_into_std_write(v, &mut std::io::sink(), xezim_core::xez_bincode_config())
+        .unwrap_or(0)
+}
+
 /// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
 /// serialized size per field (a stand-in for heap size that ranks them) and
 /// the sizes of the AST node types that make up most of it.
 fn elab_census(elab: &elaborate::ElaboratedModule) {
     fn ser<T: serde::Serialize>(v: &T) -> usize {
-        bincode::serialized_size(v).unwrap_or(0) as usize
+        serialized_len(v)
     }
     let mut rows: Vec<(&str, usize)> = vec![
         ("signals", ser(&elab.signals)),
@@ -1335,14 +1559,28 @@ fn simulate_multi_inner(
             .filter(|_| sources.as_slice() == raw_sources),
     };
     let cache = design_cache_config();
-    if cache.is_some() && pre.is_none() {
-        // One pass serves both the cache key and (on a miss) elaboration.
+    if pre.is_none() {
+        // One pass serves the cache key, the intra-assignment delay rewrite
+        // below and (on a miss) elaboration.
         pre = Some(xezim_core::preprocess_design(
             &sources,
             source_paths,
             include_dirs,
             defines,
         ));
+    }
+    // §9.4.5 / §22.4 (#567): text spliced in by `include or by a macro
+    // exists only after preprocessing, so the pre-parse rewrite above never
+    // saw a delay written there. Rewrite the preprocessed texts too; the
+    // pass keeps every byte of whitespace, so the line maps stay valid, and
+    // a delay already rewritten is left alone.
+    if let Some(p) = pre.as_mut() {
+        for t in p.texts.iter_mut() {
+            let rewritten = intra_delay::rewrite_intra_assignment_delays(t);
+            if rewritten != *t {
+                *t = rewritten;
+            }
+        }
     }
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let mut cache_line_maps = Vec::new();

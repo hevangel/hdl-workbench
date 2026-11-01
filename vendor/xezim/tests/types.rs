@@ -41,6 +41,8 @@ mod bits_package_scoped_type_width;
 mod block_local_unpacked_struct;
 #[path = "types/block_local_width_in_index_shift.rs"]
 mod block_local_width_in_index_shift;
+#[path = "types/block_local_size_query_scope.rs"]
+mod block_local_size_query_scope;
 #[path = "types/byte_local_narrow.rs"]
 mod byte_local_narrow;
 #[path = "types/callback_typedef_static.rs"]
@@ -67,6 +69,8 @@ mod class_module_same_name;
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]
 mod const_function_params;
+#[path = "types/const_fn_struct_config.rs"]
+mod const_fn_struct_config;
 #[path = "types/constructor_new_not_static.rs"]
 mod constructor_new_not_static;
 #[path = "types/constructor_new_property_type.rs"]
@@ -93,6 +97,8 @@ mod division_operand_width;
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_base_and_packed_members.rs"]
 mod enum_base_and_packed_members;
+#[path = "types/enum_cross_cast_assignment.rs"]
+mod enum_cross_cast_assignment;
 #[path = "types/enum_member_per_instance.rs"]
 mod enum_member_per_instance;
 #[path = "types/enum_name_cross_method_local.rs"]
@@ -163,6 +169,8 @@ mod nba_context_width;
 mod nested_packed_member_lvalue;
 #[path = "types/nested_packed_struct_array_access.rs"]
 mod nested_packed_struct_array_access;
+#[path = "types/nested_packed_struct_pattern.rs"]
+mod nested_packed_struct_pattern;
 #[path = "types/nested_packed_typedefs.rs"]
 mod nested_packed_typedefs;
 #[path = "types/nonzero_based_vector_reads.rs"]
@@ -506,6 +514,9 @@ mod next_rest_typedef_casts_377;
 #[path = "types/unsigned_shift_context_384.rs"]
 mod unsigned_shift_context_384;
 
+#[path = "types/unsigned_operand_context.rs"]
+mod unsigned_operand_context;
+
 #[path = "types/const_fn_call_in_generate_if.rs"]
 mod const_fn_call_in_generate_if;
 
@@ -520,3 +531,92 @@ mod procedural_bitwise_sign_500;
 
 #[path = "types/arithmetic_shift_xz.rs"]
 mod arithmetic_shift_xz;
+
+#[path = "types/child_param_packed_elem_width.rs"]
+mod child_param_packed_elem_width;
+
+#[path = "types/unsigned_context_501.rs"]
+mod unsigned_context_501;
+
+#[path = "types/review_qualified_enum_casts.rs"]
+mod review_qualified_enum_casts;
+
+#[path = "types/review_exponent_width.rs"]
+mod review_exponent_width;
+
+#[path = "types/review_local_query_widths.rs"]
+mod review_local_query_widths;
+
+#[path = "types/review_nested_struct_params.rs"]
+mod review_nested_struct_params;
+
+#[path = "types/struct_param_override.rs"]
+mod struct_param_override;
+
+#[path = "types/const_fn_type_cast_localparam.rs"]
+mod const_fn_type_cast_localparam;
+#[path = "types/param_array_pattern_forms.rs"]
+mod param_array_pattern_forms;
+#[path = "types/tagged_union_whole_copy_keeps_tag.rs"]
+mod tagged_union_whole_copy_keeps_tag;
+#[path = "types/inlined_typedef_packed_array_dims.rs"]
+mod inlined_typedef_packed_array_dims;
+#[path = "types/struct_param_member_select_bounds.rs"]
+mod struct_param_member_select_bounds;
+#[path = "types/instance_local_typedef_struct_array.rs"]
+mod instance_local_typedef_struct_array;
+
+#[path = "types/scoped_typed_assignment_pattern.rs"]
+mod scoped_typed_assignment_pattern;
+
+#[path = "types/param_array_struct_default.rs"]
+mod param_array_struct_default;
+#[path = "types/wide_array_elem_x_index.rs"]
+mod wide_array_elem_x_index;
+#[path = "types/packed_elem_const_index_out_of_range.rs"]
+mod packed_elem_const_index_out_of_range;
+#[path = "types/fn_return_width_struct_param_member.rs"]
+mod fn_return_width_struct_param_member;
+#[path = "types/const_typedef_cast.rs"]
+mod const_typedef_cast;
+#[path = "types/const_bits_of_cast.rs"]
+mod const_bits_of_cast;
+#[path = "types/literal_whitespace_580.rs"]
+mod literal_whitespace_580;
+#[path = "types/const_bits_compound.rs"]
+mod const_bits_compound;
+#[path = "types/package_struct_array_index_584.rs"]
+mod package_struct_array_index_584;
+#[path = "types/review_nested_pattern_default.rs"]
+mod review_nested_pattern_default;
+#[path = "types/package_net_602.rs"]
+mod package_net_602;
+#[path = "types/package_net_kinds_610.rs"]
+mod package_net_kinds_610;
+#[path = "types/unit_wildcard_import_order_620.rs"]
+mod unit_wildcard_import_order_620;
+#[path = "types/nonzero_formal_bitselect_650.rs"]
+mod nonzero_formal_bitselect_650;
+
+#[path = "types/unpacked_array_parameter_reference.rs"]
+mod unpacked_array_parameter_reference;
+
+#[path = "types/array_parameter_imported_dimension.rs"]
+mod array_parameter_imported_dimension;
+
+#[path = "types/packed_package_parameter_element.rs"]
+mod packed_package_parameter_element;
+
+#[path = "types/module_struct_localparam_first_instance.rs"]
+mod module_struct_localparam_first_instance;
+
+#[path = "types/enum_scope_677.rs"]
+mod enum_scope_677;
+
+#[path = "types/typedef_overlay_674.rs"]
+mod typedef_overlay_674;
+
+#[path = "types/unit_subroutine_usage_675.rs"]
+mod unit_subroutine_usage_675;
+#[path = "types/body_typedef_first_instance_680.rs"]
+mod body_typedef_first_instance_680;

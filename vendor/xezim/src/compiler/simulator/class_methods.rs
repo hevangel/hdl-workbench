@@ -204,6 +204,7 @@ impl Simulator {
             let mut assoc_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
             let mut static_or_param: HashSet<String> = HashSet::default();
+            let mut constant_arrays: HashSet<String> = HashSet::default();
             let mut string_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 for (name, cm) in cd.methods.iter() {
@@ -237,12 +238,22 @@ impl Simulator {
                         }
                     }
                 }
+                constant_arrays.extend(cd.array_properties.keys().filter(|name| {
+                    cd.param_order.contains(*name)
+                        || (cd.properties.get(*name).is_some_and(|s| s.is_const)
+                            && !cd.property_order.contains(*name))
+                }).cloned());
+                constant_arrays.extend(cd.static_fixed_arrays.iter().map(|(name, ..)| name.clone()));
                 static_methods.extend(cd.static_methods.iter().cloned());
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
                 assoc_props.extend(cd.assoc_properties.keys().cloned());
                 static_or_param.extend(cd.static_properties.iter().cloned());
                 static_or_param.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
+                static_or_param.extend(cd.array_properties.keys().filter(|name| {
+                    cd.properties.get(*name).is_some_and(|s| s.is_const)
+                        && !cd.property_order.contains(*name)
+                }).cloned());
             }
             let mut subroutine_suffixes: HashSet<String> = HashSet::default();
             for k in self.module.functions.keys().chain(self.module.tasks.keys()) {
@@ -350,6 +361,7 @@ impl Simulator {
                 assoc_props,
                 string_props,
                 static_or_param,
+                constant_arrays,
             }
         })
     }
@@ -890,7 +902,7 @@ impl Simulator {
                 let class_ref = self.port_class_ref(port);
                 let dt = &port.data_type;
                 let fixed_width = (matches!(dt, DataType::IntegerAtom { .. })
-                    || Self::packed_dims_are_literal(dt))
+                    || Self::packed_dims_are_constant(dt))
                 .then(|| {
                     super::elaborate::resolve_type_width(
                         dt,
@@ -1198,6 +1210,38 @@ impl Simulator {
         props
     }
 
+    /// Whether `class_name` or an ancestor declares a property (of any
+    /// kind: scalar, queue, associative, static, ...) named `prop`.
+    ///
+    /// Scopes the flat, name-global `string_signals` set inside
+    /// `expr_is_string_valued`: a bare property reference in a class
+    /// method shadows same-named module-scope signals (§6.21), and the
+    /// flat set cannot distinguish specializations of a parameterized
+    /// class — a string-typed `T val` formal of `uvm_resource_db#(string)`
+    /// poisons the bare name for `uvm_resource#(<enum>)`'s `val` property,
+    /// which routed an enum `val == t` through the TEXT comparison and
+    /// made `X == 0` compare equal (skipping `uvm_resource#(T)::write`'s
+    /// `if (val == t) return;` early-out, so the stored value stayed X).
+    pub(super) fn class_declares_property(&self, class_name: &str, prop: &str) -> bool {
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.assoc_properties.contains_key(prop)
+                || cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.static_properties.contains(prop)
+            {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -1206,6 +1250,11 @@ impl Simulator {
         args: &[Expression],
     ) -> Value {
         use crate::ast::decl::ClassMethodKind;
+        if method_name == "new"
+            && let Some(value) = self.try_implicit_class_constructor(handle, start_class, args)
+        {
+            return value;
+        }
         // Re-entrant registration guard: a factory `register(obj)` whose
         // body calls `obj.get_type_name()` can trigger a parameterized class
         // specialization's lazy static init, which re-enters
@@ -1593,6 +1642,11 @@ impl Simulator {
                             || self.module.arrays_2d.contains_key(&port.name.name)
                             || self.module.arrays_nd.contains_key(&port.name.name);
                         if let Some(info) = self.bind_array_arg(port, actual) {
+                            // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                            locals.insert(
+                                format!("\u{1}array_formal:{}", port.name.name),
+                                Value::zero(1),
+                            );
                             if matches!(
                                 port.direction,
                                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
@@ -1608,8 +1662,26 @@ impl Simulator {
                             continue;
                         }
                     }
-                    let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                    // §11.6.1/§11.8.2: a call ACTUAL is CONTEXT-DETERMINED by
+                    // the callee's declared formal, exactly like the operand of
+                    // a comparison (see `actual_ctx_shape`). Gated to the shape
+                    // `resize_for_assign` already understands, and the width is
+                    // read from the cached plan rather than recomputed.
+                    let actual_ctx = if arg_supplied(i) && Self::actual_ctx_shape(port) {
+                        plan.ports[i].fixed_width.filter(|w| *w > 0)
+                    } else {
+                        None
+                    };
+                    // Class methods have automatic lifetime. An output handle
+                    // starts null on every call; it never copies in the caller's
+                    // previous object (including when the actual is a default).
+                    let mut val = if plain_class && port.direction == PortDirection::Output {
+                        Value::zero(32)
+                    } else if arg_supplied(i) {
+                        let value = match actual_ctx {
+                            Some(w) => self.eval_expr_ctx(&args[i], w),
+                            None => self.eval_expr(&args[i]),
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's
@@ -1631,7 +1703,7 @@ impl Simulator {
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
                         self.push_local_frame_typed(locals.clone(), frame_types.clone());
-                        let v = self.eval_expr(def);
+                        let v = self.eval_formal_default(port, def);
                         let v = self.vif_argument_value(port, def, v);
                         self.pop_local_frame();
                         self.class_context_stack.pop();
@@ -2041,6 +2113,24 @@ impl Simulator {
                 // run against a partially-constructed object.
                 if method_name == "new" {
                     self.ctor_class_stack.push((handle, cname.clone()));
+                    if self
+                        .pending_class_initializers
+                        .get(&handle)
+                        .is_some_and(|classes| {
+                            classes.iter().any(|cd| {
+                                cd.name == *cname
+                                    || self
+                                        .module
+                                        .classes
+                                        .get(cname.as_str())
+                                        .is_some_and(|target| std::sync::Arc::ptr_eq(target, cd))
+                            })
+                        })
+                        && !self.constructor_calls_super_new(cname)
+                    {
+                        self.initialize_implicit_constructor_base(handle, cname);
+                        self.initialize_pending_class_properties(handle, cname);
+                    }
                 }
                 // A function returning a bare type-parameter name: the
                 // width and signedness of the type bound on this object, for
@@ -2107,6 +2197,54 @@ impl Simulator {
                     _ => false,
                 };
                 self.fn_ret_collection_stack.push(method_ret_collection);
+                // §13.4/§7.9.9: and whether it returns an ASSOCIATIVE array,
+                // so `return w;` snapshots the local before the frame is
+                // torn down (as for a free function); the caller read an
+                // empty array.
+                let method_ret_assoc = match &method.kind {
+                    ClassMethodKind::Function(f) => matches!(
+                        self.fn_ret_coll_dims(&f.return_type)
+                            .as_ref()
+                            .and_then(|d| d.first()),
+                        Some(crate::ast::types::UnpackedDimension::Associative { .. })
+                    ),
+                    _ => false,
+                };
+                self.fn_ret_assoc_stack.push(method_ret_assoc);
+                // §13.4.1: a method returning a queue, dynamic or associative
+                // array has a return VARIABLE of that type, which the body may
+                // fill in place (`build[k] = v`); declare it as a collection
+                // local, as for a free function.
+                let method_ret_coll: Option<crate::ast::decl::FunctionDeclaration> =
+                    match &method.kind {
+                        ClassMethodKind::Function(f)
+                            if fn_ret_name.is_some()
+                                && self.fn_ret_coll_dims(&f.return_type).is_some() =>
+                        {
+                            Some(f.clone())
+                        }
+                        _ => None,
+                    };
+                if let (Some(f), Some(rn)) = (&method_ret_coll, fn_ret_name) {
+                    if let Some(frame) = self.local_stack.last_mut() {
+                        frame.remove(rn);
+                    }
+                    self.widths.remove(rn);
+                    let decl = Statement::new(
+                        StatementKind::VarDecl {
+                            data_type: f.return_type.clone(),
+                            lifetime: None,
+                            declarators: vec![crate::ast::stmt::VarDeclarator {
+                                name: f.name.name.clone(),
+                                dimensions: Vec::new(),
+                                init: None,
+                                span: f.span,
+                            }],
+                        },
+                        f.span,
+                    );
+                    self.exec_statement(&decl);
+                }
                 // §6.21: open a static-local sync frame so a `static`
                 // local declared in the method body persists across calls.
                 // (Class methods previously never opened one — only free
@@ -2273,6 +2411,7 @@ impl Simulator {
                 // the locals frame is dropped.
                 self.sync_static_locals();
                 self.fn_ret_collection_stack.pop();
+                self.fn_ret_assoc_stack.pop();
                 // Declaration snapshots describe this activation's string
                 // flags. Restore them before reinstating the caller's flags
                 // (§6.21/§23.8), or an integral shadow can erase the caller's
@@ -2323,6 +2462,12 @@ impl Simulator {
                 }
                 if method_name == "new" {
                     self.ctor_class_stack.pop();
+                    if let Some((caller_handle, caller_class)) =
+                        self.ctor_class_stack.last().cloned()
+                        && caller_handle == handle
+                    {
+                        self.initialize_pending_class_properties(handle, &caller_class);
+                    }
                 }
                 self.m_scope_stack = saved_m_scope;
                 self.class_context_stack.pop();
@@ -2345,6 +2490,29 @@ impl Simulator {
                         if let Some(v) = self.pack_unpacked_struct(rn, &su.clone()) {
                             self.return_value = Some(v);
                         }
+                    }
+                }
+                // Falling off the end of a collection-returning method hands
+                // its return variable over as `return f;` does.
+                if let (Some(_), Some(rn)) = (&method_ret_coll, fn_ret_name)
+                    && self.return_value.is_none()
+                {
+                    let n = self
+                        .dyn_name_lookup(rn)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| rn.to_string());
+                    if self.is_associative_array(&n) {
+                        self.snapshot_ret_assoc(&n);
+                        self.return_value = Some(Value::zero(32));
+                    } else if self.module.dynamic_arrays.contains(&n) {
+                        if self.queue_elem_struct(&n).is_none() {
+                            const RET_SNAP: &str = "__xz_ret_coll__";
+                            self.copy_whole_queue(RET_SNAP, &n);
+                            self.pending_ret_collection = Some(RET_SNAP.to_string());
+                        } else {
+                            self.pending_ret_collection = Some(n);
+                        }
+                        self.return_value = Some(Value::zero(32));
                     }
                 }
                 let implicit = fn_ret_name.and_then(|rn| {

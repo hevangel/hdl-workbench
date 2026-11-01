@@ -1481,9 +1481,15 @@ impl Simulator {
                             dyn_kind = 1;
                         }
                     }
+                    // A dynamic-offset load (`addr_i[i]` under a loop, the
+                    // fused peephole form) reads SOME slice of `s`: arm on the
+                    // whole signal. Left out, a flop whose only changing input
+                    // came in this way was never re-armed and skipped edges
+                    // (CVA6's SRAM model never latched a new read address).
                     Insn::LoadSignal(_, s)
                     | Insn::LoadSignalSigned(_, s)
                     | Insn::LoadSignalBit(_, s, _)
+                    | Insn::LoadSignalRangeDyn(_, s, _, _)
                     | Insn::BranchIfSignalFalse(s, _, _) => {
                         let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
                         if seen.insert((*s as u32, 0, w)) {

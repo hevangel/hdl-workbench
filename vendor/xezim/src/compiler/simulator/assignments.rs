@@ -85,6 +85,54 @@ impl Simulator {
         Some(out)
     }
 
+    pub(super) fn resolve_type_width_in_process_scope(
+        &mut self,
+        dt: &crate::ast::types::DataType,
+    ) -> u32 {
+        use crate::compiler::scoped_arrays;
+        let mut view = HashMap::default();
+        for arg in scoped_arrays::query_operands(dt) {
+            let Some(name) = scoped_arrays::operand_name(arg) else {
+                continue;
+            };
+            let lexical = self.dyn_name_lookup(&name).map(str::to_string);
+            let scope = self
+                .name_resolve_hint
+                .borrow()
+                .clone()
+                .or_else(|| self.process_scope_hint.get(&self.current_pid).cloned());
+            let canonical = lexical
+                .or_else(|| {
+                    scope.as_ref().and_then(|scope| {
+                        let key = format!("{scope}.{name}");
+                        self.module.arrays.contains_key(&key).then_some(key)
+                    })
+                })
+                .or_else(|| self.array_operand_name(arg))
+                .or_else(|| self.module.arrays.contains_key(&name).then(|| name.clone()))
+                .or_else(|| {
+                    let key = name.replace('.', "::");
+                    self.module.arrays.contains_key(&key).then_some(key)
+                });
+            if let Some((key, shape)) = canonical.and_then(|key| {
+                self.module
+                    .arrays
+                    .get(&key)
+                    .copied()
+                    .map(|shape| (key, shape))
+            }) {
+                view.insert(name, shape);
+                view.insert(key, shape);
+            }
+        }
+        scoped_arrays::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            &view,
+        )
+    }
+
     /// `format!("{}{}", base, suffix)` without the formatting machinery.
     pub(super) fn name_with_suffix(base: &str, suffix: &str) -> String {
         let mut out = String::with_capacity(base.len() + suffix.len());
@@ -953,27 +1001,79 @@ impl Simulator {
     /// field and corrupts the packed value. Here each item is resized to its
     /// own member width and dropped at its absolute bit offset instead; nested
     /// patterns on sub-struct members recurse. Returns false (caller falls back
-    /// to the generic path) when the lvalue is not a registered packed struct.
+    /// to the generic path) when the lvalue is neither a registered packed
+    /// struct, a packed-struct class property (`obj.prop`, `this.prop`, or a
+    /// bare property inside a method), nor a packed-struct element of a fixed
+    /// array resolved through its declared type.
     pub(super) fn try_assign_packed_struct_pattern(
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> bool {
-        let Some((obj_name, prefix, layout, _base_off, _w)) =
+        if let Some((obj_name, prefix, layout, _base_off, _w)) =
             self.resolve_packed_struct_target(lvalue, items)
-        else {
-            return false;
-        };
-        // Write straight into the whole base value at absolute offsets, so a
-        // member assign leaves its sibling members untouched.
-        let Some(mut acc) = self.get_local_or_signal(&obj_name) else {
-            return false;
-        };
-        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items) {
+        {
+            // Write straight into the whole base value at absolute offsets, so a
+            // member assign leaves its sibling members untouched.
+            if let Some(mut acc) = self.get_local_or_signal(&obj_name)
+                && self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, 0, items)
+            {
+                self.set_local_or_signal(&obj_name, acc);
+                return true;
+            }
+        }
+        // Class-property destination (`obj.prop = '{...}`, `this.prop`, or a
+        // bare `prop` inside a method): the storage is the heap object's
+        // `properties` cell, which the registered-signal path above cannot
+        // see (`packed_struct_fields` has no entry for a dotted class
+        // property). Lay the pattern out at the property's declared member
+        // offsets so later member reads — which use those offsets — agree.
+        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+            let mut acc = Value::zero(total);
+            if let Some(seed) = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&prop))
+            {
+                for b in 0..total {
+                    acc.set_bit(b as usize, seed.get_bit(b as usize));
+                }
+            }
+            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                // `set_prop_if_changed` reports whether the VALUE changed, not
+                // whether the assignment was handled — a pattern equal to the
+                // current contents (e.g. re-assigning the same literal) must
+                // still count as handled, or the caller falls back to the
+                // generic path and clobbers the correctly-laid-out value.
+                self.set_prop_if_changed(handle, &prop, acc);
+                return true;
+            }
             return false;
         }
-        self.set_local_or_signal(&obj_name, acc);
-        true
+        // Declared-type destination the registered-signal table cannot name:
+        // a whole packed-struct element of a fixed array on an instance
+        // (`u_ctrl.cfg_arr[2] = '{...}`, packed or unpacked). Resolve through
+        // the read-side `declared_packed_access` so the write lands at the
+        // same bit offsets the reads use.
+        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        {
+            if let Some(mut base_val) = self.get_local_or_signal(&storage) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                    for b in 0..width {
+                        base_val.set_bit((off + b) as usize, acc.get_bit(b as usize));
+                    }
+                    self.set_local_or_signal(&storage, base_val);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Evaluate a named/ordered/default assignment pattern targeting a PACKED
@@ -981,26 +1081,254 @@ impl Simulator {
     /// own width (0-based within the target field). For NBA / continuous
     /// assigns, whose scheduling drives the resolved (possibly sub-member)
     /// target — driving the whole base signal instead would clobber sibling
-    /// members updated in the same step. Returns None when the lvalue is not a
-    /// registered packed struct.
+    /// members updated in the same step. Returns None when the lvalue is not
+    /// a registered packed struct, a packed-struct class property, or a
+    /// packed-struct element of a fixed array.
     pub(super) fn eval_packed_struct_pattern(
         &mut self,
         lvalue: &Expression,
         items: &[AssignmentPatternItem],
     ) -> Option<Value> {
-        let (obj_name, prefix, layout, base_off, width) =
-            self.resolve_packed_struct_target(lvalue, items)?;
-        // Seed from the current field value so members the pattern omits keep
-        // their prior contents.
-        let base_val = self.get_local_or_signal(&obj_name)?;
-        let mut acc = Value::zero(width);
-        for b in 0..width {
-            acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
+        if let Some((obj_name, prefix, layout, base_off, width)) =
+            self.resolve_packed_struct_target(lvalue, items)
+        {
+            // Seed from the current field value so members the pattern omits keep
+            // their prior contents.
+            if let Some(base_val) = self.get_local_or_signal(&obj_name) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((base_off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+                    return Some(acc);
+                }
+            }
         }
-        if !self.apply_packed_struct_pattern(&mut acc, &layout, &prefix, base_off, items) {
+        // Class-property destination: evaluate at the property's declared
+        // layout, seeded from the current property value. The scheduled
+        // store (NBA / settling) then writes this value through the normal
+        // class-property path.
+        if let Some((handle, prop, layout)) = self.class_prop_pattern_target(lvalue, items) {
+            let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+            let mut acc = Value::zero(total);
+            if let Some(seed) = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(&prop))
+            {
+                for b in 0..total {
+                    acc.set_bit(b as usize, seed.get_bit(b as usize));
+                }
+            }
+            if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                return Some(acc);
+            }
             return None;
         }
-        Some(acc)
+        // Declared-type destination (a fixed-array struct element on an
+        // instance): evaluate at the element's own layout, 0-based within
+        // the element — the scheduled store places the value.
+        if let Some((storage, off, width, layout)) = self.declared_elem_pattern_target(lvalue, items)
+        {
+            if let Some(base_val) = self.get_local_or_signal(&storage) {
+                let mut acc = Value::zero(width);
+                for b in 0..width {
+                    acc.set_bit(b as usize, base_val.get_bit((off + b) as usize));
+                }
+                if self.apply_packed_struct_pattern(&mut acc, &layout, "", 0, items) {
+                    return Some(acc);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a class-property destination for a packed-struct assignment
+    /// pattern: `obj.prop = '{...}` (a handle-valued name), `this.prop` /
+    /// `super.prop`, or a bare `prop` inside a method. Returns the heap
+    /// handle, the property's storage key, and the property's declared
+    /// packed-struct member layout. The registered-signal path cannot see
+    /// these destinations: their storage is the heap object's `properties`
+    /// cell, not a signal, and `packed_struct_fields` has no entry for a
+    /// dotted class-property name.
+    fn class_prop_pattern_target(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<(usize, String, Vec<(String, u32, u32)>)> {
+        // §8.14/§8.15: `super.p`, and `h.p` / `this.p` naming a property a
+        // derived class redeclares, select a base class's cell; take the
+        // spelling `assign_value` writes, never the leaf's `p`.
+        if let Some(rw) = self
+            .super_rewrite(lvalue)
+            .or_else(|| self.shadowed_member_rewrite(lvalue))
+        {
+            return self.class_prop_pattern_target(&rw, items);
+        }
+        // Keyed/Typed items denote associative or type-keyed aggregates, not
+        // a by-member struct pack — leave those to the existing paths.
+        if items.iter().any(|it| {
+            matches!(
+                it,
+                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
+            )
+        }) {
+            return None;
+        }
+        let cand: Option<(usize, String)> = match &lvalue.kind {
+            // `obj.prop` as a dotted identifier.
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                // `this.prop` / `super.prop` fold into a dotted identifier
+                // whose head is the keyword, not a handle variable: the head
+                // cannot be evaluated by name, so resolve it through
+                // this_stack (the object `super` denotes here as well).
+                if hier.path[0].name.name.as_str() == "this"
+                    || hier.path[0].name.name.as_str() == "super"
+                {
+                    self.this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .map(|hd| (hd, hier.path[1].name.name.clone()))
+                } else {
+                    let head = hier_prefix(hier);
+                    if !self.head_denotes_class_object(&head) {
+                        return None;
+                    }
+                    let handle = self
+                        .eval_expr(&Expression::new(ExprKind::Ident(head), lvalue.span))
+                        .to_u64()? as usize;
+                    Some((handle, hier.path[1].name.name.clone()))
+                }
+            }
+            // `recv.prop` where `recv` is a bare handle name or `this`/`super`.
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                // `this.prop` with the keyword as its own expression form.
+                ExprKind::This => self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .map(|hd| (hd, member.name.clone())),
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    let name = h.path[0].name.name.as_str();
+                    if name == "this" || name == "super" {
+                        self.this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .map(|hd| (hd, member.name.clone()))
+                    } else {
+                        // Only a genuine class channel: a plain integral
+                        // value must not be misread as a heap handle.
+                        if !self.bare_name_is_class_channel(name) {
+                            return None;
+                        }
+                        self.eval_ident_handle(name).map(|hd| (hd, member.name.clone()))
+                    }
+                }
+                _ => None,
+            },
+            // Bare `prop` inside a method: the current `this` object. A
+            // shadowing local/argument was already served by the
+            // registered-signal path above; only a real property remains.
+            ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
+                let handle = self.this_stack.last().copied().flatten()?;
+                let name = hier.path[0].name.name.clone();
+                let key = self.shadowed_prop_key(&name, false).unwrap_or(name);
+                if !self
+                    .heap
+                    .get(handle)?
+                    .as_ref()?
+                    .properties
+                    .contains_key(&key)
+                {
+                    return None;
+                }
+                Some((handle, key))
+            }
+            _ => None,
+        };
+        let (handle, prop) = cand?;
+        // A live object holding this property, whose declared type is a
+        // packed struct.
+        if !self
+            .heap
+            .get(handle)?
+            .as_ref()?
+            .properties
+            .contains_key(&prop)
+        {
+            return None;
+        }
+        let su = self.class_prop_struct(handle, &prop)?;
+        if !su.packed {
+            return None;
+        }
+        let layout = super::elaborate::packed_struct_field_layout(
+            &DataType::Struct(su),
+            &self.module.parameters,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        )?;
+        Some((handle, prop, layout))
+    }
+
+    /// Resolve a declared-type destination for a packed-struct assignment
+    /// pattern that the registered-signal table cannot name: a whole
+    /// packed-struct element of a FIXED array (`u_ctrl.cfg_arr[2] = '{...}`,
+    /// packed or unpacked). Uses the read-side resolver
+    /// (`declared_packed_access`) so the write lands at the same bit offsets
+    /// the reads use. Returns the storage signal, the element's bit offset
+    /// and width within it, and the element type's member layout.
+    fn declared_elem_pattern_target(
+        &mut self,
+        lvalue: &Expression,
+        items: &[AssignmentPatternItem],
+    ) -> Option<(String, u32, u32, Vec<(String, u32, u32)>)> {
+        if items.iter().any(|it| {
+            matches!(
+                it,
+                AssignmentPatternItem::Keyed(..) | AssignmentPatternItem::Typed(..)
+            )
+        }) {
+            return None;
+        }
+        let access = self.declared_packed_access(lvalue)?;
+        // A whole packed struct: no remaining packed dimensions, and not an
+        // element still inside an unpacked dimension run.
+        if access.unpacked != 0 || !access.dimensions.is_empty() {
+            return None;
+        }
+        // Queue / dynamic / associative element writes maintain sizes and
+        // have their own pattern paths — do not bypass them here.
+        let base = match access.storage.rfind('[') {
+            Some(i) => access.storage[..i].to_string(),
+            None => access.storage.clone(),
+        };
+        if self.module.queue_vars.contains(&base)
+            || self.module.dynamic_arrays.contains(&base)
+            || self.module.associative_arrays.contains_key(&base)
+        {
+            return None;
+        }
+        if !matches!(&access.element_type, DataType::Struct(su) if su.packed) {
+            return None;
+        }
+        let layout = super::elaborate::packed_struct_field_layout(
+            &access.element_type,
+            &self.module.parameters,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        )?;
+        let total = layout.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+        if total == 0 || total != access.width {
+            return None;
+        }
+        Some((access.storage, access.offset, access.width, layout))
     }
 
     /// Write each member of a packed-struct assignment pattern into `acc` at
@@ -1056,11 +1384,27 @@ impl Simulator {
         }
 
         for (i, (full, leaf, off, w)) in children.iter().enumerate() {
-            let expr = named
+            let keyed = named
                 .get(leaf.as_str())
                 .copied()
-                .or_else(|| ordered.get(i).copied())
-                .or(default);
+                .or_else(|| ordered.get(i).copied());
+            // §10.9.2: `default:` reaches into a nested struct member and
+            // fills each of its members (`'{trans_id: id, default: 1}` sets
+            // `exception.cause` and `exception.valid` to 1);
+            // the whole member took the value, so only its LSB was set.
+            if keyed.is_none()
+                && let Some(d) = default
+                && !matches!(d.kind, ExprKind::AssignmentPattern(_))
+                && layout
+                    .iter()
+                    .any(|(k, _, _)| k.len() > full.len() + 1 && k.starts_with(&format!("{full}.")))
+            {
+                let sub = [AssignmentPatternItem::Default(d.clone())];
+                if self.apply_packed_struct_pattern(acc, layout, full, base_offset, &sub) {
+                    continue;
+                }
+            }
+            let expr = keyed.or(default);
             let Some(e) = expr else { continue };
             // A nested pattern on a sub-struct member recurses so each of ITS
             // members lands at the right offset too.
@@ -1907,6 +2251,21 @@ impl Simulator {
         if !self.string_char_receiver_is_scalar(expr) {
             return None;
         }
+        // §7.8: a row of an associative array of collections
+        // (`string m[int][string]`, `m[3]["x"] = "hi"`) is itself a
+        // collection; `[k]` selects its element. Taken for a character
+        // index, the write was dropped.
+        if let ExprKind::Index { expr: arr, .. } = &expr.kind
+            && let ExprKind::Ident(h) = &arr.kind
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+        {
+            let name = self.resolve_hier_name(h).into_owned();
+            let name = self.instance_assoc_member(&name).unwrap_or(name);
+            if self.is_associative_array(&name) && self.assoc_has_coll_elems(&name) {
+                return None;
+            }
+        }
         let mut b = self.eval_expr(expr).sv_string_bytes();
         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
         let cbyte = (val.resize(8).to_u64().unwrap_or(0) & 0xFF) as u8;
@@ -1917,6 +2276,213 @@ impl Simulator {
             return Some(self.assign_value(expr, &Self::sv_string_from_bytes(&b)));
         }
         Some(false)
+    }
+
+    /// Whether the associative array stored at `name` has collections for
+    /// elements: a module-scope or block-local declaration recorded by core,
+    /// or an object's member (`<h>#m`) whose class records it.
+    fn assoc_has_coll_elems(&self, name: &str) -> bool {
+        if self.module.assoc_coll_elems.contains(name) {
+            return true;
+        }
+        if let Some((h, prop)) = name.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+            && let Some(cd) = self.class_prop_declarer(handle, prop)
+        {
+            return cd.assoc_coll_properties.contains(prop);
+        }
+        false
+    }
+
+    /// §7.8.6/§11.5.1: a bit write into an associative element whose
+    /// element type is integral (`m[k][3] = 1`, `sb["k"][2] = 1`), absent or
+    /// not: read it (an absent one as the element type's default), set the
+    /// bit and write it back. An absent element was created with the bit
+    /// dropped, and a present one's bit went under a bogus `m[k][3]` key.
+    /// None when `expr` is not such an element.
+    /// §7.8/§7.10: a write into a row of an associative array of
+    /// collections (`aq[6][0] = 9` on `int aq[int][$]`) whose row does not
+    /// exist yet creates the row as the collection its declaration names,
+    /// as `push_back` does, so the element is stored in that row (the write
+    /// left a bare `aq[6][0]` cell no queue read, `%p` or `foreach` saw).
+    /// Every level of the key chain is created in turn: `a["p"][7]["q"] = 9`
+    /// on `byte a[string][int][string]` makes the rows `a["p"]` and
+    /// `a["p"][7]`, each keyed by its own declared key type.
+    /// Returns the innermost row when it is a QUEUE, for the append rule.
+    fn ensure_assoc_row(&mut self, row_expr: &Expression) -> Option<String> {
+        use crate::ast::types::UnpackedDimension as UD;
+        // The key selects, outermost first, down to the array's name.
+        let mut keys: Vec<&Expression> = Vec::new();
+        let mut cur = row_expr;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            keys.push(index);
+            cur = expr;
+        }
+        keys.reverse();
+        if keys.is_empty() {
+            return None;
+        }
+        let Some((name, dims)) = self.assoc_row_owner(cur) else {
+            return None;
+        };
+        if !self.is_associative_array(&name) || keys.len() > dims.len() {
+            return None;
+        }
+        let w = self.assoc_elem_width(&name).unwrap_or(32);
+        let depth = keys.len();
+        let mut parent = name;
+        for (level, key) in keys.into_iter().enumerate() {
+            // Only an associative parent is keyed by value here; a row
+            // below a queue or fixed dimension has its own paths.
+            if !self.is_associative_array(&parent) {
+                return None;
+            }
+            let kv = self.eval_expr(key);
+            if kv.has_xz() && !kv.is_real && !self.is_string_keyed_array(&parent) {
+                return None;
+            }
+            let row = format!("{}[{}]", parent, self.assoc_key_str(&parent, &kv));
+            let exists = self.module.dynamic_arrays.contains(&row)
+                || self.module.associative_arrays.contains_key(&row)
+                || self
+                    .get_signal_value_by_name(&Self::name_with_suffix(&row, ".size"))
+                    .is_some();
+            if !exists {
+                match &dims[level] {
+                    UD::Queue { .. } | UD::Unsized(_) => {
+                        self.module.dynamic_arrays.insert(row.clone());
+                        self.module.arrays.entry(row.clone()).or_insert((0, 63, w));
+                        self.set_queue_size(&row, 0);
+                    }
+                    UD::Associative { data_type, .. } => {
+                        let is_str = data_type.as_ref().is_some_and(|dt| {
+                            matches!(
+                                dt.as_ref(),
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            )
+                        });
+                        self.module.associative_arrays.insert(row.clone(), is_str);
+                    }
+                    _ => return None,
+                }
+            }
+            parent = row;
+        }
+        matches!(dims.get(depth - 1), Some(UD::Queue { .. })).then_some(parent)
+    }
+
+    /// The store of an associative array of collections named by `base`
+    /// and its row dimensions: a module-scope or block-local array
+    /// (`assoc_row_dims`), or an object's member (`this.m`, `h.m`, a bare `m`
+    /// in a method) whose class records them (`assoc_row_property_dims`).
+    fn assoc_row_owner(
+        &mut self,
+        base: &Expression,
+    ) -> Option<(String, Vec<crate::ast::types::UnpackedDimension>)> {
+        if let ExprKind::Ident(hier) = &base.kind
+            && hier.path.len() == 1
+            && hier.path[0].selects.is_empty()
+        {
+            let name = self.resolve_hier_name(hier).into_owned();
+            if let Some(d) = self
+                .module
+                .assoc_row_dims
+                .get(&name)
+                .or_else(|| self.module.assoc_row_dims.get(&hier.path[0].name.name))
+            {
+                return Some((name, d.clone()));
+            }
+            if self.no_class_objects() {
+                return None;
+            }
+            let store = self.instance_assoc_member(&name)?;
+            return self.class_assoc_row_dims(&store).map(|d| (store, d));
+        }
+        if self.no_class_objects() {
+            return None;
+        }
+        let store = self.expr_assoc_name(base)?;
+        self.class_assoc_row_dims(&store).map(|d| (store, d))
+    }
+
+    /// `assoc_row_property_dims` of the member stored at `<handle>#prop`.
+    fn class_assoc_row_dims(
+        &self,
+        store: &str,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
+        let (h, prop) = store.split_once('#')?;
+        let handle = h.parse::<usize>().ok()?;
+        self.class_prop_declarer(handle, prop)?
+            .assoc_row_property_dims
+            .get(prop)
+            .cloned()
+    }
+
+    fn assoc_elem_bit_write(
+        &mut self,
+        expr: &Expression,
+        index: &Expression,
+        val: &Value,
+    ) -> Option<bool> {
+        let ExprKind::Index {
+            expr: inner_expr,
+            index: inner_idx,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        let ExprKind::Ident(hier) = &inner_expr.kind else {
+            return None;
+        };
+        let name = self.resolve_hier_name(hier).into_owned();
+        let name = self.instance_assoc_member(&name).unwrap_or(name);
+        if !self.is_associative_array(&name) || self.assoc_has_coll_elems(&name) {
+            return None;
+        }
+        let default = self.assoc_missing_elem_value(&name)?;
+        let kv = self.eval_expr(inner_idx);
+        if kv.has_xz() && !kv.is_real && !self.is_string_keyed_array(&name) {
+            self.warn_invalid_assoc_index(&name);
+            return Some(false);
+        }
+        let bv = self.eval_expr(index);
+        let Some(b) = bv.to_i64().filter(|_| !bv.has_xz()) else {
+            return Some(false);
+        };
+        let key = self.assoc_key_str(&name, &kv);
+        let elem = format!("{}[{}]", name, key);
+        // A row that is itself a collection (`aq[k]` of `int aq[int][$]`):
+        // `[j]` selects its element, which the collection paths handle.
+        if self.is_associative_array(&elem)
+            || self.module.dynamic_arrays.contains(&elem)
+            || self
+                .signals
+                .contains_key(&Self::name_with_suffix(&elem, ".size"))
+        {
+            return None;
+        }
+        let fresh = !self.signals.contains_key(&elem);
+        let mut cur = self.get_signal_value_by_name(&elem).unwrap_or(default);
+        let phys = match self.select_base_elem_dim(expr) {
+            Some((dl, dr)) if dl < dr => dr - b,
+            Some((dl, dr)) => b - dl.min(dr),
+            None => b,
+        };
+        if phys < 0 || phys as u32 >= cur.width {
+            return Some(false);
+        }
+        let nb = val.get_bit(0);
+        let changed = cur.get_bit(phys as usize) != nb;
+        cur.set_bit(phys as usize, nb);
+        if changed || fresh {
+            self.set_signal_value_by_name(&elem, cur);
+            self.mark_dirty(&elem);
+            self.touch_queue(&name);
+        }
+        Some(changed)
     }
 
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
@@ -1931,6 +2497,51 @@ impl Simulator {
     ) -> bool {
         if let Some(r) = self.try_string_index_char_write(expr, index, val) {
             return r;
+        }
+        if let Some(r) = self.assoc_elem_bit_write(expr, index, val) {
+            return r;
+        }
+        if self.has_assoc_rows
+            && let Some(row) = self.ensure_assoc_row(expr)
+        {
+            // §7.10.1: a write at index == size APPENDS to a queue row
+            // (`q["x"][5][0] = 7` on an empty row makes it '{7}).
+            let iv = self.eval_expr(index);
+            let sz = self.get_queue_size(&row);
+            if !iv.has_xz() && iv.to_u64() == Some(sz) {
+                self.set_queue_size(&row, sz + 1);
+            }
+        }
+        // §11.5.1: a hierarchical class property's selected element lives
+        // in the heap/shared static cell, rather than a synthesized signal.
+        if let ExprKind::Ident(hier) = &expr.kind
+            && let Some(h) = self.hier_parent_handle(hier)
+        {
+            let prop = &hier.path.last().unwrap().name.name;
+            let cur = self
+                .static_read_via_handle(h, None, None, prop)
+                .or_else(|| self.read_member_value(h, prop));
+            if let Some(mut cur) = cur {
+                let idx = self.eval_expr(index);
+                if idx.has_xz() {
+                    return false;
+                }
+                let range = if let Some(dims) = self.class_prop_packed_dims(h, prop) {
+                    Self::packed_chain_slice(cur.width as u64, &dims, &[idx])
+                } else {
+                    idx.to_i64()
+                        .filter(|&i| i >= 0 && i < cur.width as i64)
+                        .map(|i| (i as u64, 1))
+                };
+                let Some((lo, width)) = range else {
+                    return false;
+                };
+                let rhs = val.resize_for_assign(width as u32);
+                for bit in 0..width as usize {
+                    cur.set_bit(lo as usize + bit, rhs.get_bit(bit));
+                }
+                return self.set_prop_if_changed(h, prop, cur);
+            }
         }
         // §7.4.1 / §11.5.1: BIT write into an ELEMENT of an unpacked
         // array/queue/assoc whose declared packed range needs label
@@ -2135,9 +2746,15 @@ impl Simulator {
                     self.set_queue_size(&row, k as u64 + 1);
                 }
                 let elem = format!("{}[{}]", row, k);
+                // §10.6/§5.7.1: the element takes the row's element width
+                // (a `'1` fill fills every bit of a struct element).
+                let val = match self.module.arrays.get(&row) {
+                    Some(&(_, _, w)) if w != val.width || val.is_fill => val.resize_for_assign(w),
+                    _ => val.clone(),
+                };
                 let prev = self.get_signal_value_by_name(&elem);
-                let changed = prev.as_ref() != Some(val);
-                self.set_signal_value_by_name(&elem, val.clone());
+                let changed = prev.as_ref() != Some(&val);
+                self.set_signal_value_by_name(&elem, val);
                 return changed;
             }
             if self.is_associative_array(&row) {
@@ -2233,12 +2850,25 @@ impl Simulator {
                     })
                 })
             };
+            // §8.3 / §23.9: inside a method, a BARE array name that the
+            // object (or its class's static store) declares is the
+            // member — a same-named module-level array's elements, found
+            // in the signal table first, took `a[i] = v` from a method's
+            // `foreach (a[i])` and the object's `a` stayed 0 (sibling of
+            // #519 / #534: the name-keyed store must not outrank the
+            // member lift that the read side and `expr_assoc_name` use).
+            let member_shadows = |sim: &Self, b: &str| -> bool {
+                !b.contains('.')
+                    && matches!(sim.this_stack.last(), Some(Some(_)))
+                    && sim.instance_assoc_member(b).is_some()
+            };
             if let Some(base) = base.filter(|b| !base_is_packed_member(self, b)) {
                 // An ASSOCIATIVE member (`s.aa["k"] = v`) is keyed, not
                 // indexed: the keyed write below formats its key (§7.8).
                 if !self.signal_name_to_id.contains_key(base.as_ref())
                     && !self.signals.contains_key(&*base)
                     && !self.module.associative_arrays.contains_key(base.as_ref())
+                    && !member_shadows(self, &base)
                 {
                     let i = self.eval_expr(index).to_i64().unwrap_or(0);
                     // §7.4.1: a bit-select into a FRAME-local unpacked-struct
@@ -2387,7 +3017,23 @@ impl Simulator {
         }
         // Class associative-array member element write — base may be
         // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
-        if let Some(an) = self.expr_assoc_name(expr) {
+        // Not a BIT of an associative element whose element is a plain
+        // integral (`m[k][3] = 1`): that is no collection, and storing the
+        // value under `m[k][3]` dropped the bit (§11.5.1).
+        let elem_bit = |me: &mut Self| -> bool {
+            let ExprKind::Index { expr: b, .. } = &expr.kind else {
+                return false;
+            };
+            let ExprKind::Ident(h) = &b.kind else {
+                return false;
+            };
+            let n = me.resolve_hier_name(h).into_owned();
+            let n = me.instance_assoc_member(&n).unwrap_or(n);
+            me.is_associative_array(&n)
+                && !me.assoc_has_coll_elems(&n)
+                && me.assoc_missing_elem_value(&n).is_some()
+        };
+        if let Some(an) = self.expr_assoc_name(expr).filter(|_| !elem_bit(self)) {
             let idx_val = self.eval_expr(index);
             let idx_str = self.assoc_key_str(&an, &idx_val);
             let elem_name = Self::name_with_key(&an, &idx_str);
@@ -2449,8 +3095,23 @@ impl Simulator {
                 let mut base_name = self.resolve_hier_name(hier);
                 // Bare class-member N-D array inside a method:
                 // resolve to its per-instance `<handle>#<member>`.
-                if !self.module.arrays_nd.contains_key(&*base_name) {
+                // A member shadows a module array of the same name (§8.10).
+                if !self.module.arrays_nd.contains_key(&*base_name)
+                    || (hier.path.len() == 1
+                        && hier.path[0].selects.is_empty()
+                        && *base_name == *hier.path[0].name.name)
+                {
                     if let Some(s) = self.instance_assoc_member(&base_name) {
+                        base_name = std::borrow::Cow::Owned(s);
+                    }
+                }
+                // `o.m[i][j][k]` on an object's member: its store is
+                // `<handle>#m` (§7.4.5).
+                if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2 {
+                    if let Some(s) = self
+                        .expr_assoc_name(cur)
+                        .filter(|s| self.module.arrays_nd.contains_key(s))
+                    {
                         base_name = std::borrow::Cow::Owned(s);
                     }
                 }
@@ -2615,10 +3276,25 @@ impl Simulator {
         {
             if let ExprKind::Ident(hier) = &inner_expr.kind {
                 let mut name = self.resolve_hier_name(hier);
-                // Bare class-member 2D array inside a method:
-                // resolve to its per-instance `<handle>#<member>`.
-                if !self.module.arrays_2d.contains_key(&*name) {
+                // Bare class-member 2D array inside a method: resolve to its
+                // per-instance `<handle>#<member>`. The member shadows a
+                // module array of the same name (§8.10); taking the module's
+                // first sent the write to it and left the member at 0 (#597).
+                let bare_member = hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                    && *name == *hier.path[0].name.name;
+                if !self.module.arrays_2d.contains_key(&*name) || bare_member {
                     if let Some(s) = self.instance_assoc_member(&name) {
+                        name = std::borrow::Cow::Owned(s);
+                    }
+                }
+                // `o.m[i][j] = v` on an object's member: its store is
+                // `<handle>#m` (§7.4.5).
+                if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
+                    if let Some(s) = self
+                        .expr_assoc_name(inner_expr)
+                        .filter(|s| self.module.arrays_2d.contains_key(s))
+                    {
                         name = std::borrow::Cow::Owned(s);
                     }
                 }
@@ -2655,8 +3331,25 @@ impl Simulator {
                     }
                 }
                 if self.module.arrays_2d.contains_key(&*name) {
-                    let i = self.eval_expr(inner_idx).to_u64().unwrap_or(0) as i64;
-                    let j = self.eval_expr(index).to_u64().unwrap_or(0) as i64;
+                    // §7.4.5 / §11.5.1: unpacked indices are signed;
+                    // an unknown or out-of-bounds index performs no write.
+                    let (Some(i), Some(j)) = (
+                        self.eval_expr(inner_idx).to_index(),
+                        self.eval_expr(index).to_index(),
+                    ) else {
+                        return false;
+                    };
+                    let &((il, ih), (jl, jh), _) = &self.module.arrays_2d[&*name];
+                    let (outer_lo, outer_hi) = if self.module.dynamic_arrays.contains(&*name) {
+                        // The 2-D table's initial allocation is a placeholder;
+                        // new[N] sets the live outer dimension (§7.5.1).
+                        (0, self.get_queue_size(&name) as i64 - 1)
+                    } else {
+                        (il.min(ih), il.max(ih))
+                    };
+                    if i < outer_lo || i > outer_hi || j < jl.min(jh) || j > jl.max(jh) {
+                        return false;
+                    }
                     let elem_name = format!("{}[{}][{}]", name, i, j);
                     if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                         let width = self.signal_widths[id];
@@ -4024,6 +4717,38 @@ impl Simulator {
         }
         match &lhs.kind {
             ExprKind::Ident(hier) => {
+                // §7.2.1/§23.7: preserve the full registered struct path
+                // before leaf-name fallback can select an unrelated observer.
+                if !self.module.classes.is_empty()
+                    && !self.module.packed_struct_fields.is_empty()
+                    && hier.path.len() > 2
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let dotted = hier
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let name = dotted
+                        .strip_prefix(&format!("{}.", self.module.name))
+                        .unwrap_or(&dotted);
+                    if let Some((base, off, width)) = self.packed_leaf_of_hier(name)
+                        && let Some(cur) = self.get_signal_value_by_name(&base)
+                    {
+                        let mut next = cur.clone();
+                        let rhs =
+                            self.packed_member_piece(&base, name, val.resize_for_assign(width));
+                        for bit in 0..width as usize {
+                            next.set_bit(off as usize + bit, rhs.get_bit(bit));
+                        }
+                        if next == cur {
+                            return false;
+                        }
+                        self.set_signal_value_by_name(&base, next);
+                        return true;
+                    }
+                }
                 // LRM §25.9: virtual-interface alias (task/function
                 // formal frame, or a plain `virtual <iface>` variable) —
                 // rewrite `vif.member` to `<bound>.member`. Must fire
@@ -4090,6 +4815,34 @@ impl Simulator {
                             };
                             self.local_stack[last_idx].insert(joined, fitted);
                             return true;
+                        }
+                    }
+                }
+                // §8.4: `tb.u_leaf.obj.field = v` writes the OBJECT.  The dotted
+                // name used to fall through to the signal table, which resolves
+                // the leaf flat and landed on tb's own `field` — the object kept
+                // its old value while a read through a handle showed the new one.
+                // Only taken when the parent really is a live object that declares
+                // the member, so struct/net lvalues are untouched.
+                if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
+                    if let Some(h) = self.hier_parent_handle(hier) {
+                        let member_name = hier.path[hier.path.len() - 1].name.name.as_str();
+                        if self.read_member_value(h, member_name).is_some()
+                            || self
+                                .static_member_target(h, None, None, member_name)
+                                .is_some()
+                        {
+                            if let Some(ok) = self.static_write_via_handle(
+                                h,
+                                None,
+                                None,
+                                member_name,
+                                val.clone(),
+                            ) {
+                                return ok;
+                            }
+                            let fitted = self.fit_class_prop(h, member_name, &val);
+                            return self.set_prop_if_changed(h, member_name, fitted);
                         }
                     }
                 }
@@ -4456,7 +5209,14 @@ impl Simulator {
                         .map(|s| s.name.name.as_str())
                         .collect::<Vec<_>>()
                         .join(".");
-                    if let Some(existing_val) = self.signals.get(&dotted_name).cloned() {
+                    // Only a name WITHOUT a table slot lives in the name-keyed
+                    // copy alone. After `sync_table_to_hashmap` (a `$monitor`,
+                    // a dump, a `$readmemh`) every table signal has a copy
+                    // there too; writing that copy loses the write at the next
+                    // sync while every read uses the table (#568, §10.4.1).
+                    if !self.signal_name_to_id.contains_key(dotted_name.as_str())
+                        && let Some(existing_val) = self.signals.get(&dotted_name).cloned()
+                    {
                         let w = existing_val.width;
                         let is_real =
                             self.real_signals.contains(&dotted_name) || existing_val.is_real;
@@ -4873,13 +5633,35 @@ impl Simulator {
                     if index_value.has_xz() && !index_value.is_real {
                         return false;
                     }
+                    // §7.8.6: a select write to an ABSENT associative element
+                    // reads it as the element type's default, replaces the
+                    // selected bits and writes it back, creating it; the
+                    // write was dropped. Its key takes the array's key form.
+                    let mut assoc_default: Option<Value> = None;
                     let element_name = self.class_nd_elem_name(array_expr, index).or_else(|| {
-                        let base = self.expr_assoc_name(array_expr)?;
+                        // A module-scope or block-local array is not an
+                        // object member: resolve the plain name too.
+                        let base = self.expr_assoc_name(array_expr).or_else(|| {
+                            let ExprKind::Ident(h) = &array_expr.kind else {
+                                return None;
+                            };
+                            let n = self.resolve_hier_name(h).into_owned();
+                            let n = self.instance_assoc_member(&n).unwrap_or(n);
+                            self.is_associative_array(&n).then_some(n)
+                        })?;
+                        if self.is_associative_array(&base) {
+                            let key = self.assoc_key_str(&base, &index_value);
+                            assoc_default = self.assoc_missing_elem_value(&base);
+                            return Some(format!("{}[{}]", base, key));
+                        }
                         let index = index_value.to_i64()?;
                         Some(format!("{}[{}]", base, index))
                     });
                     if let Some(element_name) = element_name {
-                        if let Some(mut current) = self.get_signal_value_by_name(&element_name) {
+                        if let Some(mut current) = self
+                            .get_signal_value_by_name(&element_name)
+                            .or(assoc_default)
+                        {
                             let width = current.width as usize;
                             let hi = msb.min(width.saturating_sub(1));
                             if oob_write_discard(msb_i, src_base, width as u32) {
@@ -4900,11 +5682,31 @@ impl Simulator {
                                     }
                                 }
                             }
-                            if changed {
+                            if changed || !self.signals.contains_key(&element_name) {
                                 self.set_signal_value_by_name(&element_name, current);
                             }
                             return changed;
                         }
+                    }
+                }
+                // §11.5.1: splice a selected class property back into the
+                // object, including static and nested hierarchical receivers.
+                if let ExprKind::Ident(hier) = &expr.kind
+                    && let Some(h) = self.hier_parent_handle(hier)
+                {
+                    let member = &hier.path.last().unwrap().name.name;
+                    if let Some(mut cur) = self
+                        .static_read_via_handle(h, None, None, member)
+                        .or_else(|| self.read_member_value(h, member))
+                    {
+                        if oob_write_discard(msb_i, src_base, cur.width) {
+                            return false;
+                        }
+                        let rhs = val.resize_for_assign((msb_i - src_base + 1).max(1) as u32);
+                        for bit in lsb..=msb.min(cur.width.saturating_sub(1) as usize) {
+                            cur.set_bit(bit, rhs.get_bit((bit as i64 - src_base) as usize));
+                        }
+                        return self.set_prop_if_changed(h, member, cur);
                     }
                 }
                 // Fast path: resolve target signal_id directly (avoids format!

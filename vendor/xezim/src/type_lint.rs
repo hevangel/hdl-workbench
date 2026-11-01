@@ -276,12 +276,14 @@ struct PortSig {
     has_default: bool,
 }
 
+#[derive(Clone)]
 struct ClassInfo {
     base: Option<String>,
     /// Parameterized, or extends a specialization: identity is not the name.
     param: bool,
     interface: bool,
     props: HashMap<String, Ty>,
+    types: HashMap<String, Ty>,
     methods: HashMap<String, Rc<Sig>>,
 }
 
@@ -526,13 +528,11 @@ impl<'a> Ck<'a> {
                     return Ty::Unknown;
                 }
                 let n = name.name.name.as_str();
-                if let Some(scope) = name.single_scope() {
-                    return self
-                        .env
-                        .packages
-                        .get(&scope.name)
-                        .and_then(|p| p.types.get(n).cloned())
-                        .unwrap_or(Ty::Unknown);
+                if name.has_scope() || n.contains("::") {
+                    let mut path: Vec<String> =
+                        name.scopes.iter().map(|s| s.name.name.clone()).collect();
+                    path.push(n.to_string());
+                    return self.scoped_type(&path).unwrap_or(Ty::Unknown);
                 }
                 if let Some(t) = self.lookup_type(n) {
                     return t;
@@ -984,13 +984,14 @@ impl<'a> Ck<'a> {
                 _ => {}
             }
         }
-        self.pop();
+        let types = self.pop().types;
         let base = c.extends.as_ref().map(|e| e.name.name.clone());
         ClassInfo {
             base,
             param: !c.params.is_empty() || c.extends.as_ref().is_some_and(|e| !e.args.is_empty()),
             interface: c.is_interface,
             props,
+            types,
             methods,
         }
     }
@@ -1227,8 +1228,122 @@ impl<'a> Ck<'a> {
                 Some(c) => Ty::Class(c.as_str().into()),
                 None => Ty::Unknown,
             },
+            // A cast contributes its target type to the operand's type so the
+            // assignment checks can see through it (§6.19.3: a value of enum
+            // type e_t is still a value of e_t — a cast to a *different* enum
+            // does not make the assignment to that enum legal). `e_t'(x)` is
+            // lowered to `$__xz_named_cast(e_t, x)`; `int'(x)`/`byte'(x)` to
+            // `$__xz_type_cast(int, x)` (both in xezim-parser §6.24.1).
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_named_cast" => {
+                    let mut t = Ty::Unknown;
+                    if let Some(target) = args.first() {
+                        t = self.cast_target_ty(target);
+                    }
+                    t
+                }
+                "$__xz_type_cast" => {
+                    let mut t = Ty::Unknown;
+                    if let Some(target) = args.first() {
+                        t = self.cast_target_ty(target);
+                    }
+                    t
+                }
+                _ => Ty::Unknown,
+            },
             _ => Ty::Unknown,
         }
+    }
+
+    /// The type a `$__xz_named_cast`/`$__xz_type_cast` target names — an
+    /// `Ident`/`MemberAccess` spelling a typedef, or a `TypeLiteral`. Used so
+    /// the assignment checks can see an enum-typed cast result (§6.19.3).
+    fn cast_target_ty(&self, target: &Expression) -> Ty {
+        fn path(e: &Expression, out: &mut Vec<String>) -> bool {
+            match &e.kind {
+                ExprKind::Paren(e) => path(e, out),
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    out.extend(h.path.iter().map(|s| s.name.name.clone()));
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if !path(expr, out) {
+                        return false;
+                    }
+                    out.push(member.name.clone());
+                    true
+                }
+                ExprKind::TypeLiteral(dt) => {
+                    if let DataType::TypeReference {
+                        name,
+                        dimensions,
+                        type_args,
+                        ..
+                    } = &**dt
+                        && dimensions.is_empty()
+                        && type_args.is_empty()
+                        && !name.has_specialized_scope()
+                    {
+                        out.extend(name.scopes.iter().map(|s| s.name.name.clone()));
+                        out.push(name.name.name.clone());
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        let mut names = Vec::new();
+        if !path(target, &mut names) {
+            return Ty::Unknown;
+        }
+        self.scoped_type(&names).unwrap_or(Ty::Unknown)
+    }
+
+    // §6.19.3 / §8.23: a qualified cast keeps the declaring typedef's identity.
+    fn scoped_type(&self, names: &[String]) -> Option<Ty> {
+        // Elaboration can flatten package class names into one identifier.
+        if names.iter().any(|n| n.contains("::")) {
+            let expanded = names
+                .iter()
+                .flat_map(|n| n.split("::").map(str::to_string))
+                .collect::<Vec<_>>();
+            return self.scoped_type(&expanded);
+        }
+        let (leaf, scopes) = names.split_last()?;
+        if scopes.is_empty() {
+            return self.lookup_type(leaf);
+        }
+        if scopes.len() == 1
+            && let Some(p) = self.env.packages.get(&scopes[0])
+        {
+            return p.types.get(leaf).cloned();
+        }
+        let qualified = scopes.join("::");
+        let mut current = if self.class(&qualified).is_some() {
+            qualified
+        } else if scopes.len() == 1 {
+            scopes[0].clone()
+        } else {
+            return None;
+        };
+        for _ in 0..64 {
+            let class = self.class(&current)?;
+            if class.param {
+                return None;
+            }
+            if let Some(t) = class
+                .types
+                .get(leaf)
+                .or_else(|| class.types.get(&format!("{current}::{leaf}")))
+            {
+                return Some(t.clone());
+            }
+            current = class.base.clone()?;
+        }
+        None
     }
 
     fn index_ty(&self, t: Ty, index: &Expression) -> Ty {
@@ -2751,7 +2866,14 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                     declare_package_items(&mut ck, &p.items);
                     for it in &p.items {
                         if let PackageItem::Class(c) = it {
+                            let first = found.len();
                             class_info_rec(&mut ck, c, &mut found);
+                            let qualified = if c.name.name.contains("::") {
+                                c.name.name.clone()
+                            } else {
+                                format!("{}::{}", p.name.name, c.name.name)
+                            };
+                            found.push((qualified, found[first].1.clone()));
                         }
                     }
                 }
@@ -2763,7 +2885,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             }
         }
         for (n, ci) in found {
-            if class_names.get(&n) == Some(&1) {
+            if n.contains("::") || class_names.get(&n) == Some(&1) {
                 classes.insert(n, Some(Rc::new(ci)));
             }
         }
@@ -3064,7 +3186,7 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
 }
 
 /// Call `f` on `e` and every sub-expression of it.
-fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression)) {
+pub(crate) fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression)) {
     f(e);
     match &e.kind {
         ExprKind::Unary { operand, .. } => visit_expr(operand, f),
@@ -3113,7 +3235,22 @@ fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression)) {
             visit_expr(a, f);
             visit_expr(b, f);
         }
-        ExprKind::Paren(x) => visit_expr(x, f),
+        ExprKind::Paren(x)
+        | ExprKind::Specialization { base: x, .. }
+        | ExprKind::ShallowCopy { source: x } => visit_expr(x, f),
+        ExprKind::WithClause { expr, filter } => {
+            visit_expr(expr, f);
+            visit_expr(filter, f);
+        }
+        ExprKind::StreamOp {
+            slice_size, exprs, ..
+        } => {
+            if let Some(size) = slice_size {
+                visit_expr(size, f);
+            }
+            exprs.iter().for_each(|x| visit_expr(x, f));
+        }
+        ExprKind::Tagged { inner: Some(x), .. } => visit_expr(x, f),
         ExprKind::AssignExpr { lvalue, rvalue } => {
             visit_expr(lvalue, f);
             visit_expr(rvalue, f);

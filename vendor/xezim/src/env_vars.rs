@@ -140,6 +140,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)",
     ),
     (
+        "XEZIM_CLASS_GC",
+        "Class objects: reclaim unreachable objects between time slots (default on; 0 disables, stress collects at every time advance)",
+    ),
+    (
         "XEZIM_CLKTREE_PROBE",
         "Clock tree: print the detected clock-tree roots and gating structure",
     ),
@@ -557,6 +561,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Elab: =1 keeps the nets of substituted input ports that nothing can reach by name (turns unobserved-port elision off)",
     ),
     (
+        "XEZIM_KEYWORDS",
+        "Parse: keyword set outside `begin_keywords` regions, a §22.14 version (same as --keywords)",
+    ),
+    (
         "XEZIM_LARGE_ARRAY_NAME_THRESHOLD",
         "Elab: element-count threshold above which per-element names are lazy",
     ),
@@ -609,6 +617,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_NO_CLKTREE_DEDUP",
         "Clock tree: disable derived-clock deduplication",
+    ),
+    (
+        "XEZIM_NO_CONFIG_KEYWORDS",
+        "Parse: read the configuration keywords as names (1 enables; same as --no-config-keywords)",
     ),
     (
         "XEZIM_NO_DYN_RENAME",
@@ -769,8 +781,40 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_REG_DBG", "Debug: trace VM register allocation"),
     (
+        "XEZIM_RELAX_CASEX_INSIDE",
+        "Parse: read `casex/casez (e) inside` as `case (e) inside` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_CROSS_HIER_ITEM",
+        "Parse: accept a hierarchical cross item with an implicit coverpoint (1 enables)",
+    ),
+    (
         "XEZIM_RELAX_DRIVER_CONFLICTS",
         "Elab: report conflicting variable drivers (§6.5, §9.2.2) as warnings, not errors (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_DUPLICATE_DECLS",
+        "Parse: ignore a repeated declaration in a subroutine or block (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_ENUM_NO_BASE",
+        "Parse: read `enum [N:0] {...}` as `enum bit [N:0]` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_EVENT_THIS",
+        "Parse: read `@this.ev` as `@(this.ev)` (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_MACRO_SPACE",
+        "Preprocess: read white space after a backtick as none (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_NUL_BYTES",
+        "Preprocess: read a NUL byte as white space (1 enables)",
+    ),
+    (
+        "XEZIM_RELAX_STATIC_CONST",
+        "Parse: read `static const` as `const static` (1 enables)",
     ),
     (
         "XEZIM_REPORT_STATS",

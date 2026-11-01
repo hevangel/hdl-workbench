@@ -13,7 +13,8 @@
 
 use xezim_core::SourceDefinition;
 use xezim_core::ast::decl::{
-    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, TypedefDeclaration,
+    ClassDeclaration, ClassItem, ClassMethodKind, ClassQualifier, ModuleItem, ParameterDeclaration,
+    ParameterKind, TypedefDeclaration,
 };
 use xezim_core::ast::expr::{
     AssignmentPatternItem, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind,
@@ -60,6 +61,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 }
                 check_proc_net_assign(&m.ports, &m.items, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
@@ -81,6 +84,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 }
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
@@ -101,6 +106,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
                 check_program_items(&m.items, &mut errs);
+                check_monitor_automatic(&m.items, &mut errs);
+                check_unpacked_pattern_counts(&m.items, &mut errs);
                 check_instantiations(&m.items, &port_map, &mut errs);
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
@@ -1778,6 +1785,32 @@ fn check_wildcard_cmp(items: &[ModuleItem], _elab: &ElaboratedModule, errs: &mut
 fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut blocks: HashMap<String, HashSet<String>> = HashMap::new();
     let mut other: HashSet<String> = HashSet::new();
+    // Data objects (variables, nets, ports, parameters, subroutines,
+    // formals and block locals): a dotted name is a MEMBER select from such
+    // a segment on (`resp.exception.valid` reads a struct field, §7.2), so
+    // the walk below stops there instead of matching the next segment
+    // against a same-named block label. Instance and generate names are
+    // scopes and keep the walk going (`U[0].V.a`).
+    let mut data: HashSet<String> = HashSet::new();
+    fn param_names(params: &[ParameterDeclaration], out: &mut HashSet<String>) {
+        for p in params {
+            match &p.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+                ParameterKind::Type { assignments } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+            }
+        }
+    }
+    fn ansi_port_names(ports: &PortList, out: &mut HashSet<String>) {
+        match ports {
+            PortList::Ansi(ps) => out.extend(ps.iter().map(|p| p.name.name.clone())),
+            PortList::NonAnsi(ids) => out.extend(ids.iter().map(|i| i.name.clone())),
+            PortList::Empty => {}
+        }
+    }
 
     fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
@@ -1814,6 +1847,7 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
         stmts: &mut Vec<&'a Statement>,
         exprs: &mut Vec<&'a Expression>,
         other: &mut HashSet<String>,
+        data: &mut HashSet<String>,
     ) {
         for it in items {
             match it {
@@ -1822,11 +1856,18 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                 ModuleItem::FinalConstruct(f) => stmts.push(&f.stmt),
                 ModuleItem::TaskDeclaration(t) => {
                     other.insert(t.name.name.name.clone());
+                    data.insert(t.name.name.name.clone());
+                    data.extend(t.ports.iter().map(|p| p.name.name.clone()));
                     stmts.extend(t.items.iter());
                 }
                 ModuleItem::FunctionDeclaration(f) => {
                     other.insert(f.name.name.name.clone());
+                    data.insert(f.name.name.name.clone());
+                    data.extend(f.ports.iter().map(|p| p.name.name.clone()));
                     stmts.extend(f.items.iter());
+                }
+                ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
+                    param_names(std::slice::from_ref(p), data)
                 }
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, r) in &ca.assignments {
@@ -1839,25 +1880,27 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
                 }
                 ModuleItem::DataDeclaration(d) => {
                     other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    data.extend(d.declarators.iter().map(|x| x.name.name.clone()));
                 }
                 ModuleItem::NetDeclaration(d) => {
                     other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                    data.extend(d.declarators.iter().map(|x| x.name.name.clone()));
                 }
-                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other),
+                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other, data),
                 ModuleItem::GenerateIf(g) => {
                     other.extend(g.branch_labels.iter().flatten().cloned());
                     for (_, b) in &g.branches {
-                        walk_items(b, stmts, exprs, other);
+                        walk_items(b, stmts, exprs, other, data);
                     }
                 }
                 ModuleItem::GenerateFor(g) => {
                     other.extend(g.name.iter().cloned());
-                    walk_items(&g.items, stmts, exprs, other);
+                    walk_items(&g.items, stmts, exprs, other, data);
                 }
                 ModuleItem::GenerateCase(g) => {
                     for arm in &g.arms {
                         other.extend(arm.label.iter().cloned());
-                        walk_items(&arm.items, stmts, exprs, other);
+                        walk_items(&arm.items, stmts, exprs, other, data);
                     }
                 }
                 _ => {}
@@ -1868,15 +1911,32 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
     let mut exprs: Vec<&Expression> = Vec::new();
     for def in defs {
         let items = match def {
-            SourceDefinition::Module(m) => &m.items,
-            SourceDefinition::Interface(m) => &m.items,
-            SourceDefinition::Program(m) => &m.items,
+            SourceDefinition::Module(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
+            SourceDefinition::Interface(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
+            SourceDefinition::Program(m) => {
+                param_names(&m.params, &mut data);
+                ansi_port_names(&m.ports, &mut data);
+                &m.items
+            }
             _ => continue,
         };
-        walk_items(items, &mut stmts, &mut exprs, &mut other);
+        walk_items(items, &mut stmts, &mut exprs, &mut other, &mut data);
     }
     for st in &stmts {
         note_stmt(st, &mut blocks);
+        for_each_stmt(st, &mut |s| {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                data.extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+        });
     }
     blocks.retain(|label, _| !other.contains(label));
     if blocks.is_empty() {
@@ -1909,6 +1969,9 @@ fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
             return;
         }
         for w in segs.windows(2) {
+            if data.contains(&w[0]) {
+                break;
+            }
             let Some(members) = blocks.get(&w[0]) else {
                 continue;
             };
@@ -2390,10 +2453,12 @@ fn package_decls(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>>
                         out.extend(et.members.iter().map(|m| m.name.name.clone()));
                     }
                 }
-                PackageItem::Function(f) => {
+                // §8.24 / §26.3: an out-of-block class method belongs to
+                // its class, not to the package's imported namespace.
+                PackageItem::Function(f) if f.name.scopes.is_empty() => {
                     out.insert(f.name.name.name.clone());
                 }
-                PackageItem::Task(t) => {
+                PackageItem::Task(t) if t.name.scopes.is_empty() => {
                     out.insert(t.name.name.name.clone());
                 }
                 PackageItem::Class(c) => {
@@ -4113,4 +4178,365 @@ fn check_cont_assign_rhs_names(
             ));
         }
     }
+}
+
+/// §6.21: an automatic variable may not be referenced by `$monitor` (or
+/// `$monitorb/h/o`), which keeps reading its arguments after the process
+/// that declared them is gone. Loop variables declared in a `for` header
+/// or named by `foreach` are automatic (§12.7.1, §12.7.3), as are variables
+/// declared `automatic`, and the ports and locals of an automatic task or
+/// function and of every class method. The monitor printed x for them.
+fn check_monitor_automatic(items: &[ModuleItem], errs: &mut Vec<String>) {
+    for it in items {
+        match it {
+            ModuleItem::InitialConstruct(i) => monitor_walk(&i.stmt, &mut vec![], false, errs),
+            ModuleItem::AlwaysConstruct(a) => monitor_walk(&a.stmt, &mut vec![], false, errs),
+            ModuleItem::TaskDeclaration(t) => {
+                let auto = matches!(
+                    t.lifetime,
+                    Some(xezim_core::ast::types::Lifetime::Automatic)
+                );
+                monitor_subroutine(&t.ports, &t.items, auto, errs);
+            }
+            ModuleItem::FunctionDeclaration(f) => {
+                let auto = matches!(
+                    f.lifetime,
+                    Some(xezim_core::ast::types::Lifetime::Automatic)
+                );
+                monitor_subroutine(&f.ports, &f.items, auto, errs);
+            }
+            ModuleItem::ClassDeclaration(c) => monitor_class(c, errs),
+            _ => {}
+        }
+    }
+}
+
+fn monitor_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
+    for ci in &c.items {
+        match ci {
+            ClassItem::Method(m) => match &m.kind {
+                ClassMethodKind::Function(f) => monitor_subroutine(&f.ports, &f.items, true, errs),
+                ClassMethodKind::Task(t) => monitor_subroutine(&t.ports, &t.items, true, errs),
+                _ => {}
+            },
+            ClassItem::Class(inner) => monitor_class(inner, errs),
+            _ => {}
+        }
+    }
+}
+
+fn monitor_subroutine(
+    ports: &[xezim_core::ast::decl::FunctionPort],
+    body: &[Statement],
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    let mut scopes: Vec<Vec<(String, bool)>> =
+        vec![ports.iter().map(|p| (p.name.name.clone(), auto)).collect()];
+    for s in body {
+        monitor_stmt(s, &mut scopes, auto, errs);
+    }
+}
+
+fn monitor_walk(
+    stmt: &Statement,
+    scopes: &mut Vec<Vec<(String, bool)>>,
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    scopes.push(Vec::new());
+    monitor_stmt(stmt, scopes, auto, errs);
+    scopes.pop();
+}
+
+/// Declares the statement's variables in the innermost scope and checks any
+/// `$monitor` it makes. `auto` is the default lifetime of the enclosing
+/// subroutine (block variables of a static context are static).
+fn monitor_stmt(
+    stmt: &Statement,
+    scopes: &mut Vec<Vec<(String, bool)>>,
+    auto: bool,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::stmt::ForInit;
+    use xezim_core::ast::types::Lifetime;
+    match &stmt.kind {
+        StatementKind::VarDecl {
+            lifetime,
+            declarators,
+            ..
+        } => {
+            let is_auto = match lifetime {
+                Some(Lifetime::Automatic) => true,
+                Some(Lifetime::Static) => false,
+                None => auto,
+            };
+            if let Some(top) = scopes.last_mut() {
+                for d in declarators {
+                    top.push((d.name.name.clone(), is_auto));
+                }
+            }
+        }
+        StatementKind::Expr(e) => {
+            if let ExprKind::SystemCall { name, args } = &e.kind
+                && matches!(
+                    name.as_str(),
+                    "$monitor" | "$monitorb" | "$monitorh" | "$monitoro"
+                )
+            {
+                let mut seen: Vec<String> = Vec::new();
+                for a in args {
+                    let mut ids = Vec::new();
+                    monitor_idents(a, &mut ids);
+                    for id in ids {
+                        let automatic = scopes
+                            .iter()
+                            .rev()
+                            .find_map(|s| s.iter().rev().find(|(n, _)| *n == id).map(|(_, a)| *a))
+                            .unwrap_or(false);
+                        if automatic && !seen.contains(&id) {
+                            errs.push(format!(
+                                "automatic variable '{}' is not allowed as an argument to {} \
+                                 (LRM 1800-2017 §6.21)",
+                                id, name
+                            ));
+                            seen.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            scopes.push(Vec::new());
+            for s in stmts {
+                monitor_stmt(s, scopes, auto, errs);
+            }
+            scopes.pop();
+        }
+        StatementKind::For { init, body, .. } => {
+            let vars: Vec<(String, bool)> = init
+                .iter()
+                .filter_map(|i| match i {
+                    ForInit::VarDecl { name, .. } => Some((name.name.clone(), true)),
+                    ForInit::Assign { .. } => None,
+                })
+                .collect();
+            scopes.push(vars);
+            monitor_walk(body, scopes, auto, errs);
+            scopes.pop();
+        }
+        StatementKind::Foreach { vars, body, .. } => {
+            scopes.push(
+                vars.iter()
+                    .flatten()
+                    .map(|v| (v.name.clone(), true))
+                    .collect(),
+            );
+            monitor_walk(body, scopes, auto, errs);
+            scopes.pop();
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            monitor_walk(then_stmt, scopes, auto, errs);
+            if let Some(e) = else_stmt {
+                monitor_walk(e, scopes, auto, errs);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                monitor_walk(&it.stmt, scopes, auto, errs);
+            }
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::TimingControl { stmt: body, .. }
+        | StatementKind::Wait { stmt: body, .. } => monitor_walk(body, scopes, auto, errs),
+        _ => {}
+    }
+}
+
+/// §10.9.1: an ordered assignment pattern for an unpacked array has exactly
+/// one item per element of the dimension it fills (`'{1,2,3}` for a
+/// `[1:4]` row is illegal). Checked for module-scope arrays whose bounds are
+/// literals (no parameter can change them), assigned whole or by row;
+/// patterns with `default:`, keys, member names or replication are not
+/// counted. A name declared again in a procedural block is skipped.
+fn check_unpacked_pattern_counts(items: &[ModuleItem], errs: &mut Vec<String>) {
+    let mut arrays: std::collections::HashMap<String, Vec<(i64, i64)>> =
+        std::collections::HashMap::new();
+    let mut shadowed: HashSet<String> = HashSet::default();
+    for it in items {
+        if let ModuleItem::DataDeclaration(d) = it {
+            for decl in &d.declarators {
+                if let Some(dims) = literal_unpacked_dims(&decl.dimensions) {
+                    if arrays
+                        .insert(decl.name.name.clone(), dims.clone())
+                        .is_some()
+                    {
+                        shadowed.insert(decl.name.name.clone());
+                    }
+                    // 1-D flat initializers are `check_array_flat_init`'s.
+                    if dims.len() > 1
+                        && let Some(init) = &decl.init
+                        && let ExprKind::AssignmentPattern(pi) = &init.kind
+                    {
+                        pattern_count(&decl.name.name, pi, &dims, errs);
+                    }
+                }
+            }
+        }
+    }
+    if arrays.is_empty() {
+        return;
+    }
+    let procs: Vec<&Statement> = items
+        .iter()
+        .filter_map(|it| match it {
+            ModuleItem::InitialConstruct(i) => Some(&i.stmt),
+            ModuleItem::AlwaysConstruct(a) => Some(&a.stmt),
+            _ => None,
+        })
+        .collect();
+    for s in &procs {
+        for_each_stmt(s, &mut |st| {
+            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+                for d in declarators {
+                    shadowed.insert(d.name.name.clone());
+                }
+            }
+            if let StatementKind::For { init, .. } = &st.kind {
+                for i in init {
+                    if let xezim_core::ast::stmt::ForInit::VarDecl { name, .. } = i {
+                        shadowed.insert(name.name.clone());
+                    }
+                }
+            }
+        });
+    }
+    for s in &procs {
+        for_each_assign_pair(s, &mut |lhs, rhs| {
+            let ExprKind::AssignmentPattern(pi) = &rhs.kind else {
+                return;
+            };
+            let mut base = lhs;
+            let mut k = 0usize;
+            while let ExprKind::Index { expr, index } = &base.kind {
+                if matches!(
+                    index.kind,
+                    ExprKind::Range(..) | ExprKind::RangeSelect { .. }
+                ) {
+                    return;
+                }
+                k += 1;
+                base = expr;
+            }
+            let ExprKind::Ident(h) = &base.kind else {
+                return;
+            };
+            if h.root.is_some() || h.path.len() != 1 {
+                return;
+            }
+            k += h.path[0].selects.len();
+            let name = &h.path[0].name.name;
+            if shadowed.contains(name) {
+                return;
+            }
+            if let Some(dims) = arrays.get(name)
+                && k < dims.len()
+            {
+                pattern_count(name, pi, &dims[k..], errs);
+            }
+        });
+    }
+}
+
+fn literal_unpacked_dims(dims: &[UnpackedDimension]) -> Option<Vec<(i64, i64)>> {
+    if dims.is_empty() {
+        return None;
+    }
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Range { left, right, .. } => {
+                Some((literal_int(left)?, literal_int(right)?))
+            }
+            UnpackedDimension::Expression { expr, .. } => {
+                let n = literal_int(expr)?;
+                (n > 0).then_some((0, n - 1))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn literal_int(e: &Expression) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Number(_) => xezim_core::elaborate::const_eval_i64_with_params(e, None),
+        _ => None,
+    }
+}
+
+fn pattern_count(
+    name: &str,
+    items: &[AssignmentPatternItem],
+    dims: &[(i64, i64)],
+    errs: &mut Vec<String>,
+) {
+    let Some(&(l, r)) = dims.first() else {
+        return;
+    };
+    let mut ordered: Vec<&Expression> = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            AssignmentPatternItem::Ordered(e)
+                if !matches!(e.kind, ExprKind::Replication { .. }) =>
+            {
+                ordered.push(e)
+            }
+            _ => return,
+        }
+    }
+    let n = (l - r).abs() + 1;
+    if ordered.len() as i64 != n {
+        errs.push(format!(
+            "assignment pattern for '{}' has {} element(s), but the dimension [{}:{}] has {} \
+             (LRM 1800-2017 §10.9.1)",
+            name,
+            ordered.len(),
+            l,
+            r,
+            n
+        ));
+        return;
+    }
+    if dims.len() > 1 {
+        for e in ordered {
+            if let ExprKind::AssignmentPattern(inner) = &e.kind {
+                pattern_count(name, inner, &dims[1..], errs);
+            }
+        }
+    }
+}
+
+/// The leading names an expression reads (`a` of `a[i].f`, and `i`),
+/// including names inside index selects.
+fn monitor_idents(e: &Expression, out: &mut Vec<String>) {
+    for_each_expr(e, &mut |x| {
+        if let ExprKind::Ident(h) = &x.kind {
+            if h.root.is_none()
+                && let Some(first) = h.path.first()
+            {
+                out.push(first.name.name.clone());
+            }
+            for seg in &h.path {
+                for sel in &seg.selects {
+                    monitor_idents(sel, out);
+                }
+            }
+        }
+    });
 }

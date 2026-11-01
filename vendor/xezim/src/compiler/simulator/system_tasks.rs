@@ -815,7 +815,7 @@ impl Simulator {
                             "Fatal: $sdf_annotate cannot read SDF file '{}': {}",
                             path, e
                         );
-                        self.finished = true;
+                        self.abort_run();
                     }
                     Ok(content) => match super::sdf::parse_sdf(&content) {
                         Err(e) => {
@@ -823,7 +823,7 @@ impl Simulator {
                                 "Fatal: $sdf_annotate cannot parse SDF file '{}': {}",
                                 path, e
                             );
-                            self.finished = true;
+                            self.abort_run();
                         }
                         Ok(sdf) => {
                             let select = self.sdf_select.unwrap_or(super::sdf::DelaySelect::Typ);
@@ -1126,6 +1126,19 @@ impl Simulator {
             self.format_args(args, "$display")
         };
         self.emit_severity_text(severity, &body);
+    }
+
+    /// End the run on a run-time error the simulator itself reports and
+    /// cannot continue past: a null handle a process body reads through or
+    /// calls a method on (§8.4), a loop or delta cycle that can never let
+    /// time advance, an SDF file `$sdf_annotate` cannot read, or a failed
+    /// internal consistency check. Like `$fatal` (§20.10), such an error ends
+    /// the simulation with a failing exit status, not 0.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn abort_run(&mut self) {
+        self.saw_fatal = true;
+        self.finished = true;
     }
 
     /// `emit_severity` with the message already formatted.
@@ -1537,7 +1550,63 @@ impl Simulator {
             // A bare or member reference whose declared type is `string`, or an
             // element of a string-typed queue/array.
             ExprKind::Ident(h) => {
-                self.string_signals.contains(&*self.resolve_hier_name(h))
+                // The `string_signals` set is flat and name-global. Inside a
+                // class method a bare property of `this` shadows same-named
+                // module-scope signals (§6.21), and the flat set cannot
+                // distinguish specializations of a parameterized class: a
+                // string-typed `T val` formal of `uvm_resource_db#(string)`
+                // poisons the bare name for `uvm_resource#(<enum>)`'s `val`
+                // property, routing an enum `val == t` through the TEXT
+                // comparison where `X == 0` compares equal. When the name is
+                // a property of the current instance's class (and no local
+                // formal shadows it), the class-aware probes below decide.
+                if h.path.len() == 1
+                    && matches!(self.class_context_stack.last(), Some(Some(_)))
+                    && self.string_signals.contains(&*self.resolve_hier_name(h))
+                {
+                    let name = h.path[0].name.name.as_str();
+                    // Only the CURRENT method's frames shadow (§6.21): the
+                    // callers' frames below `method_local_base` are not in
+                    // scope here, and a same-named caller local (`val` in
+                    // `uvm_resource_db#(T)::set` calling `rsrc.write(val, …)`)
+                    // forced the flat-set fallback this branch exists to avoid.
+                    let local_shadows = self
+                        .method_local_base
+                        .last()
+                        .map(|&base| {
+                            self.local_stack
+                                .get(base..)
+                                .unwrap_or(&[])
+                                .iter()
+                                .any(|m| m.contains_key(name))
+                        })
+                        .unwrap_or_else(|| self.local_stack.iter().any(|m| m.contains_key(name)));
+                    let is_class_prop = !local_shadows
+                        && self
+                            .this_stack
+                            .last()
+                            .copied()
+                            .flatten()
+                            .and_then(|hh| self.heap.get(hh).and_then(|c| c.as_ref()))
+                            .is_some_and(|inst| {
+                                self.class_declares_property(&inst.class_name, name)
+                            });
+                    if is_class_prop {
+                        return self.class_member_is_string(expr)
+                            || self.ident_type_is_string(h, expr)
+                            || self.local_struct_member_is_string(h)
+                            || self.member_chain_is_string(expr);
+                    }
+                }
+                // A bare name asks the running task frame first: its non-string
+                // formal overrides a string flag another frame left on the name.
+                let name = self.resolve_hier_name(h);
+                let flagged = if h.path.len() == 1 {
+                    self.frame_name_is_string(&name)
+                } else {
+                    self.string_signals.contains(&*name)
+                };
+                flagged
                     || self.class_member_is_string(expr)
                     || self.ident_type_is_string(h, expr)
                     || self.local_struct_member_is_string(h)
@@ -2330,6 +2399,19 @@ impl Simulator {
     pub(super) fn call_returns_string(&self, func: &Expression) -> bool {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::{DataType, SimpleType};
+        // Use the same ownership rules as execution. A local SV declaration
+        // can hide a bare imported alias while an explicit package stays bound.
+        let dpi_key = self.package_dpi_call_key(func).map(std::borrow::Cow::Owned)
+            .or_else(|| match &func.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 =>
+                    self.resolve_dpi_call_name(&h.path[0].name.name, None),
+                _ => None,
+            });
+        if let Some(spec) = dpi_key.and_then(|key| self.module.dpi_imports.get(key.as_ref())) {
+            return matches!(&spec.proto, crate::ast::decl::DPIProto::Function(fd)
+                if matches!(self.dpi_resolve_typedef(&fd.return_type),
+                    DataType::Simple { kind: SimpleType::String, .. }));
+        }
         // A plain module/package FUNCTION with a `string` return type
         // (`$display("%s", where_am_i())`) — not a class method at all.
         if let ExprKind::Ident(h) = &func.kind {
@@ -2454,13 +2536,7 @@ impl Simulator {
         // §21.2.1.7 `%0p` (compact): the arm below marks where its output
         // starts; the rewrite runs here on the NEXT iteration (or after the
         // loop) because the arm has many early-continue exits.
-        let mut compact_from: Option<usize> = None;
         while let Some(c) = chars.next() {
-            if let Some(fp) = compact_from.take() {
-                let tail = Self::compact_p(&result[fp..]);
-                result.truncate(fp);
-                result.push_str(&tail);
-            }
             if c == '%' {
                 // §21.2.1.2: %[flags][width][.precision]<spec>. Flags: '-'
                 // left-justifies (pad spaces on the right), '+' forces a sign
@@ -2524,10 +2600,33 @@ impl Simulator {
                         format!("{}{}", " ".repeat(pad), core)
                     }
                 };
+                let push_raw_spec = |out: &mut String, spec: Option<char>| {
+                    out.push('%');
+                    if left_align {
+                        out.push('-');
+                    }
+                    if plus_sign {
+                        out.push('+');
+                    }
+                    out.push_str(&width_str);
+                    if let Some(p) = precision {
+                        use std::fmt::Write as _;
+                        let _ = write!(out, ".{}", p);
+                    }
+                    if let Some(s) = spec {
+                        out.push(s);
+                    }
+                };
                 if let Some(&spec) = chars.peek() {
                     chars.next();
                     match spec {
-                        '%' => result.push('%'),
+                        '%' => {
+                            if left_align || plus_sign || has_width || precision.is_some() {
+                                push_raw_spec(&mut result, Some('%'));
+                            } else {
+                                result.push('%');
+                            }
+                        }
                         't' | 'T' => {
                             if ai < args.len() {
                                 // The argument carries a time in the scope's
@@ -2564,12 +2663,13 @@ impl Simulator {
                             }
                         }
                         'p' | 'P' => {
-                            if has_width && pad_width == 0 {
-                                compact_from = Some(result.len());
-                            }
+                            // §21.2.1.7 defines no width for `%p`; `%0p`
+                            // prints as `%p` (#566, majority), not a
+                            // brace-less list.
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                self.p_top_level = true;
                                 // §8.9: a static fixed array spelled `Cls::S`
                                 // or `C#(T)::S`, or one element of it,
                                 // `Cls::S[i]`.
@@ -2607,6 +2707,21 @@ impl Simulator {
                                         if is_local && !self.local_ident_is_collection(nm) {
                                             let is_str = self.p_local_is_string(nm);
                                             let v = self.eval_expr(arg);
+                                            // A packed-struct or enum formal or
+                                            // local renders from its declared type.
+                                            if let Some(dt) = self.p_decl_type(arg)
+                                                && (matches!(self.resolve_dt(&dt), DataType::Struct(su) if su.packed)
+                                                    || self.p_enum_label(&Value::zero(1), &dt).is_some())
+                                                && super::elaborate::resolve_type_width(
+                                                    &dt,
+                                                    Some(&self.module.parameters),
+                                                    Some(&self.module.typedefs),
+                                                ) == v.width
+                                            {
+                                                let core = self.render_p_value_typed(&v, &dt);
+                                                result.push_str(&core);
+                                                continue;
+                                            }
                                             let core = Self::render_p_value(&v, is_str);
                                             result.push_str(&core);
                                             continue;
@@ -2836,6 +2951,48 @@ impl Simulator {
                                     {
                                         let elem = format!("{}{}", storage, &flat[cut..]);
                                         let s = self.render_p_typed(&elem, &DataType::Struct(su));
+                                        result.push_str(&s);
+                                        continue;
+                                    }
+                                }
+                                // §21.2.1.7: a PACKED struct, union or enum
+                                // operand the name-based paths do not type —
+                                // a class property (handle, `this`, bare,
+                                // static, specialized), an interface or
+                                // virtual-interface member, an element of a
+                                // collection of them, a queue slice, a
+                                // function result or a subroutine formal —
+                                // renders from its declared type. Each printed
+                                // one flat decimal.
+                                if !self.p_operand_is_collection(arg)
+                                    && let Some(dt) = self.p_decl_type(arg)
+                                    && let resolved = self.resolve_dt(&dt)
+                                    && (matches!(&resolved, DataType::Struct(su) if su.packed)
+                                        || self.p_enum_label(&Value::zero(1), &dt).is_some()
+                                        || matches!(&dt, DataType::TypeReference { name, .. }
+                                            if self.module.enum_members.contains_key(&name.qualified())
+                                                || self.module.enum_members.contains_key(&name.name.name)))
+                                {
+                                    let w = super::elaborate::resolve_type_width(
+                                        &dt,
+                                        Some(&self.module.parameters),
+                                        Some(&self.module.typedefs),
+                                    );
+                                    if let ExprKind::RangeSelect { expr, left, right, .. } = &arg.kind
+                                        && let Some(flat) = self.flat_member_name(expr)
+                                    {
+                                        let l = self.eval_expr(left).to_u64().unwrap_or(0) as i64;
+                                        let r = self.eval_expr(right).to_u64().unwrap_or(0) as i64;
+                                        let (lo, hi) = (l.min(r), l.max(r));
+                                        let parts: Vec<String> = (lo..=hi)
+                                            .map(|i| self.render_p_typed(&format!("{flat}[{i}]"), &dt))
+                                            .collect();
+                                        result.push_str(&format!("'{{{}}}", parts.join(", ")));
+                                        continue;
+                                    }
+                                    let v = self.eval_expr(arg);
+                                    if v.width == w || w == 0 {
+                                        let s = self.render_p_value_typed(&v, &dt);
                                         result.push_str(&s);
                                         continue;
                                     }
@@ -3093,7 +3250,30 @@ impl Simulator {
                             result.push_str(&self.m_path());
                         }
                         _ => {
-                            if ai < args.len() {
+                            // §21.2.1: only a known specifier consumes an
+                            // argument. Deciding that first keeps an unknown
+                            // `%q` from evaluating the next actual (and its
+                            // side effects, `f()` / `i++`) and then handing
+                            // it back to the following specifier.
+                            let consumes = matches!(
+                                spec,
+                                'd' | 'D'
+                                    | 'b' | 'B'
+                                    | 'o' | 'O'
+                                    | 'h' | 'H'
+                                    | 'x' | 'X'
+                                    | 'f' | 'F'
+                                    | 'e' | 'E'
+                                    | 'g' | 'G'
+                                    | 's' | 'S'
+                                    | 'c' | 'C'
+                                    | 'u' | 'U'
+                                    | 'z' | 'Z'
+                                    | 'v' | 'V'
+                            );
+                            if !consumes {
+                                push_raw_spec(&mut result, Some(spec));
+                            } else if ai < args.len() {
                                 let v = self.eval_expr(&args[ai]);
                                 ai += 1;
                                 match spec {
@@ -3297,25 +3477,15 @@ impl Simulator {
                                         let s = self.strength_field(&args[ai - 1], &v);
                                         result.push_str(&field(s, 0));
                                     }
-                                    _ => {
-                                        result.push('%');
-                                        if left_align {
-                                            result.push('-');
-                                        }
-                                        if plus_sign {
-                                            result.push('+');
-                                        }
-                                        result.push_str(&width_str);
-                                        if let Some(p) = precision {
-                                            result.push_str(&format!(".{}", p));
-                                        }
-                                        result.push(spec);
-                                        ai -= 1;
-                                    }
+                                    _ => unreachable!("specifier admitted above"),
                                 }
+                            } else {
+                                push_raw_spec(&mut result, Some(spec));
                             }
                         }
                     }
+                } else {
+                    push_raw_spec(&mut result, None);
                 }
             } else if c == '\\' {
                 if let Some(&e) = chars.peek() {
@@ -3334,11 +3504,6 @@ impl Simulator {
             } else {
                 result.push(c);
             }
-        }
-        if let Some(fp) = compact_from.take() {
-            let tail = Self::compact_p(&result[fp..]);
-            result.truncate(fp);
-            result.push_str(&tail);
         }
         (result, ai)
     }

@@ -355,6 +355,17 @@ fn issue_312_survey_single_module() {
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
 
+/// Issue #388 follow-up (reporter's survey)
+#[test]
+fn issue_388_unpacked_arr_in_params() {
+    let msgs = outputs(
+        include_str!("../issue_cases/unpacked_arr_in_params_388.sv"),
+        100_000,
+    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
 /// Issue #390: a queue-of-structs element pushed as a function's struct
 /// return (`q.push_back(make(...))`) keeps its string members when the queue
 /// is passed to a function, copied to another queue, or iterated with

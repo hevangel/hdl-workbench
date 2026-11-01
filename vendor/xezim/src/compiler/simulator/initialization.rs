@@ -523,9 +523,43 @@ impl Simulator {
                 *n >= 2
                     || module.wildcard_shadowed.contains(*base)
                     || module.foreign_displaced.contains(*base)
+                    // A package first hoisted after the local declaration
+                    // never needed to displace its signal during elaboration.
+                    || module.foreign_package_names.contains(*base)
             })
             .map(|(b, _)| b.to_string())
             .collect();
+        // §15.5 / §26.3: package events have the same synchronization identity
+        // through scoped and imported spellings. Prefer owner-specific type
+        // metadata; old artifacts can safely use the bare type only if unique.
+        let mut package_events = Vec::new();
+        for qualified in module.pkg_var_decls.keys() {
+            let Some((_, leaf)) = qualified.split_once("::") else {
+                continue;
+            };
+            let dt = module.var_decl_types.get(qualified).or_else(|| {
+                (!contested.contains(leaf))
+                    .then(|| module.var_decl_types.get(leaf))
+                    .flatten()
+            });
+            if dt.is_some_and(|dt| {
+                matches!(
+                    super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                )
+            }) {
+                package_events.push((qualified.clone(), leaf.to_string()));
+            }
+        }
+        for (qualified, leaf) in package_events {
+            module.events.insert(qualified.clone());
+            if !contested.contains(&leaf) {
+                module.events.insert(leaf);
+            }
+        }
         if contested.is_empty() {
             return contested;
         }
@@ -1656,6 +1690,8 @@ impl Simulator {
         let signals = SignalMap {
             map: HashMap::default(),
             elems: HashMap::default(),
+            elem_gens: HashMap::default(),
+            elem_gen_counter: 0,
         };
         let widths: HashMap<String, u32> = HashMap::default();
         let signed_signals: HashSet<String> = HashSet::default();
@@ -2439,6 +2475,19 @@ impl Simulator {
                 }
             }
         }
+
+        // §26.3: package enum members under their qualified spelling, for
+        // the bytecode compiler (see `Simulator::pkg_enum_consts`).
+        let pkg_enum_consts: HashMap<String, (u64, u32)> = module
+            .package_enum_members
+            .iter()
+            .flat_map(|(pkg, members)| {
+                members
+                    .iter()
+                    .filter(|(_, (_, w))| *w > 0 && *w <= 64)
+                    .map(move |(m, (v, w))| (format!("{}::{}", pkg, m), (*v, *w)))
+            })
+            .collect();
 
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
@@ -3664,12 +3713,16 @@ impl Simulator {
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            annex_n_seed: 0,
+            has_assoc_rows: false,
             partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            pattern_scratch_seq: 0,
+            pattern_scratch_free: Vec::new(),
             force_epoch_gen: 0,
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),
@@ -3760,6 +3813,7 @@ impl Simulator {
             sva_owed: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
+            clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
@@ -3813,6 +3867,12 @@ impl Simulator {
             settle_limit_last_time: 0,
             proc_settle_defer: false,
             deferred_proc_entries: Vec::new(),
+            t0_starts_remaining: 0,
+            rand_scope_nd: HashMap::default(),
+            rand_scope_nd_dyn: HashMap::default(),
+            rand_scope_row_owners: HashMap::default(),
+            p_top_level: false,
+            null_call_reported: Default::default(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3844,6 +3904,10 @@ impl Simulator {
             dpi_bind_tried: HashSet::default(),
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
+            class_gc_heap_len: 0,
+            class_gc_live: 0,
+            class_gc_released: 0,
+            class_gc_runs: 0,
             virtual_iface_bindings: HashMap::default(),
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
@@ -3863,6 +3927,7 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
+            class_param_arrays: HashMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
             spec_scope_stack: Vec::new(),
@@ -3921,6 +3986,7 @@ impl Simulator {
             pending_spec_inits: Vec::new(),
             spec_init_depth: 0,
             construct_init_depth: 0,
+            pending_class_initializers: HashMap::default(),
             var_class_types: HashMap::default(),
             var_type_args: HashMap::default(),
             var_container_types: HashMap::default(),
@@ -3933,6 +3999,7 @@ impl Simulator {
             mailboxes: HashMap::default(),
             mbx_msg_seq: 0,
             mbx_free_ids: Vec::new(),
+            mbx_patterns: HashMap::default(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
@@ -3948,10 +4015,14 @@ impl Simulator {
             rand_child_snapshots: Vec::new(),
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
+            randc_wide: HashMap::default(),
+            randc_wide_pending: HashMap::default(),
             dist_decks: HashMap::default(),
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
+            assertion_labels: HashMap::default(),
+            assert_wrap_label: None,
             code_cov: None,
             code_cov_hits: Vec::new(),
             code_cov_toggle_names,
@@ -4005,6 +4076,7 @@ impl Simulator {
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
             pkg_ambiguous_names,
+            pkg_enum_consts,
             contested_pkg_vars,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
@@ -4241,6 +4313,12 @@ impl Simulator {
             cond_progress: 0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
+            fork_collection_captures: HashMap::default(),
+            fork_capture_refs: HashMap::default(),
+            fork_gen_pids: HashMap::default(),
+            fork_pid_gens: HashMap::default(),
+            fork_local_scopes: HashMap::default(),
+            deferred_collection_cleanup: HashSet::default(),
             fork_signal_captures: HashMap::default(),
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
@@ -4547,6 +4625,7 @@ impl Simulator {
             blocking_cont_cache: HashMap::default(),
             class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
+            exec_cache_pids: HashSet::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
             zero_delay_defer_pending: false,
@@ -4633,6 +4712,7 @@ impl Simulator {
             multi_modclass: std::cell::OnceCell::new(),
             has_modclass: std::cell::Cell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
+            assoc_keys_cache: RefCell::new(HashMap::default()),
             sampled_watches: Vec::new(),
             sampled_defaults: HashMap::default(),
             time0_settled: false,
@@ -4643,6 +4723,12 @@ impl Simulator {
             pending_t0_triggers: Vec::new(),
             in_pre_process_settle: false,
         };
+        sim.has_assoc_rows = !sim.module.assoc_row_dims.is_empty()
+            || sim
+                .module
+                .classes
+                .values()
+                .any(|c| !c.assoc_row_property_dims.is_empty());
         // Static event names get stable IDs before simulation; class, local
         // and selected event identities can still be interned on first use.
         // Interning alone must not make an event appear already triggered.

@@ -8,6 +8,9 @@
 //! call or concatenation fell through to the packed-integer default. The
 //! compact form now also prints a lone string without quotes. Every
 //! expectation below was cross-checked against the reference simulator.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! `%0p` as `%p`, and no space before an associative array's closing brace.
 
 use xezim::simulate;
 
@@ -46,10 +49,10 @@ endmodule
         .collect::<Vec<_>>()
         .join("\n");
     for w in [
-        "A[\"ab\"][ab]",
-        "B[\"fx\"][fx]",
-        "C[\"line1\ncc\"][line1\ncc]",
-        "D = \n line1\ncc",
+        "A[\"ab\"][\"ab\"]",
+        "B[\"fx\"][\"fx\"]",
+        "C[\"line1\ncc\"][\"line1\ncc\"]",
+        "D = \n \"line1\ncc\"",
         "E[\"abz\"]",
     ] {
         assert!(text.contains(w), "expected {w:?} in:\n{text}");

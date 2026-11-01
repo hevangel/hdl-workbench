@@ -32,6 +32,13 @@ pub struct Parser {
     /// operators. Outside this context `or` stays an event-list separator
     /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
     in_sva_seq: bool,
+    /// §16.7: the next primary is a `##` cycle-delay count, a constant
+    /// primary: a name followed by `(` there is the count, and the
+    /// parenthesis starts the next sequence (`##N (x)`), not a call.
+    sva_delay_count: bool,
+    /// Parsing a function or task prototype's ports, where a formal's name
+    /// may be omitted (A.2.7 footnote 28).
+    prototype_ports: bool,
     /// The classes of this file so far, for the strict inheritance checks.
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
@@ -65,8 +72,59 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// A.2.2.3 `delay_value ::= ... | 1step`: the lexer reads `1` and an
+    /// adjacent `step`. Right after `#` or inside `#( )` they are one delay
+    /// value, the global time precision (§3.14.3): rejoin them as the
+    /// identifier `1step`, which no source identifier can spell, so every
+    /// delay form (`#1step;`, `a = #1step b;`, `assign #1step y = x;`, a gate
+    /// delay, a clocking skew) reads it alike. Anywhere else (`x = 1step;`)
+    /// they stay apart, an error. It was a delay of 1 and a stray `step`
+    /// (#615).
+    fn join_one_step(tokens: Vec<Token>) -> Vec<Token> {
+        let joinable = |i: usize| {
+            tokens[i].kind == TokenKind::IntegerLiteral
+                && tokens[i].text == "1"
+                && tokens[i + 1].kind == TokenKind::Identifier
+                && tokens[i + 1].text == "step"
+                && tokens[i + 1].span.start == tokens[i].span.end
+                && (tokens[i - 1].kind == TokenKind::Hash
+                    || (tokens[i - 1].kind == TokenKind::LParen
+                        && i >= 2
+                        && tokens[i - 2].kind == TokenKind::Hash
+                        && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::RParen))
+                    // xezim canonicalizes `a = #d b;` to the internal call
+                    // `$__xz_intra_delay(d, b)` before parsing.
+                    || (tokens[i - 1].kind == TokenKind::LParen
+                        && i >= 2
+                        && tokens[i - 2].text == "$__xz_intra_delay"
+                        && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::Comma)))
+        };
+        let joins: Vec<usize> = (1..tokens.len().saturating_sub(1))
+            .filter(|&i| joinable(i))
+            .collect();
+        if joins.is_empty() {
+            return tokens;
+        }
+        // One pass: removing each `step` in place shifted the whole tail.
+        let mut out = Vec::with_capacity(tokens.len() - joins.len());
+        let mut joins = joins.into_iter().peekable();
+        let mut rest = tokens.into_iter().enumerate();
+        while let Some((i, mut tok)) = rest.next() {
+            if joins.next_if_eq(&i).is_some()
+                && let Some((_, step)) = rest.next()
+            {
+                tok.kind = TokenKind::Identifier;
+                tok.text = crate::ast::decl::CLOCKING_ONE_STEP.to_string();
+                tok.span.end = step.span.end;
+            }
+            out.push(tok);
+        }
+        out
+    }
+
     pub fn new(tokens: Vec<Token>) -> Self {
         crate::record_reference_census(&tokens);
+        let tokens = Self::join_one_step(tokens);
         Self {
             tokens,
             pos: 0,
@@ -74,6 +132,8 @@ impl Parser {
             pending_pattern_bindings: Vec::new(),
             plain_loop_vars: Vec::new(),
             in_sva_seq: false,
+            sva_delay_count: false,
+            prototype_ports: false,
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
             in_constraint: false,
@@ -314,6 +374,38 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 self.parse_description()
             }
+            // §33.4: a configuration (`config cfg; design work.top; ...
+            // endconfig`). xezim takes its tops from `-s` or the design and
+            // has no library mapping, so the declaration is read and set
+            // aside with a warning; it was a stream of "unexpected token"
+            // errors (#603).
+            TokenKind::KwConfig => {
+                let start = self.current().span.start;
+                self.bump(); // config
+                let name = if self.at(TokenKind::Identifier) {
+                    self.current().text.clone()
+                } else {
+                    String::new()
+                };
+                while !self.at(TokenKind::KwEndconfig) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                if self.eat(TokenKind::KwEndconfig).is_some()
+                    && self.eat(TokenKind::Colon).is_some()
+                    && self.at(TokenKind::Identifier)
+                {
+                    self.bump();
+                }
+                self.diagnostics
+                    .push(crate::diagnostics::Diagnostic::warning(
+                        format!(
+                            "configuration '{name}' is ignored: xezim selects the design \
+                         top with -s and maps no libraries (IEEE 1800-2017 §33.4)"
+                        ),
+                        self.span_from(start),
+                    ));
+                None
+            }
             TokenKind::KwModule | TokenKind::KwMacromodule => {
                 Some(Description::Module(self.parse_module_declaration()))
             }
@@ -455,6 +547,11 @@ impl Parser {
                 Some(Description::PackageItem(self.parse_package_item().unwrap()))
             }
             TokenKind::KwTask => Some(Description::PackageItem(self.parse_package_item().unwrap())),
+            // §3.12.1, A.1.11: a property or sequence declaration is a
+            // package item, so it may sit at compilation-unit scope (#653).
+            TokenKind::KwProperty | TokenKind::KwSequence => {
+                self.parse_package_item().map(Description::PackageItem)
+            }
             TokenKind::Directive => {
                 if !self.recover_undefined_macro() {
                     self.bump();
