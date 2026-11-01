@@ -1228,7 +1228,15 @@ impl Simulator {
         if (Self::recv_chain_call(rvalue).is_some() || Self::recv_chain_call(lvalue).is_some())
             && let Some(base) = self.pin_stmt_recv_calls(&[rvalue, lvalue])
         {
-            self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+            // Rebuilt aggregate paths must retain the held receiver too;
+            // cloning a call would give it a new memo key (§11.4.11).
+            if self.is_unpacked_aggregate_operand(lvalue) || self.is_unpacked_aggregate_operand(rvalue) {
+                let rvalue = self.freeze_conditional_path(rvalue, true);
+                let lvalue = self.freeze_conditional_path(lvalue, true);
+                self.exec_stmt_blocking_assign_body(stmt, &lvalue, &rvalue);
+            } else {
+                self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+            }
             self.recv_call_memo.truncate(base);
             return;
         }
@@ -1286,15 +1294,111 @@ impl Simulator {
         ))
     }
 
+    /// §7.6 / §8.3.2: copy a class/package array constant in declared order.
+    fn try_class_const_array_copy(&mut self, lhs: &Expression, rhs: &Expression) -> bool {
+        if !matches!(lhs.kind, ExprKind::Ident(_)) {
+            return false;
+        }
+        let Some(leaf) = Self::receiver_prop_name(rhs) else {
+            return false;
+        };
+        if !self.class_member_names().constant_arrays.contains(leaf)
+            && !matches!(rhs.kind, ExprKind::MemberAccess { .. })
+        {
+            return false;
+        }
+        let Some(name) = self.array_operand_name(lhs) else {
+            return false;
+        };
+        if self.module.dynamic_arrays.contains(&name) {
+            return false;
+        }
+        let Some(&(lo, hi, _)) = self.module.arrays.get(&name) else {
+            return false;
+        };
+        let Some(c) = self.resolve_class_scope_array_const(rhs) else {
+            return false;
+        };
+        let count = (hi - lo + 1).min(c.hi - c.lo + 1).max(0) as usize;
+        let (left, right) = self
+            .module
+            .unpacked_decl_dims
+            .get(&name)
+            .and_then(|d| d.first())
+            .copied()
+            .unwrap_or_else(|| {
+                if self.module.descending_arrays.contains(&name) {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                }
+            });
+        for i in 0..count {
+            let src = if c.left > c.right {
+                c.left - i as i64
+            } else {
+                c.left + i as i64
+            };
+            let dst = if left > right {
+                left - i as i64
+            } else {
+                left + i as i64
+            };
+            let value = self
+                .class_scope_array_const_elem(&c, src)
+                .unwrap_or(Value::zero(32));
+            let key = format!("{name}[{dst}]");
+            let value = self.fit_block_local_array_elem(&name, &key, value);
+            self.set_signal_value_by_name(&key, value);
+        }
+        true
+    }
+
     pub(super) fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        if let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), rvalue) {
+            self.exec_stmt_blocking_assign(stmt, lvalue, &selected);
+            return;
+        }
         // §25.9: a static virtual-interface property binds by name before
         // any value path below stores (and returns).
         self.bind_static_vif(lvalue, rvalue);
+        // §11.9: a whole-union write that is NOT a `tagged` expression moves
+        // the active tag along with the value — `b = a` makes `b.Valid` a read
+        // of the member `a` holds — and any other such write (a function
+        // result, a pattern) drops the tag a previous `tagged` assignment
+        // left, or the inactive-member check refused `b.Valid` against a
+        // stale `Invalid` and raised a spurious run-time error. Ahead of the
+        // simple-assign fast path, which is where `b = a` stores and returns;
+        // a design without tagged unions pays the one `is_empty` test.
+        if !self.active_union_tag.is_empty() && !matches!(rvalue.kind, ExprKind::Tagged { .. }) {
+            if let ExprKind::Ident(lh) = &lvalue.kind {
+                if lh.path.len() == 1 && lh.path[0].selects.is_empty() {
+                    let lname = self.resolve_hier_name(lh);
+                    let src_tag = match &rvalue.kind {
+                        ExprKind::Ident(rh)
+                            if rh.path.len() == 1 && rh.path[0].selects.is_empty() =>
+                        {
+                            let rname = self.resolve_hier_name(rh);
+                            self.active_union_tag.get(&*rname).cloned()
+                        }
+                        _ => None,
+                    };
+                    match src_tag {
+                        Some(tag) => {
+                            self.active_union_tag.insert(lname.to_string(), tag);
+                        }
+                        None => {
+                            self.active_union_tag.remove(&*lname);
+                        }
+                    }
+                }
+            }
+        }
         if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
         {
             return;
@@ -1832,13 +1936,13 @@ impl Simulator {
                 // Allocate here, before the class walk.
                 if let Some(kind) = self.lvalue_container_kind(lvalue) {
                     let handle = self.heap.len();
-                    self.heap.push(Some(ClassInstance {
+                    self.heap.push(Some(Box::new(ClassInstance {
                         class_name: kind.to_string(),
                         properties: PropMap::default(),
                         type_bindings: HashMap::default(),
                         spec: None,
                         creation_scope: self.active_instance_scope(),
-                    }));
+                    })));
                     let cargs: &[Expression] = match &rvalue.kind {
                         ExprKind::Call { args, .. } => args,
                         _ => &[],
@@ -1918,6 +2022,15 @@ impl Simulator {
                                 break;
                             }
                         }
+                        // §8.25: an element type that is a class type
+                        // parameter takes this object's binding (#576).
+                        if mtn
+                            .as_deref()
+                            .is_some_and(|t| !self.module.classes.contains_key(t))
+                            && let Some(b) = self.prop_class_type(handle, &member_name)
+                        {
+                            mtn = Some(b);
+                        }
                         if let Some(mcls) = mtn.as_deref().and_then(|t| {
                             self.resolve_typedef_spec(t)
                                 .map(|(b, s)| (b.clone(), Some((b, s))))
@@ -1973,8 +2086,16 @@ impl Simulator {
                     // and the current class context.
                     let recv_elem_cls: Option<String> =
                         if bh.path.len() == 2 && bh.path[0].selects.is_empty() {
-                            self.eval_ident_handle(&bh.path[0].name.name)
-                                .filter(|&h| h != 0)
+                            let recv = self
+                                .eval_ident_handle(&bh.path[0].name.name)
+                                .filter(|&h| h != 0);
+                            // §8.25: an element type that is a class type
+                            // parameter takes the receiver's binding (#576).
+                            let bound = recv.and_then(|h| {
+                                self.prop_class_type(h, &bname)
+                                    .filter(|_| !self.module.classes.contains_key(&bname))
+                            });
+                            bound.or_else(|| recv
                                 .and_then(|h| {
                                     self.heap
                                         .get(h)
@@ -1996,7 +2117,7 @@ impl Simulator {
                                             None => break None,
                                         }
                                     }
-                                })
+                                }))
                         } else {
                             None
                         };
@@ -2469,8 +2590,12 @@ impl Simulator {
             // A string QUEUE is in `string_signals` too (so its
             // elements render as strings), but `q = {...}` on it is a
             // QUEUE assignment — `q = {}` clears it — not a byte concat.
+            let in_frame = matches!(self.local_stack.last(), Some(f) if f.contains_key(&*lname));
             let lhs_is_queue = self.module.dynamic_arrays.contains(&*lname)
-                || self.module.arrays.contains_key(&*lname);
+                || self.module.arrays.contains_key(&*lname)
+                || self
+                    .instance_assoc_member(&lname)
+                    .is_some_and(|scoped| !in_frame && self.class_queue_prop(&scoped));
             if !lhs_is_queue
                 && (self.string_signals.contains(&*lname)
                     || self.string_signals.contains(
@@ -2601,8 +2726,15 @@ impl Simulator {
                     for i in sz..old_sz {
                         self.signals.remove(&format!("{}[{}]", dst, i));
                     }
+                    // An unpacked-struct element has no `<src>[i]` signal,
+                    // only its member leaves.
+                    let member_wise = self.queue_elem_struct(&src).is_some();
                     for i in 0..sz {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", src, i)) {
+                        if member_wise {
+                            self.queue_copy_elem(&src, i, &dst, i);
+                        } else if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                        {
                             self.set_signal_value_by_name(&format!("{}[{}]", dst, i), v);
                         }
                     }
@@ -3220,6 +3352,10 @@ impl Simulator {
             // None and passes through unchanged.
             let type_name =
                 type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn.clone()));
+            // §8.25: a member target (`other.h = new`) takes the binding of
+            // the object that owns the member, not the running
+            // specialization's (#596).
+            let type_name = self.member_target_class(lvalue).or(type_name);
             if let Some(tname) = type_name {
                 // §8.25: the type-parameter resolved to a SPECIALIZED
                 // class name `Base#(args)` (e.g. `T obj = new()` where
@@ -3434,6 +3570,12 @@ impl Simulator {
                 }
             }
         }
+        // Resolve a whole constant array before scalar evaluation or the
+        // generic collection resolver can treat a class constant as a property.
+        if self.try_class_const_array_copy(lvalue, rvalue) {
+            self.settle_after_proc_write();
+            return;
+        }
         let val = if let ExprKind::Call { func, args } = &rvalue.kind {
             if let ExprKind::Ident(hier) = &func.kind {
                 let method_name = hier.path.last().unwrap().name.name.as_str();
@@ -3495,16 +3637,26 @@ impl Simulator {
                     // real `new` runs. Plain class names are unchanged.
                     let type_name =
                         type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn));
+                    // §8.25: `o.h = new()`, `h` declared by a type parameter:
+                    // the active specialization is not `o`'s (outside the
+                    // class, or inside another specialization), so the name
+                    // stayed the parameter's or took the wrong binding. Bind
+                    // it through the object that owns the member (#576).
+                    // The owner's binding comes first even when the running
+                    // specialization names a class: inside `W #(A)`,
+                    // `other.h = new()` with `other` a `W #(B)` builds a `B`
+                    // (#596).
+                    let type_name = self.member_target_class(lvalue).or(type_name);
                     if let Some(tname) = type_name {
                         if tname == "semaphore" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             let initial_count = args
                                 .first()
                                 .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
@@ -3513,13 +3665,13 @@ impl Simulator {
                             Value::from_u64(handle as u64, 32)
                         } else if tname == "mailbox" {
                             let handle = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: tname.clone(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             self.mailboxes
                                 .insert(handle, std::collections::VecDeque::new());
                             self.record_mailbox_bound(handle, args);
@@ -3577,13 +3729,13 @@ impl Simulator {
                                 // (`id_actions = new();`) recurses
                                 // new -> initialize -> new … forever.
                                 let h = self.heap.len();
-                                self.heap.push(Some(ClassInstance {
+                                self.heap.push(Some(Box::new(ClassInstance {
                                     class_name: tname.clone(),
                                     properties: PropMap::default(),
                                     type_bindings: HashMap::default(),
                                     spec: None,
                                     creation_scope: self.active_instance_scope(),
-                                }));
+                                })));
                                 Value::from_u64(h as u64, 32)
                             }
                         }
@@ -3604,13 +3756,13 @@ impl Simulator {
                             // enclosing class's constructor and
                             // recurses.
                             let h = self.heap.len();
-                            self.heap.push(Some(ClassInstance {
+                            self.heap.push(Some(Box::new(ClassInstance {
                                 class_name: String::new(),
                                 properties: PropMap::default(),
                                 type_bindings: HashMap::default(),
                                 spec: None,
                                 creation_scope: self.active_instance_scope(),
-                            }));
+                            })));
                             Value::from_u64(h as u64, 32)
                         }
                     }
@@ -3708,8 +3860,15 @@ impl Simulator {
             // lives under "<handle>#member" — resolve it like element
             // accesses already do, else a whole-array copy involving
             // a property is silently dropped.
+            // A FIXED multi-dimensional member is not a collection: it
+            // copies element-wise by shape (`copy_multi_dim_array`).
             sim.expr_assoc_name(e)
                 .filter(|an| !sim.is_associative_array(an))
+                .filter(|an| {
+                    sim.module.dynamic_arrays.contains(an)
+                        || !(sim.module.arrays_2d.contains_key(an)
+                            || sim.module.arrays_nd.contains_key(an))
+                })
                 .map(|an| (an, true))
         };
         let l_res = resolve_coll(self, lvalue);
@@ -3731,7 +3890,9 @@ impl Simulator {
                 && (l_is_prop || self.module.dynamic_arrays.contains(&lname))
                 && (r_is_prop || self.module.dynamic_arrays.contains(&rname))
             {
-                self.copy_whole_queue(&lname, &rname);
+                // Rows that are themselves dynamic arrays or queues
+                // (`int d[][]`) are copied with their sizes and elements.
+                self.copy_dyn_tree(&lname, &rname);
                 self.settle_after_proc_write();
                 return;
             }
@@ -3841,6 +4002,23 @@ impl Simulator {
                 let (rlo, rhi, _) = self.module.arrays[&*rname];
                 let lsize = (lhi - llo + 1) as usize;
                 let rsize = (rhi - rlo + 1) as usize;
+                // §7.2 / §7.6: an unpacked struct element consists of
+                // member leaves; its container scalar carries no value.
+                if let Some(su) = self.queue_elem_struct(&rname) {
+                    let dynamic_dst = self.module.dynamic_arrays.contains(&*lname);
+                    let count = if dynamic_dst { self.get_queue_size(&rname) as usize }
+                        else { lsize.min(rsize) };
+                    let l_desc = self.module.descending_arrays.contains(&*lname);
+                    let r_desc = self.module.descending_arrays.contains(&*rname);
+                    for i in 0..count {
+                        let li = if dynamic_dst { i as i64 } else if l_desc { lhi-i as i64 } else { llo+i as i64 };
+                        let ri = if r_desc { rhi-i as i64 } else { rlo+i as i64 };
+                        self.copy_unpacked_struct(&format!("{lname}[{li}]"), &format!("{rname}[{ri}]"), &su);
+                    }
+                    if dynamic_dst { self.set_queue_size(&lname, count as u64); }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 // §7.6: assigning a FIXED array to a DYNAMIC array
                 // resizes the destination to the source's size —
                 // the placeholder (0,63) registration made this look

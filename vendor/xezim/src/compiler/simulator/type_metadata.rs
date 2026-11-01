@@ -855,6 +855,27 @@ impl Simulator {
         if self.bare_name_is_class_channel(first) {
             return true;
         }
+        // A composed declaration is authoritative. A same-named class
+        // variable in the observer cannot turn a struct/net into a handle.
+        if segs.len() > 1 {
+            let dotted = segs.join(".");
+            let name = dotted
+                .strip_prefix(&format!("{}.", self.module.name))
+                .unwrap_or(&dotted);
+            if let Some(dt) = self.module.var_decl_types.get(name) {
+                return self
+                    .declared_typeref_name(dt)
+                    .and_then(|tn| self.resolve_typeref_class_name_str(&tn))
+                    .is_some();
+            }
+            if let Some(sig) = self.module.signals.get(name) {
+                return sig
+                    .type_name
+                    .as_deref()
+                    .and_then(|tn| self.resolve_typeref_class_name_str(tn))
+                    .is_some();
+            }
+        }
         let dotted = segs.join(".");
         if self
             .local_stack

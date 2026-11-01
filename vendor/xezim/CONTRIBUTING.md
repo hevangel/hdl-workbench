@@ -14,7 +14,7 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
   or another simulator's result. When you checked against a commercial
   simulator, say "the reference simulator" rather than naming a product.
 * **The xezim version or commit.** `--verbose` prints the version banner
-  (`=== xezim 0.11.2 ===`).
+  (`=== xezim 0.11.4 ===`).
 
 ## Pull requests
 
@@ -39,20 +39,22 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
 ## Test suites
 
 Each suite is one test binary, `tests/<suite>.rs`, with its cases in
-`tests/<suite>/`. As of 0.11 there were 3,152 tests: 3,110 integration tests
-in ten suites plus 42 unit tests (9 more are marked `#[ignore]`):
+`tests/<suite>/`. In 0.11.4, the default suite passes 5,838 tests: 5,728
+integration tests in eleven suites, 109 unit tests and one documentation test.
+One additional scheduling test is marked `#[ignore]`:
 
 | Suite | Tests | Covers |
 |---|---:|---|
-| `classes` | 460 | classes, UVM, randomization, covergroups |
-| `collections` | 155 | queues, dynamic and associative arrays, array methods |
-| `gates` | 122 | gate primitives, UDPs, drive strengths, waveform dumps |
-| `hierarchy` | 246 | instances, ports, interfaces, binds, hierarchical references |
-| `misc` | 1,009 | CLI, lint, elaboration, assignments and other cases |
-| `perf` | 35 | deterministic work counters that catch performance regressions |
-| `scheduling` | 432 | event regions, sensitivity, timing, assertions |
-| `strings` | 152 | strings, formatting, DPI and VPI |
-| `types` | 495 | data types, widths, selects, operators |
+| `classes` | 1,287 | classes, UVM, randomization, covergroups |
+| `collections` | 374 | queues, dynamic and associative arrays, array methods |
+| `gates` | 195 | gate primitives, UDPs, drive strengths, waveform dumps |
+| `hierarchy` | 614 | instances, ports, interfaces, binds, hierarchical references |
+| `lrm` | 177 | IEEE 1800-2023 conformance cases |
+| `misc` | 1,260 | CLI, lint, elaboration, assignments and other cases |
+| `perf` | 48 | deterministic work counters that catch performance regressions |
+| `scheduling` | 710 | event regions, sensitivity, timing, assertions |
+| `strings` | 261 | strings, formatting, DPI and VPI |
+| `types` | 798 | data types, widths, selects, operators |
 | `upf` | 4 | power intent (`--upf`) |
 
 The xezim-core repository has its own tests for the parser and elaboration.
@@ -62,9 +64,10 @@ one module per LRM clause, each test running a small probe design and
 comparing its output with the reference simulator's. Lines where xezim still
 differs are left out and listed as `Known gap` comments at the test.
 
-CI runs the suite twice: in a default build (`cargo test`) and in a build with
-the JIT compiled in (`cargo test --features jit`). JIT execution itself is
-switched on at run time with `XEZIM_JIT=1`. A large share are differential
+CI runs the full default suite (`cargo test`) and two JIT smoke tests selected
+in `.github/workflows/test.yml`. The full JIT regression remains available
+manually with `cargo test --features jit`; JIT execution itself is switched
+on at run time with `XEZIM_JIT=1`. A large share are differential
 tests whose expected values were measured on a commercial reference simulator;
 their doc comments cite the LRM section and the measured behaviour. Tests
 marked `#[ignore = "known gap: ..."]` pin a known divergence from the

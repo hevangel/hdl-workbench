@@ -1,8 +1,8 @@
 # Vendored simulator sources
 
-`xezim/` is Xezim revision `22faa127a9cc0156bd23e0ab117f400c64231913`.
+`xezim/` is Xezim revision `e8266416d52b0bed45c0b78b8b7db39098221391` (release 0.11.4).
 `xezim-core/` (including `xezim-parser/`) is revision
-`d15cdc39e27a4c0a8a55f7e1d46369181307ead9`.
+`8ebdf4a3f1346fe758e98f4a6a6c822f17f38e54`.
 
 Both upstream projects are licensed `MIT OR Apache-2.0`; their license files
 are kept in the corresponding source trees. The local copies were created from

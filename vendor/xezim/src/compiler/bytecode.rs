@@ -32,6 +32,10 @@ pub(crate) struct MethodAdmission {
     /// non-input formal positions inherited by a receiver's class.
     pub class_parents: HashMap<String, String>,
     pub instance_fields: HashMap<String, HashSet<String>>,
+    /// §11.6.1: declared width of each fixed-width integral instance field,
+    /// the context width of a compiled `recv.field = rhs`. Strings, reals,
+    /// handles and parameter-sized fields are absent (stored self-determined).
+    pub instance_field_widths: HashMap<String, HashMap<String, u32>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
     /// NON-virtual method that some subclass redeclares (the only case where
@@ -1043,6 +1047,15 @@ pub enum CompiledMethodOutcome {
     Nil,
 }
 
+/// Decodes one on-disk method-cache entry (`m<key>.bin`). The cache's wire
+/// format is the artifact format; readers outside the simulator (tests)
+/// go through here so a format change touches one place.
+pub fn decode_persisted_method_outcome(bytes: &[u8]) -> Option<PersistedMethodOutcome> {
+    bincode::serde::decode_from_slice(bytes, xezim_core::xez_bincode_config())
+        .ok()
+        .map(|(outcome, _)| outcome)
+}
+
 /// class-perf persistent cache (XEZIM_METHOD_CACHE): the disk form of one
 /// compiled class-method outcome — the Rc-free mirror of
 /// `CompiledMethodOutcome`, bincode-serialized under a content key in the
@@ -1641,6 +1654,14 @@ pub struct BytecodeCompiler<'a> {
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
     pub scope_hint: Option<String>,
+    /// §26.3: `pkg::member` -> (value, width) of every package enum member,
+    /// shared by the module-code compilers (`pkg_enum_consts` is the
+    /// method-mode snapshot). A member two packages both declare reaches
+    /// the compiler as the two-segment `pkg.member` the inliner spells it
+    /// with; resolving that by name landed on the bare signal twin.
+    pkg_enum_consts_ref: Option<&'a HashMap<String, (u64, u32)>>,
+    /// Enum literals visible in the method's lexical class (before global names).
+    pub(crate) method_enum_constants: HashMap<String, Value>,
     /// Process-FSM mode (roadmap 11-12): statement-level `#delay` and
     /// `@(event)` compile to WaitDelayReg / WaitEdge instead of bailing.
     /// Never set for edge or comb blocks.
@@ -1746,6 +1767,16 @@ pub struct BytecodeCompiler<'a> {
     /// Step 9f: BARE-call static targets — non-virtual method name -> the
     /// first defining class from the lexical chain (§8.20).
     static_bare_targets: HashMap<String, String>,
+    /// LRM 11.6/11.8.2: declared width of every input port of every method
+    /// visible in the enclosing class chain, keyed by method name.  A call
+    /// ACTUAL is context-determined by the callee's declared formal — with
+    /// `function bit wide9(logic [8:0] v)`, the call site `wide9(a + b)`
+    /// must evaluate `a + b` at 9 bits (300), not at its 8-bit self width
+    /// (44).  The inline path already gets this from `port_effective_width`;
+    /// the CallMethod/CallScopedMethod lowerings compile their actuals
+    /// against `ctx_width = 0` and so silently truncated.  Missing entry or
+    /// width 0 = keep the old self-determined behavior.
+    method_formal_widths: HashMap<String, Vec<u32>>,
     /// Step 9g: WRITABLE static-property names (bare) of the enclosing
     /// class chain — reads AND stores lower to Load/StoreClassStatic.
     static_member_names: HashSet<String>,
@@ -2119,6 +2150,8 @@ impl<'a> BytecodeCompiler<'a> {
             allow_ast_fallback: false,
             m_labels: Vec::new(),
             scope_hint: None,
+            pkg_enum_consts_ref: None,
+            method_enum_constants: HashMap::default(),
             allow_waits: false,
             wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
@@ -2139,6 +2172,7 @@ impl<'a> BytecodeCompiler<'a> {
             super_method_names: HashSet::default(),
             method_class_parent: None,
             static_bare_targets: HashMap::default(),
+            method_formal_widths: HashMap::default(),
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
@@ -2785,6 +2819,26 @@ impl<'a> BytecodeCompiler<'a> {
 
     pub fn set_scope_hint(&mut self, scope: Option<String>) {
         self.scope_hint = scope;
+    }
+
+    pub fn set_pkg_enum_consts(&mut self, m: &'a HashMap<String, (u64, u32)>) {
+        self.pkg_enum_consts_ref = Some(m);
+    }
+
+    /// `pkg::member` of a two-segment identifier naming a package enum
+    /// member, from either enum table.
+    fn pkg_enum_const_of(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        if hier.root.is_some()
+            || hier.path.len() != 2
+            || hier.path.iter().any(|seg| !seg.selects.is_empty())
+        {
+            return None;
+        }
+        let key = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+        self.pkg_enum_consts
+            .get(&key)
+            .or_else(|| self.pkg_enum_consts_ref.and_then(|m| m.get(&key)))
+            .map(|&(val, width)| Value::from_u64(val, width.max(1)))
     }
 
     pub fn set_cast_widths(&mut self, m: &'a HashMap<String, (u32, bool)>) {
@@ -6459,6 +6513,13 @@ impl<'a> BytecodeCompiler<'a> {
             match &e.kind {
                 ExprKind::Ident(h) => {
                     if h.path.len() != 1 {
+                        // `Cfg.VLEN`: a member of a packed-struct parameter
+                        // is a constant (§6.20.2), not module state.
+                        if h.path.iter().all(|seg| seg.selects.is_empty())
+                            && me.lookup_param_value(h).is_some()
+                        {
+                            return true;
+                        }
                         // `fname.member` may arrive as TWO segments; it is
                         // function-local when the head is bound (the return
                         // variable or a formal).
@@ -7106,6 +7167,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// it; enclosing inline frames are tried otherwise.
     fn decl_width_in(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
         use crate::ast::types::DataType;
+        let inst_scope = self.scope_hint.as_deref().or(scope);
         let mut cur = dt;
         let mut owner = scope;
         let mut factor = 1u32;
@@ -7117,11 +7179,7 @@ impl<'a> BytecodeCompiler<'a> {
                 span,
             } = cur
             else {
-                return factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                    cur,
-                    self.params,
-                    self.typedefs,
-                ));
+                return factor.saturating_mul(self.decl_width_with_arrays(cur, inst_scope));
             };
             if !type_args.is_empty() || name.has_specialized_scope() {
                 break;
@@ -7133,11 +7191,7 @@ impl<'a> BytecodeCompiler<'a> {
                 dimensions: dimensions.clone(),
                 span: *span,
             };
-            factor = factor.saturating_mul(crate::compiler::elaborate::resolve_type_width(
-                &dims,
-                self.params,
-                self.typedefs,
-            ));
+            factor = factor.saturating_mul(self.decl_width_with_arrays(&dims, inst_scope));
             if self.runtime_type_param(name, owner) {
                 return crate::compiler::elaborate::resolve_type_width(dt, self.params, None);
             }
@@ -7156,7 +7210,36 @@ impl<'a> BytecodeCompiler<'a> {
                 break;
             }
         }
-        crate::compiler::elaborate::resolve_type_width(dt, self.params, self.typedefs)
+        self.decl_width_with_arrays(dt, inst_scope)
+    }
+
+    fn decl_width_with_arrays(&self, dt: &crate::ast::types::DataType, scope: Option<&str>) -> u32 {
+        use crate::compiler::scoped_arrays;
+        let mut view = HashMap::default();
+        for arg in scoped_arrays::query_operands(dt) {
+            let Some(name) = scoped_arrays::operand_name(arg) else {
+                continue;
+            };
+            let shape = if let Some(local) = self.local_var_array.get(&name) {
+                Some((
+                    local.lo,
+                    local.lo + local.regs.len() as i64 - 1,
+                    local.elem_w,
+                ))
+            } else if let Some(&(_, width, len, lo)) = self.local_array_regs.get(&name) {
+                Some((lo, lo + len as i64 - 1, width))
+            } else {
+                scope
+                    .and_then(|scope| self.arrays.get(&cat_dot(scope, &name)))
+                    .or_else(|| self.arrays.get(&name))
+                    .or_else(|| self.arrays.get(&name.replace('.', "::")))
+                    .copied()
+            };
+            if let Some(shape) = shape {
+                view.insert(name, shape);
+            }
+        }
+        scoped_arrays::resolve_type_width(dt, self.params, self.typedefs, &view)
     }
 
     /// Packed ELEMENT width of a declared type, for register-backed locals:
@@ -7718,8 +7801,25 @@ impl<'a> BytecodeCompiler<'a> {
         if layout.is_empty() {
             return None;
         }
+        // The recorded layout is flattened: a nested member is its own row
+        // (`exception.cause`) as well as its parent (`exception`). Those rows
+        // overlap. Concatenating every row builds a value wider than the
+        // struct, and the assignment keeps the low bits, so a named member
+        // such as `trans_id` lands outside its slot. A later member write
+        // repairs the fields it touches and leaves the shifted one at 0.
+        // Pack only the direct children — the same set the interpreter walks
+        // in `apply_packed_struct_pattern`. A pattern on a nested member
+        // still bails (this function's caller has already taken
+        // `pattern_layout`), and the statement runs on the interpreter.
+        let mut fields: Vec<(String, u32, u32)> = layout
+            .iter()
+            .filter(|(n, _, _)| !n.contains('.'))
+            .cloned()
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
         // MSB-first: highest offset first.
-        let mut fields: Vec<(String, u32, u32)> = layout.to_vec();
         fields.sort_by(|a, b| b.1.cmp(&a.1));
 
         let mut named: Vec<(usize, &Expression)> = Vec::new();
@@ -7752,19 +7852,63 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let mut regs: Vec<RegId> = Vec::with_capacity(fields.len());
-        for (idx, (_, _, w)) in fields.iter().enumerate() {
+        for (idx, (name, _, w)) in fields.iter().enumerate() {
             let expr = if !ordered.is_empty() {
                 ordered[idx]
             } else if let Some((_, e)) = named.iter().find(|(i, _)| *i == idx) {
                 e
             } else {
-                default?
+                // §10.9.2: `default:` fills a nested struct member member by
+                // member (see `apply_packed_struct_pattern`).
+                let d = default?;
+                regs.push(self.compile_default_fill(layout, name, d, *w)?);
+                continue;
             };
             let src = self.compile_expr(expr, *w)?;
             let r = self.alloc_reg();
             self.emit(Insn::Move(r, src));
             self.emit(Insn::Resize(r, *w));
             regs.push(r);
+        }
+        let dest = self.alloc_reg();
+        self.emit(Insn::Concat(dest, Box::new(regs)));
+        Some(dest)
+    }
+
+    /// The value `default:` gives the packed-struct member `name` of width
+    /// `w`: each of its own members filled in turn when it is a nested
+    /// struct (§10.9.2), else the default at the member's width. A pattern
+    /// default is left to the interpreter.
+    fn compile_default_fill(
+        &mut self,
+        layout: &[(String, u32, u32)],
+        name: &str,
+        default: &Expression,
+        w: u32,
+    ) -> Option<RegId> {
+        let pfx = format!("{name}.");
+        let mut kids: Vec<(String, u32, u32)> = layout
+            .iter()
+            .filter(|(k, _, _)| {
+                k.strip_prefix(&pfx)
+                    .is_some_and(|r| !r.is_empty() && !r.contains('.'))
+            })
+            .cloned()
+            .collect();
+        if kids.is_empty() {
+            let src = self.compile_expr(default, w)?;
+            let r = self.alloc_reg();
+            self.emit(Insn::Move(r, src));
+            self.emit(Insn::Resize(r, w));
+            return Some(r);
+        }
+        if matches!(default.kind, ExprKind::AssignmentPattern(_)) {
+            return None;
+        }
+        kids.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut regs = Vec::with_capacity(kids.len());
+        for (k, _, kw) in &kids {
+            regs.push(self.compile_default_fill(layout, k, default, *kw)?);
         }
         let dest = self.alloc_reg();
         self.emit(Insn::Concat(dest, Box::new(regs)));
@@ -8676,7 +8820,8 @@ impl<'a> BytecodeCompiler<'a> {
                         self.lookup_param_value(h)?
                     }
                 } else {
-                    self.lookup_param_value(h)?
+                    self.lookup_param_value(h)
+                        .or_else(|| self.const_param_member_path(h))?
                 }
             }
             ExprKind::Unary { op, operand } => {
@@ -8719,9 +8864,58 @@ impl<'a> BytecodeCompiler<'a> {
                     _ => return None,
                 }
             }
+            ExprKind::MemberAccess { expr, member } => self.const_param_member(expr, &member.name)?,
             _ => return None,
         };
         (!v.has_xz() && !v.is_real).then_some(v)
+    }
+
+    /// §6.20.2, §7.2.1: a member of a struct-typed parameter (`Cfg.LW`) is a
+    /// constant — the parameter's value sliced by its registered layout. None
+    /// of the constant folders had a MemberAccess arm, so a part-select bound
+    /// written through one (`q[Cfg.LW/Cfg.AW-1:1]` on a `[1:0][63:0]` array)
+    /// counted as dynamic and took the flat BIT-range path: CVA6's AXI adapter
+    /// returned its cache line shifted by 63 bits and the core never fetched a
+    /// second instruction.
+    fn const_param_member(&self, base: &Expression, member: &str) -> Option<Value> {
+        let mut base = base;
+        while let ExprKind::Paren(inner) = &base.kind {
+            base = inner;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        self.const_param_member_hier(h, member)
+    }
+
+    /// The inliner spells an instance's `Cfg.LW` as ONE hierarchical
+    /// identifier whose last segment is the member (`u1.Cfg` . `LW`).
+    fn const_param_member_path(&self, h: &HierarchicalIdentifier) -> Option<Value> {
+        if h.path.len() < 2 {
+            return None;
+        }
+        let member = h.path.last()?.name.name.as_str();
+        let base = HierarchicalIdentifier {
+            root: h.root.clone(),
+            path: h.path[..h.path.len() - 1].to_vec(),
+            span: h.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        self.const_param_member_hier(&base, member)
+    }
+
+    fn const_param_member_hier(&self, h: &HierarchicalIdentifier, member: &str) -> Option<Value> {
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let pv = self.lookup_param_value(h)?;
+        let (_, fields) = self.packed_struct_layout_for_hier(h)?;
+        let &(_, off, w) = fields.iter().find(|(n, _, _)| n == member)?;
+        if w == 0 || off.checked_add(w)? > pv.width {
+            return None;
+        }
+        Some(pv.range_select((off + w - 1) as usize, off as usize))
     }
 
     /// Detect the ROM `case` shape: every arm `L = <const>` with constant
@@ -9715,7 +9909,25 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    fn method_enum_constant(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        if !self.method_mode
+            || hier.root.is_some()
+            || hier.path.len() != 1
+            || !hier.path[0].selects.is_empty()
+        {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if self.local_var_regs.contains_key(name) || self.local_array_regs.contains_key(name) {
+            return None;
+        }
+        self.method_enum_constants.get(name).cloned()
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
+        if let Some(value) = self.method_enum_constant(hier) {
+            return Some(value);
+        }
         let params = self.params?;
         let raw = Self::hier_raw_cow(hier);
         let raw: &str = &raw;
@@ -9732,6 +9944,12 @@ impl<'a> BytecodeCompiler<'a> {
             let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
             if let Some(v) = params.get(q.as_str()) {
                 return Some(v.clone());
+            }
+            // §26.3: a package ENUM member has no parameter entry under its
+            // qualified spelling; take it from the enum table before any
+            // bare fallback can pick another package's member.
+            if let Some(v) = self.pkg_enum_const_of(hier) {
+                return Some(v);
             }
         }
         if let Some(scope) = &self.scope_hint {
@@ -11181,6 +11399,14 @@ impl<'a> BytecodeCompiler<'a> {
             } if self.allow_waits => {
                 match control {
                     crate::ast::stmt::TimingControl::Delay(d) => {
+                        // §3.14.3: `1step` is one global tick, not a value the
+                        // wait rounds to the scope's precision; the
+                        // interpreter's delay path handles it (#615).
+                        if matches!(&d.kind, ExprKind::SystemCall { name, .. }
+                            if name == crate::compiler::elaborate::ONE_STEP_DELAY)
+                        {
+                            return false;
+                        }
                         let Some(r) = self.compile_expr(d, 0) else {
                             return false;
                         };
@@ -13178,6 +13404,19 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                 }
+                // §26.3: a package constant two packages both declare has a
+                // shared bare signal twin (last package registered wins);
+                // the compiled unit's import decides which one it names.
+                // §26.3: `pkg.member` — the inliner's spelling of an enum
+                // member two packages both declare — is a constant of THAT
+                // package; resolved by name it landed on the bare signal twin.
+                if hier.path.len() == 2
+                    && let Some(v) = self.pkg_enum_const_of(hier)
+                {
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadConst(r, Box::new(v)));
+                    return Some(r);
+                }
                 // A register-backed block local (a for-loop variable) shadows
                 // any same-named signal for the duration of its loop.
                 if let Some((src, _)) = self.local_var_reg_of(hier) {
@@ -13275,6 +13514,11 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.method_this_reg.expect("this in method_mode"),
                                 bare.to_string().into_boxed_str(),
                             ));
+                            return Some(dest);
+                        }
+                        if let Some(value) = self.method_enum_constant(hier) {
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::LoadConst(dest, Box::new(value)));
                             return Some(dest);
                         }
                         // Step 9g: a bare STATIC property (or class localparam)
@@ -13647,10 +13891,10 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     sub_ctx
                 };
-                let left_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(left));
-                let right_unsigned =
-                    joint_unsigned && (!is_self_determined || has_context_shift(right));
+                // §11.8.2: comparison operands determine each other's type
+                // before evaluation, including nested arithmetic, not only shifts.
+                let left_unsigned = joint_unsigned;
+                let right_unsigned = joint_unsigned;
                 let l = self.compile_expr_typed(left, sub_ctx, left_unsigned)?;
                 // §11.4.10: a shift's RIGHT operand is SELF-DETERMINED — its
                 // width never affects the result, so it keeps its own.
@@ -14169,12 +14413,21 @@ impl<'a> BytecodeCompiler<'a> {
                         // index came out X.)
                         if let Some(idx) = self.eval_const_expr(index) {
                             let base = self.compile_expr(expr, 0)?;
-                            let lo = Self::packed_elem_lsb(
-                                self.packed_outer_dim(hier),
-                                idx as i64,
-                                elem_w,
-                            )
-                            .max(0) as u32;
+                            // §11.5.1: a constant index outside the declared
+                            // range reads x. `eval_const_expr` folds in u32, so
+                            // a `-1` (`conf_addr_i[i-1]` at genvar 0) arrived as
+                            // 4294967295 and `lo + elem_w` overflowed.
+                            let dim = self.packed_outer_dim(hier);
+                            let in_range = match dim {
+                                Some((l, r)) => (idx as i64) >= l.min(r) && (idx as i64) <= l.max(r),
+                                None => (idx as u64).saturating_mul(elem_w as u64) < u32::MAX as u64,
+                            };
+                            if !in_range {
+                                let dest = self.alloc_reg();
+                                self.emit(Insn::LoadConst(dest, Box::new(Value::new(elem_w))));
+                                return Some(dest);
+                            }
+                            let lo = Self::packed_elem_lsb(dim, idx as i64, elem_w).max(0) as u32;
                             let hi = lo + elem_w - 1;
                             let dest = self.alloc_reg();
                             self.emit(Insn::RangeSelectConst(dest, base, hi, lo));
@@ -15391,12 +15644,25 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("super_no_parent");
                         return None;
                     };
+                    // §13.5.1: the actual is context-determined by the
+                    // parent's declared formal, as for the bare call below.
+                    // `super.<m>` holds the parent chain's widths, which an
+                    // `m` the defining class hides does not shadow (see
+                    // `class_method_formal_widths`).
+                    let callee_widths: Option<Vec<u32>> = self
+                        .method_formal_widths
+                        .get(format!("super.{}", member.name).as_str())
+                        .cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = callee_widths
+                            .as_ref()
+                            .and_then(|w| w.get(ai).copied())
+                            .unwrap_or(0);
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -15586,12 +15852,29 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("bare_call_no_this");
                         return None;
                     };
+                    // LRM 11.6/11.8.2: a call ACTUAL is context-determined
+                    // by the callee's DECLARED formal, exactly like the
+                    // operand of a comparison.  `wide9(a + b)` against
+                    // `function bit wide9(logic [8:0] v)` must evaluate
+                    // `a + b` at 9 bits (300); compiling it self-determined
+                    // yields 8-bit 44 and the callee compares 44 !== 300.
+                    // Mirrors the inline path, which binds with
+                    // `port_effective_width`.  Unknown callee / non-scalar
+                    // port = width 0 = the previous self-determined behavior.
+                    let callee_widths: Option<Vec<u32>> = self
+                        .method_formal_widths
+                        .get(h.path[0].name.name.as_str())
+                        .cloned();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = callee_widths
+                            .as_ref()
+                            .and_then(|w| w.get(ai).copied())
+                            .unwrap_or(0);
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -15691,8 +15974,17 @@ impl<'a> BytecodeCompiler<'a> {
                     let call_next = self.next_reg;
                     let mut ok = true;
                     let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
-                    for a in args {
-                        match self.compile_expr(a, 0) {
+                    // §13.5.1: a scalar input formal is the actual's context
+                    // width (the inline path binds the same way); unpacked
+                    // formals keep the self-determined compile.
+                    let fn_scope = name.rsplit_once('.').map(|(s, _)| s.to_string());
+                    for (ai, a) in args.iter().enumerate() {
+                        let ctx = if fd.ports[ai].dimensions.is_empty() {
+                            self.port_effective_width(&fd.ports, ai, fn_scope.as_deref())
+                        } else {
+                            0
+                        };
+                        match self.compile_expr(a, ctx) {
                             Some(r) => arg_values.push(r),
                             None => {
                                 ok = false;
@@ -16658,6 +16950,13 @@ impl<'a> BytecodeCompiler<'a> {
                 let mut part_widths = Vec::with_capacity(parts.len());
                 for p in parts {
                     let w = self.infer_lhs_width(p);
+                    // A heap-field store uses width 0 to defer sizing to its
+                    // receiver. Splitting a concatenation requires concrete
+                    // widths; leave this assignment to the interpreter.
+                    if w == 0 {
+                        self.bail("concat_lhs_dynamic_width");
+                        return false;
+                    }
                     part_widths.push(w);
                 }
                 let mut bit_offset: u32 = 0;
@@ -17959,6 +18258,13 @@ impl<'a> BytecodeCompiler<'a> {
                 let mut part_widths = Vec::with_capacity(parts.len());
                 for p in parts {
                     let w = self.infer_lhs_width(p);
+                    // A heap-field store uses width 0 to defer sizing to its
+                    // receiver. Splitting a concatenation requires concrete
+                    // widths; leave this assignment to the interpreter.
+                    if w == 0 {
+                        self.bail("concat_lhs_dynamic_width");
+                        return false;
+                    }
                     part_widths.push(w);
                 }
                 let mut bit_offset: u32 = 0;
@@ -18168,25 +18474,26 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
-            // Step 9e: a `this.member = rhs` store inside a compiled method
-            // evaluates its RHS self-determined, exactly like the bare-member
-            // rule above — the 32-bit default truncated
-            // uvm_reg_item::set_offset's 64-bit actual (6976).
+            // §11.6.1: a heap-field store's context is the field's declared
+            // width, for every admitted receiver, not just `this`, so
+            // `d.f = a + b` keeps the carry. Fields without a fixed integral
+            // width (strings, reals, parameter-sized) stay self-determined
+            // (0) and StoreClassMember fits them; a guessed 32-bit context
+            // truncated strings and wide values.
             ExprKind::MemberAccess { expr, member } if self.method_mode => {
-                let is_this = matches!(&expr.kind, ExprKind::This)
-                    || matches!(
-                        &expr.kind,
-                        ExprKind::Ident(h)
-                            if h.root.is_none()
-                                && h.path.len() == 1
-                                && h.path[0].selects.is_empty()
-                                && h.path[0].name.name.as_str() == "this"
-                    );
-                if is_this && self.bare_member_names.contains(member.name.as_str()) {
-                    0
-                } else if is_this && self.string_member_names.contains(member.name.as_str()) {
-                    // class-perf P2: a string member leaf is self-determined.
-                    0
+                if self.method_handle_chain_ok(expr)
+                    && self.method_instance_field_ok(expr, &member.name)
+                {
+                    self.method_handle_chain_class(expr)
+                        .and_then(|class| {
+                            self.method_admission
+                                .as_ref()?
+                                .instance_field_widths
+                                .get(&class)?
+                                .get(&member.name)
+                                .copied()
+                        })
+                        .unwrap_or(0)
                 } else {
                     32
                 }
@@ -18246,8 +18553,15 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(v as u32);
                     }
                 }
-                self.lookup_param_value(hier)?.to_u64().map(|u| u as u32)
+                self.lookup_param_value(hier)
+                    .or_else(|| self.const_param_member_path(hier))?
+                    .to_u64()
+                    .map(|u| u as u32)
             }
+            ExprKind::MemberAccess { expr, member } => self
+                .const_param_member(expr, &member.name)?
+                .to_u64()
+                .map(|u| u as u32),
             // Fold simple parameter arithmetic so slice bounds like
             // `[ENTRY_NUM-1:0]` resolve. Without this, expr_max_width on a
             // sliced range returned 1 (unwrap_or(0)), which then clobbered
@@ -18674,6 +18988,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn expr_signedness(&mut self, e: &Expression) -> Option<bool> {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer { signed, .. }) => Some(*signed),
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(false),
             ExprKind::Paren(i) => self.expr_signedness(i),
             // §20/§21: an `int`/`integer`-valued system function is SIGNED
             // (`$countones(x) - 8 < 0` is a signed compare); `bit`, `time`
@@ -18702,8 +19017,21 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Part-selects, concatenations and replications are UNSIGNED
             // regardless of their operands (§11.8.1).
-            ExprKind::Index { .. }
-            | ExprKind::RangeSelect { .. }
+            ExprKind::Index { expr, .. } => {
+                // §7.4: an unpacked element retains its declared type; only
+                // a packed bit-select is necessarily unsigned (§11.8.1).
+                if let Some(id) = self.const_multi_dim_array_elem_signal_id(e) {
+                    return self.signal_signed.get(id).copied();
+                }
+                if let ExprKind::Ident(h) = &expr.kind
+                    && let Some(name) = self.lookup_array_name(h)
+                {
+                    let first = self.array_first_id?.get(name.as_str())?.0;
+                    return self.signal_signed.get(first).copied();
+                }
+                self.operand_scrub_is_noop(e).then_some(false)
+            }
+            ExprKind::RangeSelect { .. }
             | ExprKind::Concatenation(_)
             | ExprKind::Replication { .. } => Some(false),
             ExprKind::SystemCall { name, args } => match name.as_str() {
@@ -18714,7 +19042,13 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => None,
             },
             ExprKind::Unary { op, operand } => match op {
-                UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => self.expr_signedness(operand),
+                UnaryOp::Plus
+                | UnaryOp::Minus
+                | UnaryOp::BitNot
+                | UnaryOp::PreIncr
+                | UnaryOp::PreDecr
+                | UnaryOp::PostIncr
+                | UnaryOp::PostDecr => self.expr_signedness(operand),
                 // Reductions and ! are 1-bit unsigned.
                 _ => Some(false),
             },
@@ -19128,6 +19462,7 @@ impl<'a> BytecodeCompiler<'a> {
         super_method_names: &HashSet<String>,
         method_class_parent: &Option<String>,
         static_bare_targets: &HashMap<String, String>,
+        method_formal_widths: &HashMap<String, Vec<u32>>,
         static_member_names: &HashSet<String>,
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
@@ -19274,6 +19609,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.super_method_names = super_method_names.clone();
         self.method_class_parent = method_class_parent.clone();
         self.static_bare_targets = static_bare_targets.clone();
+        self.method_formal_widths = method_formal_widths.clone();
         // class-perf P2 (typed handle roots): declared class per handle
         // formal / class-typed local, consulted by
         // `method_handle_chain_class` so `sched.m_parent.get_pt()` admits.
@@ -19409,6 +19745,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();
+            self.method_formal_widths.clear();
             self.method_result_reg = None;
             self.method_return_val_reg = None;
             self.method_result_width = None;
@@ -23118,6 +23455,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23215,6 +23553,7 @@ mod tests {
             &HashSet::default(),
             &None,
             &HashMap::default(),
+            &HashMap::default(),
             &HashSet::default(),
             &HashSet::default(),
             &HashMap::default(),
@@ -23290,6 +23629,7 @@ mod tests {
                     &HashSet::default(),
                     &HashSet::default(),
                     &None,
+                    &HashMap::default(),
                     &HashMap::default(),
                     &HashSet::default(),
                     &HashSet::default(),

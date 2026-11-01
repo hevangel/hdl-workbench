@@ -4,6 +4,13 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+/// Values and shape owned by one scope-randomize target before a trial.
+struct StdArraySnapshot {
+    name: String,
+    size: Option<u64>,
+    elems: Vec<(i64, Value)>,
+}
+
 impl Simulator {
     /// Declared element width of an associative array, when the elaborator
     /// recorded one.
@@ -888,6 +895,7 @@ impl Simulator {
                 name.name,
                 self.expr_to_spec_fragment(x)?
             )),
+            ExprKind::AssignmentPattern(_) => self.class_array_arg_fragment(e),
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
@@ -914,6 +922,25 @@ impl Simulator {
                 } else {
                     None
                 }
+            }
+            // §8.25: a value argument matches by value. A constant expression
+            // of literals and package parameters (`pkg::N + pkg::K`) is
+            // keyed by the number it folds to, like the literal itself.
+            ExprKind::Binary { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Paren(_)
+            | ExprKind::Conditional { .. }
+            | ExprKind::MemberAccess { .. } => self.fold_package_const_expr(e),
+            ExprKind::Ident(hier)
+                if hier.path.len() == 2
+                    && self
+                        .package_param_key(&format!(
+                            "{}::{}",
+                            hier.path[0].name.name, hier.path[1].name.name
+                        ))
+                        .is_some_and(|k| self.module.parameters.contains_key(k)) =>
+            {
+                self.fold_package_const_expr(e)
             }
             ExprKind::Ident(hier) => {
                 let nm = &hier.path.last()?.name.name;
@@ -1314,6 +1341,28 @@ impl Simulator {
                         }
                     }
                     let frag = self.expr_to_spec_fragment(e)?;
+                    // §8.25: a bare SELF-REFERENCE — the argument names the
+                    // class whose specialization context we are resolving in
+                    // (`uvm_object_registry#(C,"C") type_id`, written by
+                    // `uvm_object_utils(C)`) — denotes the CURRENT
+                    // specialization `C#(sig)`, not the default. Without
+                    // this, a static method entered through a specialization
+                    // (`C#(T2)::get_type()`, or `v.get_type()` on a null `v`
+                    // declared `C#(T2)`) keyed the registry on the default
+                    // `C`, so the factory created default-specialized objects
+                    // and the `$cast` in `uvm_create_on` correctly rejected
+                    // them.
+                    //
+                    // Only inside that class's own declaration (or a derived
+                    // one): elsewhere the bare name IS the default
+                    // specialization — a non-parameterized class whose typedef
+                    // names `C` must not read `C#(sig)` just because its method
+                    // happens to run under an active `C#(sig)` context.
+                    if let Some((b, s)) = &self.current_spec {
+                        if frag == *b && self.inside_class_decl_of(b) {
+                            return Some(format!("{}#({})", b, s));
+                        }
+                    }
                     // Resolve bare type-param names (e.g. `T`, `this_type`)
                     // through the active specialization so the typedef's
                     // specialization carries concrete values.
@@ -1544,18 +1593,60 @@ impl Simulator {
         k: usize,
         name: &str,
     ) -> Option<String> {
+        Self::carried_type_binding_rec(bindings, chain, k, name, &[])
+    }
+
+    /// Defaults may name several earlier parameters. Track their declaration
+    /// path to reject a cycle without cutting off a valid long alias chain.
+    fn carried_type_binding_rec(
+        bindings: &HashMap<String, String>,
+        chain: &[&super::elaborate::ElaboratedClass],
+        k: usize,
+        name: &str,
+        path: &[(usize, String)],
+    ) -> Option<String> {
+        if path
+            .iter()
+            .any(|(level, param)| *level == k && param == name)
+        {
+            return None;
+        }
         if k == 0 {
             return bindings.get(name).cloned();
         }
+        let mut path = path.to_vec();
+        path.push((k, name.to_string()));
         let child = chain[k - 1];
-        let i = chain[k].param_order.iter().position(|p| p == name)?;
-        let a = child.extends_type_args.get(i)?.trim();
-        if Self::spec_projection(a).is_some() {
-            return Self::carry_extends_arg(a, &|p| {
-                Self::carried_type_binding(bindings, chain, k - 1, p)
+        let parent = chain[k];
+        let i = parent.param_order.iter().position(|p| p == name)?;
+        // An argument the child's `extends` omits is absent or empty in
+        // `extends_type_args` and takes the parameter's default (§8.25).
+        let written = child
+            .extends_type_args
+            .get(i)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let a = match written {
+            Some(w) => w,
+            None => {
+                let def = parent
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, d)| d.clone())?;
+                if parent.type_param_names.iter().any(|p| p == &def) {
+                    return Self::carried_type_binding_rec(bindings, chain, k, &def, &path);
+                }
+                // A default is written in the parent's scope, not the child's.
+                return Some(def);
+            }
+        };
+        if Self::spec_projection(&a).is_some() {
+            return Self::carry_extends_arg(&a, &|p| {
+                Self::carried_type_binding_rec(bindings, chain, k - 1, p, &path)
             });
         }
-        Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
+        Some(Self::carried_type_binding_rec(bindings, chain, k - 1, &a, &path).unwrap_or(a))
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an
@@ -1827,7 +1918,31 @@ impl Simulator {
     }
 
     pub(super) fn assoc_top_level_keys(&self, obj_name: &str) -> Vec<String> {
+        self.assoc_top_level_keys_shared(obj_name).as_ref().clone()
+    }
+
+    /// `assoc_top_level_keys`, shared and cached: `first`/`next`/`num` in a
+    /// loop over an unchanged array no longer rescan and re-sort every key.
+    pub(super) fn assoc_top_level_keys_shared(&self, obj_name: &str) -> Arc<Vec<String>> {
         let prefix = format!("{}[", obj_name);
+        let stamp = self.signals.elem_gen_for_prefix(&prefix);
+        if let Some((s, keys)) = self.assoc_keys_cache.borrow().get(obj_name) {
+            if *s == stamp {
+                return Arc::clone(keys);
+            }
+        }
+        let keys = Arc::new(self.assoc_top_level_keys_uncached(obj_name, &prefix));
+        let mut cache = self.assoc_keys_cache.borrow_mut();
+        // Per-call and per-object array names come and go; bound the cache
+        // rather than track every name's lifetime.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(obj_name.to_string(), (stamp, Arc::clone(&keys)));
+        keys
+    }
+
+    fn assoc_top_level_keys_uncached(&self, obj_name: &str, prefix: &str) -> Vec<String> {
         // A STRUCT element stores member-wise leaves (`sa[k].id`), which do
         // not end in `]` — accept any entry whose key bracket closes, else
         // struct-element assoc arrays enumerate as empty (num()/foreach).
@@ -2919,6 +3034,11 @@ impl Simulator {
                 || self.is_string_keyed_array(prefix);
             let (kw, ks) = self.assoc_index_width_for(prefix).unwrap_or((32, true));
             (is_str, kw, ks)
+        } else if let Some(&row_str) = self.module.associative_arrays.get(prefix) {
+            // A row registered as an associative array of its own (see
+            // `ensure_assoc_row`) keys its elements by its declared key type.
+            let (kw, ks) = self.assoc_index_width_for(prefix).unwrap_or((32, true));
+            (row_str || declared_str.unwrap_or(false), kw, ks)
         } else {
             (
                 declared_str.unwrap_or_else(|| keys.iter().any(|k| k.parse::<i128>().is_err())),
@@ -2965,6 +3085,7 @@ impl Simulator {
                 // (an int key 2 is the character 0x02), else by value (a
                 // string key "ab" is the number 0x6162).
                 let as_text = level > 0
+                    && !self.module.associative_arrays.contains_key(prefix)
                     && (self.is_string_keyed_array(prefix)
                         || self.is_string_keyed_array(root)
                         || (!is_str && key.parse::<i128>().is_err()));
@@ -3521,6 +3642,34 @@ impl Simulator {
         key
     }
 
+    /// Release a terminating child's captures (cleaning storage once no child
+    /// needs it) and its entries in the activation index `fork_gen_pids`.
+    pub(super) fn release_fork_collections(&mut self, pid: usize) {
+        if let Some(gens) = self.fork_pid_gens.remove(&pid) {
+            for g in gens {
+                if let Some(pids) = self.fork_gen_pids.get_mut(&g) {
+                    pids.remove(&pid);
+                    if pids.is_empty() {
+                        self.fork_gen_pids.remove(&g);
+                    }
+                }
+            }
+        }
+        if let Some(keys) = self.fork_collection_captures.remove(&pid) {
+            for key in keys {
+                if let Some(n) = self.fork_capture_refs.get_mut(&key) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.fork_capture_refs.remove(&key);
+                    }
+                }
+                if self.deferred_collection_cleanup.remove(&key) {
+                    self.cleanup_dyn_storage(&key);
+                }
+            }
+        }
+    }
+
     /// Remove all runtime signal/registration bookkeeping for a renamed
     /// local-dyn-array storage key (its `.size`, its `[i]` elements, and the
     /// `module.*` collection registrations). Used when a declaration is
@@ -3531,6 +3680,10 @@ impl Simulator {
         // removing them here would corrupt a concurrent process's queue.
         // (Identity-mapped formals and module-level arrays are bare.)
         if !key.starts_with('@') {
+            return;
+        }
+        if self.fork_capture_refs.contains_key(key) {
+            self.deferred_collection_cleanup.insert(key.to_string());
             return;
         }
         let mut size_key = std::mem::take(&mut self.dyn_key_scratch);
@@ -3851,6 +4004,29 @@ impl Simulator {
         )
     }
 
+    /// §18.12: failure restores values and collection sizes, including empty arrays.
+    fn restore_std_randomize_targets(
+        &mut self,
+        scalars: &[(Expression, Value)],
+        arrays: &[StdArraySnapshot],
+    ) {
+        for array in arrays {
+            if let Some(size) = array.size {
+                // Discard trial elements too: a later growth must not expose them.
+                for key in self.signals.elem_keys(&array.name) {
+                    self.signals.remove(&key);
+                }
+                self.set_queue_size(&array.name, size);
+            }
+            for (i, value) in &array.elems {
+                self.set_signal_value_by_name(&format!("{}[{}]", array.name, i), value.clone());
+            }
+        }
+        for (target, value) in scalars {
+            self.assign_value(target, value);
+        }
+    }
+
     /// `<call> with { constraints }`. For `std::randomize(vars) with {...}` the
     /// listed vars are randomized then narrowed by the inline constraints
     /// (crucially `inside` — riscv-dv selects instructions this way). For
@@ -3861,6 +4037,19 @@ impl Simulator {
         call: &Expression,
         constraints: &[crate::ast::decl::ConstraintItem],
     ) -> Value {
+        // §18.7: the empty argument parentheses may be omitted. The parser
+        // then retains the method reference rather than a Call node; falling
+        // through to eval_expr executes randomize but discards its with block.
+        if !matches!(call.kind, ExprKind::Call { .. }) {
+            let call = Expression::new(
+                ExprKind::Call {
+                    func: Box::new(call.clone()),
+                    args: Vec::new(),
+                },
+                call.span,
+            );
+            return self.eval_randomize_with(&call, constraints);
+        }
         if let ExprKind::Call { func, args } = &call.kind {
             if let ExprKind::MemberAccess { expr, member } = &func.kind {
                 if member.name == "randomize" {
@@ -3882,13 +4071,43 @@ impl Simulator {
                             // assignments below write the targets, so keep
                             // the integral scalar ones to put back.
                             let mut snapshot: Vec<(Expression, Value)> = Vec::new();
+                            // The array targets are written by the same trial
+                            // draws, and the solver commits an array element by
+                            // element, so a failed call used to leave the
+                            // rejected draw behind. Keep every element too.
+                            let mut array_snapshot = Vec::new();
                             for a in args {
-                                if matches!(a.kind, ExprKind::Ident(_))
-                                    && self.array_operand_name(a).is_none()
-                                    && self.lrm_self_width(a).is_some_and(|w| w <= 64)
-                                {
-                                    let v = self.eval_expr(a);
-                                    snapshot.push((a.clone(), v));
+                                if let Some(nm) = self.array_operand_name(a) {
+                                    let size = (self.module.dynamic_arrays.contains(&nm)
+                                        || self
+                                            .signals
+                                            .contains_key(&Self::name_with_suffix(&nm, ".size")))
+                                    .then(|| self.get_queue_size(&nm));
+                                    let (lo, hi) = if let Some(n) = size {
+                                        (0, n as i64 - 1)
+                                    } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
+                                        (lo.min(hi), lo.max(hi))
+                                    } else {
+                                        continue;
+                                    };
+                                    let elems = (lo..=hi)
+                                        .filter_map(|i| {
+                                            self.get_signal_value_by_name(&format!("{nm}[{i}]"))
+                                                .map(|v| (i, v))
+                                        })
+                                        .collect();
+                                    array_snapshot.push(StdArraySnapshot {
+                                        name: nm,
+                                        size,
+                                        elems,
+                                    });
+                                } else if let Some(fields) = self.expand_struct_target(a) {
+                                    for (_, field) in fields {
+                                        let value = self.eval_expr(&field);
+                                        snapshot.push((field, value));
+                                    }
+                                } else {
+                                    snapshot.push((a.clone(), self.eval_expr(a)));
                                 }
                             }
                             self.exec_std_randomize(args);
@@ -3936,9 +4155,7 @@ impl Simulator {
                             if let Some(ok) = self.std_randomize_sized(constraints, &targets) {
                                 if !ok {
                                     self.rand_fail_warn_std(constraints);
-                                    for (lv, v) in &snapshot {
-                                        self.assign_value(lv, v);
-                                    }
+                                    self.restore_std_randomize_targets(&snapshot, &array_snapshot);
                                 }
                                 return Value::from_u64(ok as u64, 32);
                             }
@@ -4116,9 +4333,7 @@ impl Simulator {
                             // narrow band the i64 interval solver cannot reach.
                             if !satisfied {
                                 self.rand_fail_warn_std(constraints);
-                                for (lv, v) in &snapshot {
-                                    self.assign_value(lv, v);
-                                }
+                                self.restore_std_randomize_targets(&snapshot, &array_snapshot);
                             }
                             return Value::from_u64(if satisfied { 1 } else { 0 }, 32);
                         }
@@ -4248,7 +4463,14 @@ impl Simulator {
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(&cn) {
                 for (nm, con) in cd.constraints.iter() {
-                    if all_off || disabled.contains(nm) {
+                    // §18.5.11: a static block's mode is the class-wide flag
+                    // a whole-object `constraint_mode(0)` also clears.
+                    let static_off = con.is_static
+                        && !self.static_constraint_disabled.is_empty()
+                        && self
+                            .static_constraint_disabled
+                            .contains(&(cn.clone(), nm.clone()));
+                    if all_off || static_off || disabled.contains(nm) {
                         seen.insert(nm.clone());
                         continue;
                     }

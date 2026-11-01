@@ -5,6 +5,46 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// §14.16: commit a clocking drive of a SELECT of an output clockvar
+    /// (`cb.v[2] <= 1`, `cb.u[1] <= 1`) after `skew` ticks, as a nonblocking
+    /// update of just the selected bits or element. `target` is the net with
+    /// the drive's indices frozen when it executed.
+    pub(super) fn drive_clocking_select(&mut self, target: &Expression, val: Value, skew: u64) {
+        let span = target.span;
+        let rvalue = self.make_intra_saved_expr(val, span);
+        let delay = (skew > 0).then(|| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: Some(64),
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: skew.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        });
+        self.exec_statement(&Statement::new(
+            StatementKind::NonblockingAssign {
+                lvalue: target.clone(),
+                delay,
+                rvalue,
+            },
+            span,
+        ));
+    }
+
+    /// §14.3: the element signals (`net[i]`, with `i`) of clockvar net `net`
+    /// when it is a one-dimensional unpacked array, which has no signal under
+    /// its own name; `None` for any other net.
+    pub(super) fn clocking_array_elems(&self, net: &str) -> Option<Vec<(i64, String)>> {
+        if self.signal_name_to_id.contains_key(net) {
+            return None;
+        }
+        let &(lo, hi, _) = self.module.arrays.get(net)?;
+        Some((lo..=hi).map(|i| (i, format!("{}[{}]", net, i))).collect())
+    }
+
     /// LRM §14.3 clocking-block input snapshot. Each registered cb
     /// has a clock signal; on every posedge transition of that clock
     /// we snapshot the current values of input-direction signals. The
@@ -84,8 +124,8 @@ impl Simulator {
             // whose countdown hits zero (honoring output skew), keep the rest.
             if let Some(mut pend) = self.clocking_cycle_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                let mut keep: Vec<(u64, String, Value)> = Vec::new();
-                for (n, net, val) in pend.drain(..) {
+                let mut keep: Vec<(u64, String, Value, Option<Expression>)> = Vec::new();
+                for (n, net, val, target) in pend.drain(..) {
                     if n <= 1 {
                         let skew = self
                             .clocking_sig_out_skew
@@ -93,12 +133,14 @@ impl Simulator {
                             .and_then(|m| m.get(&net))
                             .copied()
                             .unwrap_or(dskew);
-                        if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
+                        if let Some(t) = target {
+                            self.drive_clocking_select(&t, val, skew);
+                        } else if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
                             let w = self.signal_widths[id];
                             self.schedule_delayed_with_delay(id, val.resize(w), skew);
                         }
                     } else {
-                        keep.push((n - 1, net, val));
+                        keep.push((n - 1, net, val, target));
                     }
                 }
                 if !keep.is_empty() {
@@ -114,7 +156,7 @@ impl Simulator {
             // see the new output values when they run in the Reactive region.
             if let Some(pending) = self.clocking_output_pending.remove(&cb) {
                 let dskew = self.clocking_out_skew.get(&cb).copied().unwrap_or(0);
-                for (sig, val) in pending {
+                for (sig, val, target) in pending {
                     // §14.4 output skew for drives maturing at THIS edge.
                     let skew = self
                         .clocking_sig_out_skew
@@ -122,6 +164,14 @@ impl Simulator {
                         .and_then(|m| m.get(&sig))
                         .copied()
                         .unwrap_or(dskew);
+                    if let Some(t) = target {
+                        if skew > 0 {
+                            self.drive_clocking_select(&t, val, skew);
+                        } else {
+                            self.assign_value(&t, &val);
+                        }
+                        continue;
+                    }
                     if skew > 0 {
                         if let Some(&id) = self.signal_name_to_id.get(sig.as_str()) {
                             let w = self.signal_widths[id];
@@ -176,6 +226,28 @@ impl Simulator {
                         .and_then(|m| m.get(vis))
                         .copied()
                         .unwrap_or(in_dskew);
+                    // §14.3: an unpacked-array clockvar samples each element,
+                    // published as `vis[i]` for `cb.sig[i]` reads.
+                    if let Some(elems) = self.clocking_array_elems(sig) {
+                        let leaf = vis.rsplit('.').next().unwrap_or(vis);
+                        if !self.clocking_array_leaves.contains(leaf) {
+                            self.clocking_array_leaves.insert(leaf.to_string());
+                        }
+                        for (idx, e) in elems {
+                            let v = if skew == CB_SKEW_1STEP {
+                                self.clocking_preponed.get(&e).cloned()
+                            } else if skew == 0 {
+                                None
+                            } else {
+                                self.clocking_hist_value(&e, self.time.saturating_sub(skew))
+                            }
+                            .or_else(|| self.get_signal_value_by_name(&e));
+                            if let Some(v) = v {
+                                snap.insert(format!("{}[{}]", vis, idx), v);
+                            }
+                        }
+                        continue;
+                    }
                     let v = if skew == CB_SKEW_1STEP {
                         self.clocking_preponed
                             .get(sig)
@@ -379,6 +451,7 @@ impl Simulator {
         a: &crate::ast::stmt::AssertionStatement,
         kind: crate::ast::stmt::DeferredAssertion,
         passed: bool,
+        label: Option<&str>,
     ) {
         let kind_tag: u8 = match a.kind {
             crate::ast::stmt::AssertionKind::Assert => 0,
@@ -386,9 +459,11 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
         let src = self.current_src_file();
+        let stat_key = Self::assert_stat_key(a.span.start, src);
+        self.note_assert_label(stat_key, label);
         let entry = self
             .assertion_stats
-            .entry(Self::assert_stat_key(a.span.start, src))
+            .entry(stat_key)
             .or_insert(AssertionStat {
                 kind: kind_tag,
                 loc: Some((src, a.span.start)),
@@ -543,27 +618,17 @@ impl Simulator {
             let outcome = self.eval_expr(&probe.predicate).is_true();
             self.this_stack.pop();
             // Fold into assertion_stats so the coverage DB reflects
-            // concurrent-property hits without a separate channel.
-            // Synthesize a "span_key" by hashing the probe name so it
-            // doesn't collide with file-position-keyed immediate stats.
-            let span_key = probe
-                .name
-                .as_bytes()
-                .iter()
-                .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                .wrapping_add(1); // never 0
-            // AssertionStat.kind is a u8 tag — reuse the immediate-cover
-            // tag for concurrent-cover probes (no dedicated tag yet).
+            // concurrent-property hits without a separate channel, on the
+            // site's own entry: it was keyed by a hash of a synthetic name,
+            // tagged `cover` whatever its kind, and had no location.
             let stat = self
                 .assertion_stats
-                .entry(span_key as usize)
-                .or_insert_with(|| {
-                    AssertionStat {
-                        kind: 2,
-                        /* cover */ loc: None,
-                        pass_count: 0,
-                        fail_count: 0,
-                    }
+                .entry(probe.stat_key)
+                .or_insert_with(|| AssertionStat {
+                    kind: probe.kind,
+                    loc: Some(probe.loc),
+                    pass_count: 0,
+                    fail_count: 0,
                 });
             if outcome {
                 stat.pass_count += 1;

@@ -83,6 +83,12 @@ impl Simulator {
     }
 
     pub(super) fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
+        if let ExprKind::Ident(hier) = &base.kind
+            && hier.path.len() > 2
+            && let Some(h) = self.hier_parent_handle(hier)
+        {
+            return Some((h, hier.path.last()?.name.name.clone()));
+        }
         if let Some((obj, prop)) = Self::split_trailing_member(base) {
             // §8.9: `Cls::prop` of a static struct names its shared store.
             if !self.static_struct_names.is_empty()
@@ -231,13 +237,13 @@ impl Simulator {
             .and_then(|(head, _)| head.split_once('#'))
             .map(|(b, sig)| (b.to_string(), sig.to_string()));
         let h = self.heap.len();
-        self.heap.push(Some(ClassInstance {
+        self.heap.push(Some(Box::new(ClassInstance {
             class_name: decl,
             properties: PropMap::default(),
             type_bindings: HashMap::default(),
             spec,
             creation_scope: String::new(),
-        }));
+        })));
         self.seed_class_struct_cells(h, prop, &su);
         self.static_struct_holders.insert(key, h);
         Some(h)
@@ -905,6 +911,33 @@ impl Simulator {
 
     /// Declared (post-type-parameter-resolution) return type of a call's
     /// callee, resolving the receiver with the same rules as the result layout.
+    /// The declared return type of `name` as the first class in `cls`'s
+    /// lexical chain declares it (§8.20: a non-virtual bare call binds to
+    /// the first defining class; an override keeps the prototype).
+    fn class_method_return_type(&self, cls: &str, name: &str) -> Option<DataType> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cls.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            if let Some(md) = cd.methods.get(name) {
+                return match &md.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => {
+                        Some(f.return_type.clone())
+                    }
+                    Kind::Task(_) => None,
+                };
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        None
+    }
+
     pub(super) fn call_return_type(&mut self, func: &Expression) -> Option<DataType> {
         // Split the callee into (receiver expression, method name). A method
         // call parses as EITHER `MemberAccess(recv, m)` OR a flat hier ident
@@ -943,12 +976,22 @@ impl Simulator {
             _ => return None,
         };
         let ret: DataType = match recv_expr {
+            // §8.20/§23.9: a bare call inside a class method binds to the
+            // enclosing class chain before any module-scope function of
+            // the same name (`index >= size()` in `queue_c` read the return
+            // type of an unrelated `size`, turning the compare unsigned).
             None => self
-                .module
-                .functions
-                .get(method_name.as_str())?
-                .return_type
-                .clone(),
+                .class_context_stack
+                .last()
+                .cloned()
+                .flatten()
+                .and_then(|cls| self.class_method_return_type(&cls, &method_name))
+                .or_else(|| {
+                    self.module
+                        .functions
+                        .get(method_name.as_str())
+                        .map(|f| f.return_type.clone())
+                })?,
             Some(recv) => {
                 if let ExprKind::Ident(h) = &recv.kind
                     && h.path.len() == 1

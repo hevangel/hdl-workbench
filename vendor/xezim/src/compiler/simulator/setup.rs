@@ -2282,6 +2282,7 @@ impl Simulator {
         // and only because the body has no process locals for the
         // interpreter to miss (LoadProcessLocal is rejected there).
         compiler.allow_ast_fallback = true;
+        compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
@@ -2514,6 +2515,56 @@ impl Simulator {
                     extra_writes.push(format!("{}{}", ctx.prefix, w));
                 }
                 extra_writes.push(w.clone());
+            }
+        }
+        // Instance `initial` blocks travel unmaterialized in `pending_initial`
+        // — bare source names plus a per-instance `RewriteCtx` — and are only
+        // rewritten into `initial_blocks` (instance-prefixed names) at
+        // scheduling, long after this census. The walk below therefore never
+        // saw a driver initial's write to its own output port under the
+        // spelling the buffer pass compares against (`<ctx.prefix>p`, the rhs
+        // of the output-connect CA), so `p0 = d0.p` collapsed onto the
+        // procedurally written `d0.p`: the t=0 write then hit the merged net
+        // directly, firing the receiver's edge before its `always` armed
+        // (tests/scheduling/t0_comb_defer_start_batch) — and dropping the
+        // delta step the waiter_edge_ordering rule keeps at any time. Add the
+        // prefixed spellings here; a name the set only gains never enables a
+        // collapse, it can only inhibit one.
+        for p in &self.module.pending_initial {
+            let (_, writes) = by_source
+                .entry(std::rc::Rc::as_ptr(&p.source) as usize)
+                .or_insert_with(|| super::elaborate::stmt_write_targets(&p.source));
+            for w in writes.iter() {
+                let head = w.split('.').next().unwrap_or(w);
+                if p.ctx.local_names.contains(head) {
+                    extra_writes.push(format!("{}{}", p.ctx.prefix, w));
+                }
+                extra_writes.push(w.clone());
+            }
+        }
+        // `static_init_blocks` (§6.8 variable declaration assignments) are
+        // absent from the core walk as well; their writes are already
+        // instance-qualified, so they go in verbatim. A materialized
+        // instance block that kept bare names carries its instance path in
+        // `scope` (the runtime resolution hint); qualify those too.
+        for ib in &self.module.static_init_blocks {
+            let (_, writes) = super::elaborate::stmt_write_targets(&ib.stmt);
+            extra_writes.extend(writes);
+        }
+        for ib in self
+            .module
+            .initial_blocks
+            .iter()
+            .chain(self.module.final_blocks.iter())
+        {
+            if ib.scope.is_empty() {
+                continue;
+            }
+            let (_, writes) = super::elaborate::stmt_write_targets(&ib.stmt);
+            for w in writes {
+                if !w.contains('.') {
+                    extra_writes.push(format!("{}.{}", ib.scope, w));
+                }
             }
         }
         let deferred = &self.deferred_always;

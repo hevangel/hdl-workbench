@@ -5007,6 +5007,7 @@ impl Simulator {
             // read hidden inside an interpreted expression can't break wake-up
             // analysis here (unlike comb entries / cont-assigns).
             compiler.set_expr_fallback(true);
+            compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
@@ -5409,6 +5410,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_ast_fallback(false);
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_scope_hint(scope_hint);
                 compiler.set_tasks(&self.module.tasks);
                 compiler.set_functions(&self.module.functions);
@@ -5449,6 +5451,7 @@ impl Simulator {
                 );
                 delay_compiler.set_ast_fallback(false);
                 delay_compiler.set_scope_hint(self.process_scope_hint.get(&pid).cloned());
+                delay_compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 delay_compiler.set_tasks(&self.module.tasks);
                 delay_compiler.set_functions(&self.module.functions);
                 delay_compiler.set_params(&self.module.parameters);

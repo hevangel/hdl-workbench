@@ -1003,10 +1003,24 @@ impl Simulator {
                             let struct_w =
                                 fields.iter().map(|(_, o, fw)| o + fw).max().unwrap_or(0);
                             let dims = self.module.packed_full_dims.get(&arr_name).cloned();
+                            // A package parameter (`p::ENC[f].man_bits` in a
+                            // class method reaches here as `p.ENC`) is no
+                            // signal: read its value from the parameters.
                             if struct_w > 0
                                 && let Some(slot) =
                                     Self::flatten_packed_slot(&indices, dims.as_deref())
-                                && let Some(sig) = self.get_local_or_signal(&arr_name)
+                                && let Some(sig) =
+                                    self.get_local_or_signal(&arr_name).or_else(|| {
+                                        self.module
+                                            .parameters
+                                            .get(&arr_name)
+                                            .or_else(|| {
+                                                self.module
+                                                    .parameters
+                                                    .get(&arr_name.replacen('.', "::", 1))
+                                            })
+                                            .cloned()
+                                    })
                             {
                                 let lo = slot * struct_w + off;
                                 if lo + w <= sig.width {
@@ -1208,8 +1222,15 @@ impl Simulator {
             None
         };
         if let Some(cn) = static_class {
-            if let Some(v) = self.class_static_get(&cn, &member.name) {
-                return v;
+            // Header value parameters are per instance. They also sit in
+            // `param_defaults`, so `class_static_get` answers them from the
+            // elaborated default (`int D = H` is 32) and used to hide the
+            // specialization stored on the object. Localparams and `static`
+            // members are in `static_properties` and stay on the shared cell.
+            if self.member_is_static_prop(&cn, &member.name) {
+                if let Some(v) = self.class_static_get(&cn, &member.name) {
+                    return v;
+                }
             }
         }
         if handle == 0 || handle >= self.heap.len() {
@@ -1854,6 +1875,68 @@ impl Simulator {
         (self.recv_call_memo.len() > base).then_some(base)
     }
 
+    /// §8.4/§23.7: resolve the declared class boundary before following
+    /// object properties. Integral values and unrelated leaf names cannot
+    /// establish a class boundary.
+    pub(super) fn hier_parent_handle(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<usize> {
+        if self.no_class_objects()
+            || hier.path.len() < 3
+            || hier.path.iter().any(|s| !s.selects.is_empty())
+            || self.bare_name_is_class_channel(&hier.path[0].name.name)
+        {
+            return None;
+        }
+        let segs: Vec<&str> = hier.path.iter().map(|s| s.name.name.as_str()).collect();
+        for split in (1..segs.len()).rev() {
+            let dotted = segs[..split].join(".");
+            let name = dotted
+                .strip_prefix(&format!("{}.", self.module.name))
+                .unwrap_or(&dotted);
+            let class = self
+                .module
+                .var_decl_types
+                .get(name)
+                .and_then(|dt| self.declared_typeref_name(dt))
+                .or_else(|| {
+                    self.module
+                        .signals
+                        .get(name)
+                        .and_then(|s| s.type_name.clone())
+                })
+                .or_else(|| {
+                    self.signal_name_to_id
+                        .get(name)
+                        .and_then(|id| self.signal_type_names.get(id).cloned())
+                })
+                .and_then(|tn| self.resolve_typeref_class_name_str(&tn));
+            let mut handle = if split == 1 && self.bare_name_is_class_channel(segs[0]) {
+                self.eval_ident_handle(segs[0])
+            } else if class.is_some() {
+                self.get_signal_value_by_name(name)
+                    .and_then(|v| v.to_u64())
+                    .map(|v| v as usize)
+            } else {
+                None
+            };
+            for member in &segs[split..segs.len() - 1] {
+                handle = handle.and_then(|h| {
+                    let tn = self.class_prop_type_name(h, member)?;
+                    self.resolve_typeref_class_name_str(&tn)?;
+                    self.member_handle(h, member)
+                });
+            }
+            if let Some(h) =
+                handle.filter(|&h| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some()))
+            {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -1874,7 +1957,7 @@ impl Simulator {
     }
 
     /// Declared expression signedness without executing conditional arms or
-    /// calls. Consulted only when a nested shift needs type propagation.
+    /// calls. Context-determined operands need this type before evaluation.
     #[inline(never)]
     pub(super) fn expression_signed_hint(&mut self, expr: &Expression) -> Option<bool> {
         fn joint(left: Option<bool>, right: Option<bool>) -> Option<bool> {
@@ -1907,8 +1990,60 @@ impl Simulator {
                     })
             }),
             ExprKind::Paren(e) => self.expression_signed_hint(e),
+            ExprKind::Index { .. } => {
+                let mut root = expr;
+                let mut indices = 0;
+                loop {
+                    match &root.kind {
+                        ExprKind::Index { expr, .. } => {
+                            indices += 1;
+                            root = expr;
+                        }
+                        ExprKind::Paren(inner) => root = inner,
+                        _ => break,
+                    }
+                }
+                let ExprKind::Ident(h) = &root.kind else {
+                    return None;
+                };
+                if self.frame_bound_bare_name(h).is_some() {
+                    return self
+                        .get_expr_type_name(expr)
+                        .and_then(|name| self.concrete_type_signed(&name));
+                }
+                let name = self.resolve_hier_name(h);
+                let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(name.as_ref()) {
+                    dims.len()
+                } else if self.module.arrays_2d.contains_key(name.as_ref()) {
+                    2
+                } else {
+                    usize::from(
+                        self.module.arrays.contains_key(name.as_ref())
+                            || self.module.dynamic_arrays.contains(name.as_ref())
+                            || self.module.queue_vars.contains(name.as_ref())
+                            || self.is_associative_array(name.as_ref()),
+                    )
+                };
+                if indices > unpacked {
+                    // More indices can enter a nested queue or associative
+                    // row. Only a known scalar signal proves a packed select;
+                    // unknown class/local storage must retain its own type.
+                    return (unpacked == 0 && self.module.signals.contains_key(name.as_ref()))
+                        .then_some(false);
+                }
+                self.module.var_decl_types.get(name.as_ref()).map(|dt| {
+                    super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                })
+            }
             ExprKind::Unary {
-                op: UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot,
+                op:
+                    UnaryOp::Plus
+                    | UnaryOp::Minus
+                    | UnaryOp::BitNot
+                    | UnaryOp::PreIncr
+                    | UnaryOp::PreDecr
+                    | UnaryOp::PostIncr
+                    | UnaryOp::PostDecr,
                 operand,
             } => self.expression_signed_hint(operand),
             ExprKind::Unary { .. } => Some(false),
@@ -2290,7 +2425,8 @@ impl Simulator {
             // class-local typedef args (e.g. `special_comp_type`) through
             // `resolve_typedef_spec`, which reads `self.current_spec`.
             let saved = self.current_spec.clone();
-            let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &saved);
+            let lexical = self.lexical_spec();
+            let extracted = self.resolve_call_spec_params(Self::extract_call_spec(expr), &lexical);
             if let Some((ref base, ref sig)) = extracted {
                 self.ensure_spec_statics(base, sig);
             }
@@ -2345,6 +2481,24 @@ impl Simulator {
                 Value::from_string(s)
             }
             ExprKind::Ident(hier) => {
+                // §14.3: the flat spelling of `cb.sig[i]` (the select on the
+                // last segment) on an unpacked-array clockvar.
+                if !self.clocking_array_leaves.is_empty()
+                    && hier.path.len() >= 2
+                    && let Some((last, owner)) = hier.path.split_last()
+                    && let [sel] = last.selects.as_slice()
+                    && self.clocking_array_leaves.contains(last.name.name.as_str())
+                    && owner.iter().all(|s| s.selects.is_empty())
+                {
+                    let mut base = hier.clone();
+                    base.path.last_mut().unwrap().selects.clear();
+                    base.cached_signal_id = std::cell::Cell::new(None);
+                    base.cached_resolved_name = std::cell::OnceCell::new();
+                    let base = Expression::new(ExprKind::Ident(base), expr.span);
+                    if let Some(v) = self.clocking_array_elem_read(&base, sel) {
+                        return v;
+                    }
+                }
                 // §13.5.2: a selected read through a `ref` formal reads the
                 // caller's actual (see `ref_formal_redirect_hier`).
                 if self.ref_redirect_possible() {
@@ -3112,6 +3266,24 @@ impl Simulator {
                             return val.clone();
                         }
                     }
+                    // §8.4: the object's own storage wins over the signal table.
+                    // `tb.u_leaf.obj.field` used to be looked up as the flat name
+                    // "tb.u_leaf.obj.field", which fell through to the leaf and
+                    // returned tb's own `field` signal — the object was never
+                    // consulted.  Only taken when the parent really is a live
+                    // object AND declares the member, so struct/net paths are
+                    // untouched.
+                    if let Some(h) = self.hier_parent_handle(hier) {
+                        let member_name = hier.path[hier.path.len() - 1].name.name.as_str();
+                        let via = hier.path[hier.path.len() - 2].name.name.as_str();
+                        let mut mval = self.static_read_via_handle(h, Some(via), None, member_name);
+                        if mval.is_none() {
+                            mval = self.read_member_value(h, member_name);
+                        }
+                        if let Some(mval) = mval {
+                            return mval;
+                        }
+                    }
                     // SV-2023: class-handle dereference. If a leading dotted
                     // prefix names a signal storing a class handle (e.g. a
                     // parameterized static like `registry#(byte)::singleton`),
@@ -3622,8 +3794,8 @@ impl Simulator {
                 // never `iface.signal` selects) so ordinary comparisons keep
                 // their value semantics.
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq) {
-                    let lv = self.vif_operand(left);
-                    let rv = self.vif_operand(right);
+                    let lv = self.vif_operand_eval(left);
+                    let rv = self.vif_operand_eval(right);
                     let engaged = lv.is_some() || rv.is_some();
                     if engaged {
                         // A bare `null` on the other side of a vif operand is
@@ -4079,33 +4251,41 @@ impl Simulator {
                     }
                     pre_r = Some(r0);
                 }
-                // §11.8.2: propagate unsigned type into nested shifts before
-                // their operands widen. Type probes never execute calls.
+                // §11.8.2: propagate unsigned type before nested arithmetic
+                // runs or its operands widen. Type probes never execute calls.
                 let joint_unsigned = if is_arith_or_bitwise
                     || matches!(op, BinaryOp::Div | BinaryOp::Mod)
                     || is_comparison
                 {
                     (!is_comparison && unsigned_context)
-                        || (has_shift
-                            && (pre_l
+                        || (pre_l
+                            .as_ref()
+                            .map(|v| v.is_signed)
+                            .or_else(|| self.expression_signed_hint(left))
+                            == Some(false)
+                            || pre_r
                                 .as_ref()
                                 .map(|v| v.is_signed)
-                                .or_else(|| self.expression_signed_hint(left))
-                                == Some(false)
-                                || pre_r
-                                    .as_ref()
-                                    .map(|v| v.is_signed)
-                                    .or_else(|| self.expression_signed_hint(right))
-                                    == Some(false)))
+                                .or_else(|| self.expression_signed_hint(right))
+                                == Some(false))
                 } else if widens_left {
                     unsigned_context
                 } else {
                     false
                 };
+                let literal_comparison = matches!(
+                    op,
+                    BinaryOp::CaseEq
+                        | BinaryOp::CaseNeq
+                        | BinaryOp::WildcardEq
+                        | BinaryOp::WildcardNeq
+                );
                 let left_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(left));
-                let right_unsigned =
-                    joint_unsigned && (!is_comparison || super::bytecode::has_context_shift(right));
+                    joint_unsigned && !(literal_comparison && Self::expr_is_signed_literal(left));
+                // §11.6.1: an exponent is self-determined and keeps its type.
+                let right_unsigned = joint_unsigned
+                    && !matches!(op, BinaryOp::Power)
+                    && !(literal_comparison && Self::expr_is_signed_literal(right));
                 let mut l = match pre_l.take() {
                     Some(mut v) => {
                         if left_unsigned && !v.is_real {
@@ -4153,6 +4333,9 @@ impl Simulator {
                         v.is_signed = false;
                     }
                     v
+                } else if matches!(op, BinaryOp::Power) {
+                    // §11.6.1: the exponent keeps its own width as well as type.
+                    self.eval_expr_ctx(right, 0)
                 } else if is_shift_op {
                     let rw = self.infer_width(right);
                     self.eval_expr_ctx(right, rw)
@@ -4384,10 +4567,8 @@ impl Simulator {
                 }
                 let c = self.eval_expr(condition);
                 let arms_unsigned = unsigned_context
-                    || ((super::bytecode::has_context_shift(then_expr)
-                        || super::bytecode::has_context_shift(else_expr))
-                        && (self.expression_signed_hint(then_expr) == Some(false)
-                            || self.expression_signed_hint(else_expr) == Some(false)));
+                    || self.expression_signed_hint(then_expr) == Some(false)
+                    || self.expression_signed_hint(else_expr) == Some(false);
                 let arm_ctx = if arms_unsigned {
                     ctx_width
                         .max(self.lrm_self_width(then_expr).unwrap_or(0))
@@ -4643,6 +4824,66 @@ impl Simulator {
                 r
             }
             ExprKind::Index { expr, index } => {
+                if let Some(selected) = self.selected_aggregate_rhs(None, expr) {
+                    let selected = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(selected),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    );
+                    return self.eval_expr_ctx(&selected, ctx_width);
+                }
+
+                // §14.3: `cb.sig[i]` on an unpacked-array clockvar reads the
+                // element's sample (see `tick_clocking_blocks`).
+                if let Some(v) = self.clocking_array_elem_read(expr, index) {
+                    return v;
+                }
+                // §13.4/§7.4: an element of a function's or method's returned
+                // collection (`f()[k]`, `o.build()[k]`). Evaluating the call
+                // as a scalar and bit-selecting it read 0 or x.
+                if let ExprKind::Call {
+                    func: cf,
+                    args: cargs,
+                } = &expr.kind
+                    && self.call_returns_collection(cf)
+                {
+                    self.pending_ret_collection = None;
+                    let _ = self.eval_call(cf, cargs);
+                    if let Some(src) = self.take_pending_ret_collection() {
+                        let iv = self.eval_expr(index);
+                        if self.is_associative_array(&src) {
+                            let key = self.assoc_key_str(&src, &iv);
+                            return self
+                                .get_signal_value_by_name(&format!("{}[{}]", src, key))
+                                .or_else(|| self.assoc_missing_elem_value(&src))
+                                .unwrap_or_else(|| Value::new(32));
+                        }
+                        if let Some(i) = iv.to_i64().filter(|_| !iv.has_xz()) {
+                            if i >= 0 && (i as u64) < self.get_queue_size(&src) {
+                                if let Some(v) =
+                                    self.get_signal_value_by_name(&format!("{}[{}]", src, i))
+                                {
+                                    return v;
+                                }
+                            }
+                        }
+                        // §7.4.6: out of range or x/z reads the element default.
+                        return Value::new(32);
+                    }
+                }
+                // §8.25: class constant arrays precede packed-property probes.
+                // The declaration-name cache excludes ordinary indexed reads
+                // before constructing or resolving a class-scope path.
+                if !self.module.classes.is_empty()
+                    && Self::receiver_prop_name(expr).is_some_and(|name| {
+                        self.class_member_names().constant_arrays.contains(name)
+                    })
+                    && let Some(v) = self.class_param_array_element(expr, index)
+                {
+                    return v;
+                }
                 // Element select on a packed multi-dimensional CLASS property.
                 if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
                     // §7.4: an element of an unpacked array property of
@@ -4807,7 +5048,8 @@ impl Simulator {
                 if let ExprKind::Ident(_h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if !self.module.arrays.contains_key(nm)
-                        && self.signal_name_to_id.contains_key(nm)
+                        && (self.signal_name_to_id.contains_key(nm)
+                            || self.module.packed_signal_elem_widths.contains_key(nm))
                     {
                         if let Some(&ew) = self.module.packed_signal_elem_widths.get(nm) {
                             // `ew == 1` is a real element width when the inner
@@ -5112,8 +5354,24 @@ impl Simulator {
                         let mut base_name = self.resolve_hier_name(hier);
                         // Bare class-member N-D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_nd.contains_key(&*base_name) {
+                        // A member shadows a module array of the same name (§8.10).
+                        if !self.module.arrays_nd.contains_key(&*base_name)
+                            || (hier.path.len() == 1
+                                && hier.path[0].selects.is_empty()
+                                && *base_name == *hier.path[0].name.name)
+                        {
                             if let Some(s) = self.instance_assoc_member(&base_name) {
+                                base_name = std::borrow::Cow::Owned(s);
+                            }
+                        }
+                        // `o.m[i][j][k]` on an object's member: its store is
+                        // `<handle>#m` (§7.4.5).
+                        if !self.module.arrays_nd.contains_key(&*base_name) && hier.path.len() >= 2
+                        {
+                            if let Some(s) = self
+                                .expr_assoc_name(cur)
+                                .filter(|s| self.module.arrays_nd.contains_key(s))
+                            {
                                 base_name = std::borrow::Cow::Owned(s);
                             }
                         }
@@ -5150,8 +5408,23 @@ impl Simulator {
                         let mut name = self.resolve_hier_name(hier);
                         // Bare class-member 2D array inside a method:
                         // resolve to its per-instance `<handle>#<member>`.
-                        if !self.module.arrays_2d.contains_key(&*name) {
+                        // A member shadows a module array of the same name (§8.10).
+                        if !self.module.arrays_2d.contains_key(&*name)
+                            || (hier.path.len() == 1
+                                && hier.path[0].selects.is_empty()
+                                && *name == *hier.path[0].name.name)
+                        {
                             if let Some(s) = self.instance_assoc_member(&name) {
+                                name = std::borrow::Cow::Owned(s);
+                            }
+                        }
+                        // `o.m[i][j]` on an object's member: its store is
+                        // `<handle>#m` (§7.4.5).
+                        if !self.module.arrays_2d.contains_key(&*name) && hier.path.len() >= 2 {
+                            if let Some(s) = self
+                                .expr_assoc_name(inner_expr)
+                                .filter(|s| self.module.arrays_2d.contains_key(s))
+                            {
                                 name = std::borrow::Cow::Owned(s);
                             }
                         }
@@ -5449,7 +5722,9 @@ impl Simulator {
                 // the empty leading bytes and always returned 0.
                 if let ExprKind::Ident(_hier) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
-                    if self.string_signals.contains(nm) {
+                    // The running task frame decides for its own formals: a
+                    // string flag another frame left on the name is not it.
+                    if self.frame_name_is_string(nm) {
                         let content = self.eval_expr(expr).sv_string_bytes();
                         let i = self.eval_expr(index).to_u64().unwrap_or(0) as usize;
                         let byte = content.get(i).copied().unwrap_or(0);
@@ -5461,7 +5736,11 @@ impl Simulator {
                 // against the signal's full packed dims, normalizing indices
                 // for ascending / non-zero-based / negative ranges (§7.4.1).
                 if let Some((base, lo_opt, w)) = self.packed_nested_select(expr, index) {
-                    if let Some(base_v) = self.get_signal_value_by_name(&base) {
+                    // §13.5, §6.21: a formal or local of the running frame
+                    // shadows a design signal of its name (an `initial`
+                    // block's static `a` beside a function's `a`, #650).
+                    let frame_v = self.frame_get(&base).cloned();
+                    if let Some(base_v) = frame_v.or_else(|| self.get_signal_value_by_name(&base)) {
                         return match lo_opt {
                             Some(lo) => base_v.range_select(lo + w as usize - 1, lo),
                             None => {
@@ -6062,12 +6341,27 @@ impl Simulator {
                             // A queue/array operand means set membership: the
                             // value matches any element (e.g. `group inside
                             // {supported_isa}`). Scalars compare directly.
-                            if let Some(nm) = self.array_operand_name(r) {
-                                let sz = self.get_queue_size(&nm);
-                                for i in 0..sz {
-                                    if let Some(ev) =
-                                        self.get_signal_value_by_name(&format!("{}[{}]", nm, i))
-                                    {
+                            if let Some(keys) = self.inside_operand_keys(r) {
+                                for key in keys {
+                                    if let Some(ev) = self.get_signal_value_by_name(&key) {
+                                        if val.wildcard_eq(&ev).is_true() {
+                                            return Value::from_u64(1, 1);
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            // §8.3.2/§6.20.2 (issue #388): a class-scope ARRAY
+                            // constant operand (`v inside {pkg::Cls::T}`,
+                            // `{Cls::T}` from a foreign class, bare `{T}` in
+                            // a method of the declaring class) is set
+                            // membership over its elements, like any other
+                            // array operand — the whole-array reference has
+                            // no scalar value, so the direct compare below
+                            // matched against a zero.
+                            if let Some(c) = self.resolve_class_scope_array_const(r) {
+                                for i in c.lo..=c.hi {
+                                    if let Some(ev) = self.class_scope_array_const_elem(&c, i) {
                                         if val.wildcard_eq(&ev).is_true() {
                                             return Value::from_u64(1, 1);
                                         }

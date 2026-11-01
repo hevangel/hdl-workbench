@@ -1270,6 +1270,7 @@ impl Simulator {
             return None;
         }
         let mut sv = BlockScopeSave {
+            scope_gen: self.next_frame_gen(),
             frame_gen: self.local_gen_stack.last().copied().unwrap_or(0),
             pid_mark: self.next_pid,
             ..Default::default()
@@ -1325,6 +1326,7 @@ impl Simulator {
             let plain = Self::type_is_plain_scalar(data_type);
             for d in declarators {
                 let nm = d.name.name.as_str();
+                sv.declared_names.push(nm.to_string());
                 if d.dimensions.is_empty() && self.is_virtual_iface_type(data_type) {
                     // §6.21 / §25.9: hiding a variable also hides its binding.
                     // Values alone cannot restore the enclosing vif after a
@@ -2114,7 +2116,7 @@ impl Simulator {
             );
             self.record_output(m.clone());
             self.stdout_writeln(&m);
-            self.finished = true;
+            self.abort_run();
             return true;
         }
         true
@@ -2265,6 +2267,7 @@ impl Simulator {
             body.span,
         ));
         let cont: Arc<[Statement]> = Arc::from(cont);
+        self.exec_cache_pids.insert(key.0);
         self.forever_cont_cache.insert(key, cont.clone());
         cont
     }
@@ -2352,6 +2355,7 @@ impl Simulator {
                                 let is_clk_ev = self.is_clocking_event(event);
                                 let resolved = self.resolve_sens_ids(&sens);
                                 if !sens.is_empty() && resolved.len() == sens.len() {
+                                    self.exec_cache_pids.insert(pid);
                                     self.forever_sens_cache
                                         .insert(key, (resolved.clone(), is_clk_ev));
                                 }
@@ -2380,6 +2384,21 @@ impl Simulator {
                             }
                             return;
                         }
+                        // §15.5: an event with no signal-table slot — a class
+                        // event (`@ev` on `this`, `@(h.ev)`, a static class
+                        // event) — parks through `run_process_stmts`, which
+                        // knows those identities. Executed synchronously below
+                        // it never waited, and the loop never saw the trigger.
+                        let cont = self.forever_cont(pid, body, body_stmts, i, 2, s);
+                        let contp = pc.pushed_frame(cont, resume_at);
+                        if self.forever_depth >= Self::FOREVER_RECURSION_LIMIT {
+                            self.event_queue.schedule(self.time, pid, contp);
+                            return;
+                        }
+                        self.forever_depth += 1;
+                        self.run_process_stmts(pid, &contp);
+                        self.forever_depth -= 1;
+                        return;
                     }
                 }
             }
@@ -2490,7 +2509,7 @@ impl Simulator {
                 "               Simulated time can never advance past this loop. Add a timing control,"
             );
             eprintln!("               or raise/disable the check with XEZIM_STALL_LIMIT=<n>.");
-            self.finished = true;
+            self.abort_run();
         }
     }
 
@@ -2509,6 +2528,14 @@ impl Simulator {
     /// that collection (§11.4.12). None when the base is not an indexable
     /// collection, in which case there is no bound to install.
     pub(super) fn dollar_bound_for_base(&mut self, base: &Expression) -> Option<i64> {
+        // §7.10.1: an object's queue is stored under its handle, not the
+        // source spelling (`list.contents`). Resolve that store before
+        // looking up the last index, including for a class-handle formal.
+        if let Some(n) = self.expr_assoc_name(base) {
+            if self.module.dynamic_arrays.contains(&n) {
+                return Some(self.get_queue_size(&n) as i64 - 1);
+            }
+        }
         let n = match &base.kind {
             ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
             _ => self.flat_member_name(base).map(std::borrow::Cow::Owned),
@@ -2624,6 +2651,21 @@ impl Simulator {
                     e.span,
                 )
             }
+            // §7.10.1/§11.4.12: the queue select may be the receiver of
+            // a property write (`list.contents[$].flags = v`). The scan
+            // above detects it; descend here too so the bound is installed
+            // before the assignment paths evaluate the object handle.
+            ExprKind::MemberAccess { expr, member } => Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.resolve_dollar_in_lvalue(expr)),
+                    member: member.clone(),
+                },
+                e.span,
+            ),
+            ExprKind::Paren(expr) => Expression::new(
+                ExprKind::Paren(Box::new(self.resolve_dollar_in_lvalue(expr))),
+                e.span,
+            ),
             _ => e.clone(),
         }
     }
@@ -2650,6 +2692,56 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// §10.4.2 (#569): the root name of a member/element NBA target when it
+    /// holds a live object handle, with the handle value, so the apply site
+    /// writes THAT object. The root may be a frame local or formal, a
+    /// property of `this`, or a module or block variable (#613): any
+    /// class-typed name, read as the statement executes.
+    pub(super) fn nba_root_frame(
+        &self,
+        lvalue: &Expression,
+    ) -> Option<(String, Value, Option<String>)> {
+        if !matches!(
+            lvalue.kind,
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+        ) && !matches!(&lvalue.kind, ExprKind::Ident(h) if h.path.len() > 1)
+        {
+            return None;
+        }
+        let mut e = lvalue;
+        loop {
+            match &e.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => e = expr,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        let root = &h.path[0].name.name;
+        // `this` is carried by `this_handle`.
+        if root == "this" {
+            return None;
+        }
+        // Only a class-typed root holds a handle: an integer local whose value
+        // happens to index a live object is not one.
+        let class = self.class_of_var(root)?;
+        let handle = match self.local_stack.last().and_then(|f| f.get(root)) {
+            Some(v) => v.to_u64()? as usize,
+            None => self.eval_ident_handle(root)?,
+        };
+        if handle == 0 || !self.heap.get(handle).is_some_and(|o| o.is_some()) {
+            return None;
+        }
+        Some((
+            root.clone(),
+            Value::from_u64(handle as u64, 64),
+            Some(class),
+        ))
     }
 
     pub(super) fn freeze_lvalue_indices(&mut self, e: &Expression) -> Expression {
@@ -3072,6 +3164,7 @@ impl Simulator {
         }
         self.enqueue_context_nba(
             NbaEntry {
+                root_frame: None,
                 lhs: key.is_none().then(|| root.into_owned()),
                 value,
                 resolved_id: None,
@@ -3278,10 +3371,33 @@ impl Simulator {
             }
             if let Some(lhs) = entry.lhs {
                 // Re-establish the scheduling context so a class-property
-                // target resolves (see NbaEntry::this_handle).
+                // target resolves (see NbaEntry::this_handle), and the
+                // object the target's root NAMED when it was scheduled
+                // (see NbaEntry::root_frame).
                 if let Some(h) = entry.this_handle {
                     self.this_stack.push(Some(h));
                 }
+                // The frame declares the root's class (its declared one, else
+                // the object's own), so a member write resolves without
+                // whichever call frame the event loop still holds (#613).
+                let pushed_root = if let Some((name, val, declared)) = entry.root_frame {
+                    let class = declared.or_else(|| {
+                        val.to_u64()
+                            .and_then(|h| self.heap.get(h as usize))
+                            .and_then(|o| o.as_ref())
+                            .map(|o| o.class_name.clone())
+                    });
+                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    let mut types = self.take_pooled_types();
+                    if let Some(c) = class {
+                        types.0.insert(name.clone(), c);
+                    }
+                    frame.insert(name, val);
+                    self.push_local_frame_typed(frame, types);
+                    true
+                } else {
+                    false
+                };
                 let value = if let Some((dst, src, len)) = entry.static_slice {
                     let mut stored = self.eval_expr(&lhs);
                     stored.copy_bits_from(dst as usize, &entry.value, src as usize, len as usize);
@@ -3290,6 +3406,9 @@ impl Simulator {
                     entry.value
                 };
                 self.assign_value(&lhs, &value);
+                if pushed_root {
+                    self.pop_local_frame();
+                }
                 if entry.this_handle.is_some() {
                     self.this_stack.pop();
                 }
@@ -3956,7 +4075,7 @@ impl Simulator {
             passes += 1;
             if self.stall_limit > 0 && passes > self.stall_limit {
                 self.report_edge_rescan_stall(passes);
-                self.finished = true;
+                self.abort_run();
                 break;
             }
             self.check_edges_inner(Some(&subset), false);

@@ -42,8 +42,13 @@ impl Simulator {
                 return None;
             }
             if let Some(dt) = cd.property_types.get(prop) {
+                // §8.25: a property declared by a class type parameter
+                // (`rand T w;`, T = `logic [8:0][7:0]`) has the dimensions
+                // of the type this object binds to it; the declared `T`
+                // has none, so `o.w[1] = 7` wrote nothing (#576).
+                let bound = self.bind_type_params_in(dt, &|n| self.obj_type_param(handle, &c, n));
                 let dims = super::elaborate::packed_full_dims_chained(
-                    dt,
+                    bound.as_ref().unwrap_or(dt),
                     &self.module.parameters,
                     &self.module.typedef_types,
                 )?;
@@ -396,7 +401,7 @@ impl Simulator {
         matches!(
             expr.kind,
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. } | ExprKind::Paren(_)
-        )
+        ) || matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() > 1)
     }
 
     /// A select of a select of a variable the innermost call frame owns (a
@@ -450,11 +455,10 @@ impl Simulator {
             return None;
         }
         let name = h.path[0].name.name.as_str();
-        if !self
-            .local_stack
-            .last()
-            .is_some_and(|f| f.contains_key(name))
-            && !self.hoisted_sub_static_names.contains(name)
+        if !self.local_stack.last().is_some_and(|f| {
+            f.contains_key(name)
+                || (self.any_struct_formal_markers && f.contains_key(&format!("{name}.")))
+        }) && !self.hoisted_sub_static_names.contains(name)
         {
             return None;
         }
@@ -511,9 +515,66 @@ impl Simulator {
         {
             return None;
         }
-        let dt = self.module.var_decl_types.get(name)?;
-        let (hops, total, two) = self.packed_hops(dt, &steps)?;
-        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(name)) {
+        // A suspended task keeps its typedef in the process-local frame.
+        // Another task may meanwhile bind a same-named formal of a different
+        // type, replacing the shared var_decl_types / packed-element tables.
+        // Resolve the active declaration before consulting those tables.
+        // The frame records a local's typedef name only, which is not the
+        // whole type of a packed array of it (`e8_t [1:0] a`), so a type
+        // whose geometry does not fit the cell falls back to the module's
+        // declaration.
+        let (dt, unpacked, _) = self.query_root_decl_type(name)?;
+        if !unpacked.is_empty() {
+            return None;
+        }
+        let (root, steps, hops, two) = self
+            .frame_packed_geometry(dt, root.clone(), name, &steps)
+            .or_else(|| {
+            let dt = self.module.var_decl_types.get(name)?.clone();
+            self.frame_packed_geometry(dt, root, name, &steps)
+        })?;
+        Some((root, name, steps, hops, two))
+    }
+
+    /// `frame_packed_target`'s layout of the selects `steps` of frame
+    /// variable `name` declared `dt`, when it fits the variable's cell.
+    #[allow(clippy::type_complexity)]
+    fn frame_packed_geometry<'e>(
+        &self,
+        mut dt: DataType,
+        mut root: std::borrow::Cow<'e, Expression>,
+        name: &'e str,
+        steps: &[PendingSel<'e>],
+    ) -> Option<(
+        std::borrow::Cow<'e, Expression>,
+        Vec<PendingSel<'e>>,
+        Vec<PackedHop>,
+        bool,
+    )> {
+        let mut steps = steps.to_vec();
+        let mut cell = std::borrow::Cow::Borrowed(name);
+        // Unpacked structs are stored as individual frame leaves (`req.data`),
+        // not as a packed value at `req`. Walk to that leaf, then use the
+        // member's declared packed geometry for the remaining selects. Never
+        // derive its shape from a different activation's name-keyed metadata.
+        while matches!(self.resolve_dt_ref(&dt), DataType::Struct(su) if !su.packed) {
+            let PendingSel::Member(member) = steps.first()? else {
+                return None;
+            };
+            let (member_dt, dims) = self.member_decl_type(&dt, member)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            cell = std::borrow::Cow::Owned(format!("{cell}.{member}"));
+            root = std::borrow::Cow::Owned(Self::append_member_expr(root.as_ref(), member));
+            dt = member_dt;
+            steps.remove(0);
+        }
+        if steps.is_empty() {
+            return None;
+        }
+        let (hops, total, two) = self.packed_hops(&dt, &steps)?;
+        let valid = if let Some(cur) = self.local_stack.last().and_then(|f| f.get(cell.as_ref())) {
             !cur.is_real && cur.width == total
         } else if self.hoisted_sub_static_names.contains(name) {
             self.get_signal_value_by_name(name)
@@ -524,7 +585,7 @@ impl Simulator {
         if !valid {
             return None;
         }
-        Some((root, name, steps, hops, two))
+        Some((root, steps, hops, two))
     }
 
     /// The packed layout of `dt`: its packed dimensions, outermost first and
@@ -1109,7 +1170,27 @@ impl Simulator {
                     return None;
                 }
                 let dt = self.module.var_decl_types.get(&name)?;
-                let (element_type, dimensions, width) = self.declared_packed_type(dt)?;
+                let (element_type, mut dimensions, mut width) = self.declared_packed_type(dt)?;
+                // §23.10: a declaration inside an instantiated module sizes its
+                // dimensions with THAT instance's parameters. The declaration
+                // above was evaluated against the design-wide table, where a
+                // child's `N` is stored as `<inst>.N`: a bare `N` misses (the
+                // shape collapses to a plain 2-bit vector, so `mv[1][0]` read
+                // one bit) or hits an unrelated top-level `N`. Elaboration
+                // recorded this signal's dimensions per instance; use them.
+                if let Some(recorded) = self.module.packed_full_dims.get(&name)
+                    && matches!(
+                        element_type,
+                        DataType::IntegerVector { .. } | DataType::Implicit { .. }
+                    )
+                {
+                    let mut total: u32 = 1;
+                    for &(l, r) in recorded {
+                        total = total.checked_mul(u32::try_from(l.abs_diff(r) + 1).ok()?)?;
+                    }
+                    dimensions = recorded.clone();
+                    width = total;
+                }
                 let unpacked = if let Some((dims, _)) = self.module.arrays_nd.get(&name) {
                     dims.len()
                 } else if self.module.arrays_2d.contains_key(&name) {
@@ -1653,7 +1734,7 @@ impl Simulator {
         items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
     ) -> rand_csp::CspOutcome {
-        let (scalars, arrays) = match self.std_randomize_vars(targets, false) {
+        let (scalars, arrays) = match self.std_randomize_vars(items, targets, false) {
             Ok(v) => v,
             Err(o) => return o,
         };
@@ -1678,8 +1759,8 @@ impl Simulator {
         items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
     ) -> Option<bool> {
-        let (scalars, arrays) = self.std_randomize_vars(targets, true).ok()?;
-        let sized: HashSet<String> = arrays
+        let (scalars, arrays) = self.std_randomize_vars(items, targets, true).ok()?;
+        let mut sized: HashSet<String> = arrays
             .iter()
             .filter(|a| {
                 (self.module.dynamic_arrays.contains(&a.1)
@@ -1693,7 +1774,27 @@ impl Simulator {
         if sized.is_empty() {
             return None;
         }
-        for _ in 0..4 {
+        let mut arrays = arrays;
+        let mut scalars = scalars;
+        for round in 0..6 {
+            if round > 0 && !self.rand_scope_row_owners.is_empty() {
+                // §7.4.5: rows created by the last round have sizes of
+                // their own to solve.
+                let (s2, a2) = self.std_randomize_vars(items, targets, true).ok()?;
+                sized = a2
+                    .iter()
+                    .filter(|a| {
+                        (self.module.dynamic_arrays.contains(&a.1)
+                            || self
+                                .signals
+                                .contains_key(&Self::name_with_suffix(&a.1, ".size")))
+                            && Self::items_read_size(items, &a.0)
+                    })
+                    .map(|a| a.0.clone())
+                    .collect();
+                scalars = s2;
+                arrays = a2;
+            }
             let sizes = match self.csp_scope_sizes(items, &scalars, &arrays, &sized) {
                 Ok(s) => s,
                 // A relaxation of the problem has no solution.
@@ -1703,7 +1804,27 @@ impl Simulator {
             for (name, n) in sizes {
                 if let Some(a) = arrays.iter().find(|a| a.0 == name) {
                     let key = a.1.clone();
-                    self.resize_random_dyn_target(&key, n);
+                    match self.rand_scope_row_owners.get(&key).copied() {
+                        // §7.4.5: its elements are rows; new dynamic rows
+                        // start empty, their sizes solved next round.
+                        Some(dyn_rows) => {
+                            let old = self.get_queue_size(&key);
+                            for i in n..old {
+                                let row = format!("{key}[{i}]");
+                                self.clear_dyn_row(&row);
+                                self.signals.remove(&format!("{row}.size"));
+                            }
+                            if dyn_rows {
+                                for i in old.min(n)..n {
+                                    let row = format!("{key}[{i}]");
+                                    self.module.dynamic_arrays.insert(row.clone());
+                                    self.set_queue_size(&row, 0);
+                                }
+                            }
+                            self.set_queue_size(&key, n);
+                        }
+                        None => self.resize_random_dyn_target(&key, n),
+                    }
                 }
             }
             if matches!(
@@ -1714,6 +1835,57 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Whether the dynamic `std::randomize` target stored at `key` (written
+    /// `written`) has dynamic rows (`T d[][]`): rows already sized, or a
+    /// constraint calling `size()` on a row, which only a dynamic array or
+    /// queue has (§7.5.2, §7.10.2).
+    pub(super) fn scope_dyn_rows(
+        &self,
+        key: &str,
+        written: &str,
+        items: &[crate::ast::decl::ConstraintItem],
+    ) -> bool {
+        let n = self.get_queue_size(key);
+        if (0..n).any(|i| {
+            let row = format!("{key}[{i}]");
+            self.module.dynamic_arrays.contains(&row)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(&row, ".size"))
+        }) {
+            return true;
+        }
+        let mut hit = false;
+        for it in items {
+            Self::csp_item_walk(it, &mut |i| {
+                let mut look = |e: &Expression| {
+                    Self::walk_operands(e, &mut |x| {
+                        if let ExprKind::Call { func, args } = &x.kind
+                            && args.is_empty()
+                            && let ExprKind::MemberAccess { expr, member } = &func.kind
+                            && member.name == "size"
+                            && let ExprKind::Index { expr: b, .. } = &expr.kind
+                            && let ExprKind::Ident(h) = &b.kind
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && h.path[0].name.name == written
+                        {
+                            hit = true;
+                        }
+                    })
+                };
+                match i {
+                    crate::ast::decl::ConstraintItem::Expr(e) => look(e),
+                    crate::ast::decl::ConstraintItem::Inside { expr, .. } => look(expr),
+                    crate::ast::decl::ConstraintItem::Implication { condition, .. }
+                    | crate::ast::decl::ConstraintItem::IfElse { condition, .. } => look(condition),
+                    _ => {}
+                }
+            });
+        }
+        hit
     }
 
     /// Whether some item reads `name.size()`.
@@ -1729,6 +1901,12 @@ impl Simulator {
             items: items.to_vec(),
             span: crate::ast::Span::dummy(),
         }];
+        // A row (`d[1]`) is named by an index on its base (§7.4.5).
+        let nd_base = name
+            .strip_suffix(']')
+            .and_then(|r| r.rsplit_once('['))
+            .filter(|(_, i)| i.parse::<i64>().is_ok())
+            .map(|(b, _)| (b.to_string(), Vec::new()));
         let c = RandColl {
             prop: name.to_string(),
             scoped: name.to_string(),
@@ -1738,6 +1916,8 @@ impl Simulator {
             hi: 0,
             nested: false,
             is_object_elem: false,
+            nd_base,
+            row_tail: None,
         };
         Self::csp_size_solved(&c, &wrapper)
     }
@@ -1748,6 +1928,7 @@ impl Simulator {
     #[allow(clippy::type_complexity)]
     pub(super) fn std_randomize_vars(
         &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
         empty: bool,
     ) -> Result<
@@ -1759,12 +1940,105 @@ impl Simulator {
     > {
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
+        self.rand_scope_nd.clear();
+        self.rand_scope_row_owners.clear();
+        self.rand_scope_nd_dyn.clear();
         for (name, lv) in targets {
             let enum_vals = |me: &Self, n: &str| {
                 me.declared_enum_members(n)
                     .filter(|m| !m.is_empty())
                     .map(|m| m.iter().map(|x| x.1).collect::<Vec<u64>>())
             };
+            // §18.12 / §18.4 (#519): a multi-dimensional unpacked array
+            // joins as one solver array per row (all but the last dimension
+            // indexed), its bounds kept for the `foreach` levels above.
+            if let ExprKind::Ident(h) = &lv.kind
+                && h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+            {
+                let nm = self.resolve_hier_name(h).into_owned();
+                let nm = self.instance_assoc_member(&nm).unwrap_or(nm);
+                let shape: Option<(Vec<(i64, i64)>, u32)> =
+                    if let Some(&(d0, d1, w)) = self.module.arrays_2d.get(&nm) {
+                        Some((vec![d0, d1], w))
+                    } else {
+                        self.module.arrays_nd.get(&nm).map(|(sh, w)| (sh.clone(), *w))
+                    };
+                if let Some((dims, w)) = shape
+                    && dims.len() >= 2
+                {
+                    let w = w.max(1);
+                    if w > 64 {
+                        return Err(rand_csp::CspOutcome::NotApplicable);
+                    }
+                    let written = if h.path.len() == 1 && h.path[0].name.name != nm {
+                        h.path[0].name.name.clone()
+                    } else {
+                        nm.clone()
+                    };
+                    let signed = match self.module.var_decl_types.get(&nm) {
+                        Some(dt) => super::elaborate::is_type_signed_resolved(
+                            dt,
+                            &self.module.typedef_types,
+                        ),
+                        None => self.signed_signals.contains(&nm),
+                    };
+                    let ev = enum_vals(self, &nm);
+                    // §7.4.5: a dynamic outer dimension (`T a[][N]`) has its
+                    // current size, not the 64-slot buffer; while sizes are
+                    // solved it is also a size-only array of its own.
+                    let mut dims = dims;
+                    let dyn_outer = self.module.dynamic_arrays.contains(&nm)
+                        || self
+                            .signals
+                            .contains_key(&Self::name_with_suffix(&nm, ".size"));
+                    if dyn_outer {
+                        let n = self.get_queue_size(&nm) as i64;
+                        dims[0] = (0, n - 1);
+                        self.rand_scope_row_owners.insert(nm.clone(), false);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 1);
+                        if empty {
+                            arrays.push((
+                                written.clone(),
+                                nm.clone(),
+                                Vec::new(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                    }
+                    let (ll, lr) = dims[dims.len() - 1];
+                    let idx: Vec<i64> = (ll.min(lr)..=ll.max(lr)).collect();
+                    let mut prefixes: Vec<String> = vec![String::new()];
+                    for (d, &(l, r)) in dims[..dims.len() - 1].iter().enumerate() {
+                        let span: Vec<i64> = if d == 0 && dyn_outer {
+                            (0..=r).collect()
+                        } else {
+                            (l.min(r)..=l.max(r)).collect()
+                        };
+                        let mut next = Vec::new();
+                        for p in &prefixes {
+                            for &i in &span {
+                                next.push(format!("{p}[{i}]"));
+                            }
+                        }
+                        prefixes = next;
+                    }
+                    self.rand_scope_nd.insert(written.clone(), dims.clone());
+                    for p in prefixes {
+                        arrays.push((
+                            format!("{written}{p}"),
+                            format!("{nm}{p}"),
+                            idx.clone(),
+                            w,
+                            signed,
+                            ev.clone(),
+                        ));
+                    }
+                    continue;
+                }
+            }
             if let Some(nm) = self.array_operand_name(lv) {
                 if self.module.arrays_nd.contains_key(&nm)
                     || self.module.arrays_2d.contains_key(&nm)
@@ -1775,6 +2049,73 @@ impl Simulator {
                     || self
                         .signals
                         .contains_key(&Self::name_with_suffix(&nm, ".size"));
+                // §7.4.5: dynamic rows (`T d[][]`), each with its own size.
+                if dynamic {
+                    let written = match &lv.kind {
+                        ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && h.path[0].name.name != nm =>
+                        {
+                            h.path[0].name.name.clone()
+                        }
+                        _ => nm.clone(),
+                    };
+                    if self.scope_dyn_rows(&nm, &written, items) {
+                        let w = self
+                            .module
+                            .arrays
+                            .get(&nm)
+                            .map(|t| t.2)
+                            .unwrap_or(32)
+                            .max(1);
+                        if w > 64 {
+                            return Err(rand_csp::CspOutcome::NotApplicable);
+                        }
+                        let signed = self.signed_signals.contains(&nm)
+                            || self.module.var_decl_types.get(&nm).is_some_and(|dt| {
+                                super::elaborate::is_type_signed_resolved(
+                                    dt,
+                                    &self.module.typedef_types,
+                                )
+                            });
+                        let ev = enum_vals(self, &nm);
+                        let n = self.get_queue_size(&nm) as i64;
+                        let sizes: Vec<i64> = (0..n)
+                            .map(|i| self.get_queue_size(&format!("{nm}[{i}]")) as i64)
+                            .collect();
+                        let m = sizes.iter().copied().max().unwrap_or(0);
+                        self.rand_scope_nd
+                            .insert(written.clone(), vec![(0, n - 1), (0, m - 1)]);
+                        self.rand_scope_row_owners.insert(nm.clone(), true);
+                        self.rand_scope_nd_dyn.insert(written.clone(), 2);
+                        if empty {
+                            arrays.push((
+                                written.clone(),
+                                nm.clone(),
+                                Vec::new(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                        for (i, &mi) in sizes.iter().enumerate() {
+                            if mi == 0 && !empty {
+                                continue;
+                            }
+                            arrays.push((
+                                format!("{written}[{i}]"),
+                                format!("{nm}[{i}]"),
+                                (0..mi).collect(),
+                                w,
+                                signed,
+                                ev.clone(),
+                            ));
+                        }
+                        continue;
+                    }
+                }
                 let idx: Vec<i64> = if dynamic {
                     (0..self.get_queue_size(&nm) as i64).collect()
                 } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
@@ -1842,30 +2183,48 @@ impl Simulator {
                 arrays.push((written, nm, idx, w.max(1), signed, ev));
                 continue;
             }
-            if let Some((root, _)) = name.split_once('.') {
+            if let Some((parent, _)) = name.rsplit_once('.') {
                 // A field of a packed struct that is itself a target: a view
-                // of that variable, not a variable of its own.
-                if targets.iter().any(|(n, _)| n == root) {
+                // of that variable, not a variable of its own.  Compare the
+                // IMMEDIATE parent: a static subroutine local's resolved name
+                // is dotted the same way (`<fn>.<var>`), and matching only the
+                // FIRST segment never matched `<fn>.<var>`'s parent, so every
+                // static local was mistaken for a field view and dropped the
+                // whole call out of the joint solver.
+                if targets.iter().any(|(n, _)| n == parent) {
                     continue;
                 }
-                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             if !matches!(lv.kind, ExprKind::Ident(_)) {
+                // `obj.f` / `s.g.h` — a field access this solve does not model.
+                // A plain identifier is only *scope*-qualified (`<fn>.<var>`),
+                // which is a real variable of the call and joins below.
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
             let cur = self.eval_expr(lv);
             if cur.is_real {
                 return Err(rand_csp::CspOutcome::NotApplicable);
             }
+            // The name the constraints write this variable by.  A static
+            // subroutine local resolves to `<fn>.<var>`, but the `with {…}`
+            // block names it `<var>`; the solve matches operands by the name
+            // as written (`csp_solve_path`) and reads and writes through `lv`
+            // (`csp.scope`), so it registers under the written name — exactly
+            // as the array path above does.
+            let written = match &lv.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name != *name =>
+                {
+                    h.path[0].name.name.clone()
+                }
+                _ => name.clone(),
+            };
             // A local wider than 64 bits joins as segments (`csp_scope`).
             let ev = enum_vals(self, name);
-            scalars.push((
-                name.clone(),
-                lv.clone(),
-                cur.width.max(1),
-                cur.is_signed,
-                ev,
-            ));
+            scalars.push((written, lv.clone(), cur.width.max(1), cur.is_signed, ev));
         }
         Ok((scalars, arrays))
     }
@@ -1955,6 +2314,40 @@ impl Simulator {
         name: &String,
         args: &Vec<Expression>,
     ) -> Value {
+        if matches!(
+            name.as_str(),
+            "$bits"
+                | "$size"
+                | "$left"
+                | "$right"
+                | "$low"
+                | "$high"
+                | "$increment"
+                | "$dimensions"
+                | "$unpacked_dimensions"
+        ) && let Some(first) = args.first()
+        {
+            let mut operand = first;
+            while let ExprKind::Paren(inner) = &operand.kind {
+                operand = inner;
+            }
+            if let ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } = &operand.kind
+                && self.is_unpacked_aggregate_operand(then_expr)
+                && self.is_unpacked_aggregate_operand(else_expr)
+            {
+                let mut args = args.clone();
+                // §20.7 queries the current value of a dynamic dimension;
+                // fixed dimensions and §20.6.2 $bits are type-only probes.
+                args[0] = if matches!(name.as_str(), "$size" | "$left" | "$right" | "$low" | "$high" | "$increment") && self.aggregate_query_needs_value(operand) {
+                    self.selected_aggregate_rhs(None, operand).unwrap_or_else(|| (**then_expr).clone())
+                } else { (**then_expr).clone() };
+                return self.eval_expr_system_call_body(expr, ctx_width, name, &args);
+            }
+        }
         match name.as_str() {
             COV_COND_FN => return self.cov_cond(args),
             // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
@@ -3028,132 +3421,73 @@ impl Simulator {
                     .unwrap_or(0);
                 Value::from_u64(self.rng_range_u64(a.min(b), a.max(b)), 32)
             }
-            // `$random` (no seed) keeps its legacy deterministic value; with a
-            // seed it produces a reproducible stream (updating the seed).
-            // §20.15.2 probabilistic distribution functions. Each takes an
-            // inout `seed` it advances in place, so the same seed replays
-            // the same stream.
-            "$dist_uniform" | "$dist_normal" | "$dist_exponential" | "$dist_poisson"
-            | "$dist_chi_square" | "$dist_t" | "$dist_erlang" => {
-                let Some(seed_arg) = args.first() else {
+            // §20.15.1, §20.15.2: `$random` and the distribution functions
+            // run the Annex N generators. Each takes an inout `seed` it
+            // advances in place, so the same seed replays the same stream
+            // in every simulator that follows the standard.
+            "$random" | "$dist_uniform" | "$dist_normal" | "$dist_exponential"
+            | "$dist_poisson" | "$dist_chi_square" | "$dist_t" | "$dist_erlang" => {
+                use super::annex_n;
+                let seed_arg = args.first();
+                if seed_arg.is_none() && name != "$random" {
                     return Value::zero(32);
+                }
+                // A no-seed `$random` draws from one simulation-wide seed
+                // that starts at 0 (Annex N's `$random` static seed).
+                let mut seed = match seed_arg {
+                    Some(a) => self.eval_expr(a).to_u64().unwrap_or(0) as u32 as i32,
+                    None => self.annex_n_seed,
                 };
-                let mut seed = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
-                // Advance the caller's seed exactly once per call.
-                let next_u32 = |sd: &mut u32| -> u32 {
-                    *sd = Self::prng_next(*sd);
-                    *sd
-                };
-                let unit = |sd: &mut u32| -> f64 {
-                    // (0,1) — never exactly 0, so ln() stays finite.
-                    (next_u32(sd) as f64 + 1.0) / (u32::MAX as f64 + 2.0)
-                };
-                let arg_i = |sim: &mut Self, i: usize| -> i64 {
+                let arg_i = |sim: &mut Self, i: usize| -> i32 {
                     args.get(i)
-                        .map(|a| sim.eval_expr(a).to_i64().unwrap_or(0))
+                        .map(|a| sim.eval_expr(a).to_i64().unwrap_or(0) as i32)
                         .unwrap_or(0)
                 };
-                let out: i64 = match name.as_str() {
+                let out = match name.as_str() {
+                    "$random" => annex_n::random(&mut seed),
                     "$dist_uniform" => {
-                        let lo = arg_i(self, 1);
-                        let hi = arg_i(self, 2);
-                        if hi <= lo {
-                            lo
-                        } else {
-                            let span = (hi - lo + 1) as u64;
-                            lo + (next_u32(&mut seed) as u64 % span) as i64
-                        }
+                        let (lo, hi) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_uniform(&mut seed, lo, hi)
                     }
                     "$dist_normal" => {
-                        let mean = arg_i(self, 1) as f64;
-                        let sd = arg_i(self, 2) as f64;
-                        // Box-Muller.
-                        let u1 = unit(&mut seed);
-                        let u2 = unit(&mut seed);
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        (mean + sd * z).round() as i64
+                        let (mean, sd) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_normal(&mut seed, mean, sd)
                     }
                     "$dist_exponential" => {
-                        let mean = arg_i(self, 1).max(1) as f64;
-                        (-mean * unit(&mut seed).ln()).round() as i64
+                        let mean = arg_i(self, 1);
+                        annex_n::dist_exponential(&mut seed, mean)
                     }
                     "$dist_poisson" => {
-                        let mean = arg_i(self, 1).max(0) as f64;
-                        // Knuth.
-                        let l = (-mean).exp();
-                        let mut k = 0i64;
-                        let mut p = 1.0f64;
-                        loop {
-                            p *= unit(&mut seed);
-                            if p <= l || k > 10_000 {
-                                break;
-                            }
-                            k += 1;
-                        }
-                        k
+                        let mean = arg_i(self, 1);
+                        annex_n::dist_poisson(&mut seed, mean)
                     }
                     "$dist_chi_square" => {
-                        // Sum of `df` squared standard normals.
-                        let df = arg_i(self, 1).max(1);
-                        let mut acc = 0.0f64;
-                        for _ in 0..df.min(1000) {
-                            let u1 = unit(&mut seed);
-                            let u2 = unit(&mut seed);
-                            let z =
-                                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                            acc += z * z;
-                        }
-                        acc.round() as i64
+                        let df = arg_i(self, 1);
+                        annex_n::dist_chi_square(&mut seed, df)
                     }
                     "$dist_t" => {
-                        let df = arg_i(self, 1).max(1);
-                        let u1 = unit(&mut seed);
-                        let u2 = unit(&mut seed);
-                        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        let mut chi = 0.0f64;
-                        for _ in 0..df.min(1000) {
-                            let a = unit(&mut seed);
-                            let b = unit(&mut seed);
-                            let zz =
-                                (-2.0 * a.ln()).sqrt() * (2.0 * std::f64::consts::PI * b).cos();
-                            chi += zz * zz;
-                        }
-                        (z / (chi / df as f64).sqrt()).round() as i64
+                        let df = arg_i(self, 1);
+                        annex_n::dist_t(&mut seed, df)
                     }
                     _ => {
-                        // $dist_erlang(seed, k, mean)
-                        let k = arg_i(self, 1).max(1);
-                        let mean = arg_i(self, 2).max(1) as f64;
-                        let mut acc = 0.0f64;
-                        for _ in 0..k.min(1000) {
-                            acc += -unit(&mut seed).ln();
-                        }
-                        (acc * mean / k as f64).round() as i64
+                        let (k, mean) = (arg_i(self, 1), arg_i(self, 2));
+                        annex_n::dist_erlang(&mut seed, k, mean)
                     }
                 };
-                self.assign_value(seed_arg, &Value::from_u64(seed as u64, 32));
-                let mut v = Value::from_u64(out as u64, 32);
+                match seed_arg {
+                    Some(a) => {
+                        let mut sv = Value::from_u64(seed as u32 as u64, 32);
+                        sv.is_signed = true;
+                        self.assign_value(a, &sv);
+                    }
+                    None => self.annex_n_seed = seed,
+                }
+                let mut v = Value::from_u64(out as u32 as u64, 32);
                 v.is_signed = true;
                 v
             }
-            "$random" => {
-                if let Some(seed_arg) = args.first() {
-                    let s = self.eval_expr(seed_arg).to_u64().unwrap_or(0) as u32;
-                    let next = Self::prng_next(s);
-                    self.assign_value(seed_arg, &Value::from_u64(next as u64, 32));
-                    let mut v = Value::from_u64(next as u64, 32);
-                    v.is_signed = true;
-                    v
-                } else {
-                    // §20.15.1: no-seed `$random` draws from the global RNG
-                    // (same stream as no-arg `$urandom`) and returns a SIGNED
-                    // 32-bit value. It used to return a constant 0, so every
-                    // `$random` stimulus was stuck at 0.
-                    let mut v = Value::from_u64(self.rng_u32() as u64, 32);
-                    v.is_signed = true;
-                    v
-                }
-            }
+            // §3.14.3: a `1step` delay value, one global tick (#615).
+            n if n == super::elaborate::ONE_STEP_DELAY => Value::from_f64(1.0),
             "$isunknown" => {
                 let v = args
                     .first()
@@ -3788,6 +4122,42 @@ impl Simulator {
                     if let Some(rv) = self.member_array_query(&sn, arg, dim) {
                         return rv;
                     }
+                    // §8.3.2/§6.20.2 (issue #388): the query on a class-scope
+                    // ARRAY constant — `$size(pkg::Cls::T)`, `$size(Cls::T)`
+                    // (which parses as a MemberAccess when the prefix is a
+                    // plain class), bare `$size(T)` in a method of the
+                    // declaring class. The constant has no module-scope shape
+                    // row, so the query fell through to the operand's packed
+                    // width (32) while the element reads were right.
+                    if dim == 1 {
+                        if let Some(c) = self.resolve_class_scope_array_const(arg) {
+                            let size = (c.hi - c.lo + 1).max(0) as u64;
+                            // Declared bounds in source order: a descending
+                            // `[5:4]` constant reports `$left` 5 / `$right` 4
+                            // and `$increment` 1 (§20.7); the normalized
+                            // (lo, hi) pair covers `$low`/`$high`/`$size`.
+                            // Falls back to the normalized pair (ascending)
+                            // when no declared-dimension row was recorded.
+                            let result = match sn.as_str() {
+                                "$left" => c.left as u64,
+                                "$right" => c.right as u64,
+                                "$high" => c.hi as u64,
+                                "$low" => c.lo as u64,
+                                "$size" => size,
+                                "$increment" => {
+                                    if c.left >= c.right {
+                                        1
+                                    } else {
+                                        0u64.wrapping_sub(1)
+                                    }
+                                }
+                                _ => 0,
+                            };
+                            let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
+                            rv.is_signed = true;
+                            return rv;
+                        }
+                    }
                     // Resolve the operand to the name its declared bounds
                     // are registered under. A plain / hierarchical Ident
                     // resolves as it always did; a HANDLE-QUALIFIED member
@@ -4277,9 +4647,21 @@ impl Simulator {
                         self.collect_sva_signal_ids(&e, &mut ids);
                         ids.sort_unstable();
                         ids.dedup();
+                        let index_saved = self.install_preponed(&ids);
+                        // §16.5.1: an element of an unpacked array has no
+                        // "signal id" through collect_sva_signal_ids, but its
+                        // Preponed sample lives at the cell's id in
+                        // `sva_preponed`. Collect the cell ids too (sva_cells
+                        // resolves `mem[k]` to its cell id) so install_preponed
+                        // swaps in the Preponed values during the eval below,
+                        // immune to any in-slot writes to that cell.
+                        self.sva_cells(&e, &mut ids);
+                        ids.sort_unstable();
+                        ids.dedup();
                         let saved = self.install_preponed(&ids);
                         let v = self.eval_expr(&e);
                         self.restore_preponed(saved);
+                        self.restore_preponed(index_saved);
                         v
                     }
                     None => Value::zero(32),

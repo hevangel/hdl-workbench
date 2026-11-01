@@ -1,4 +1,8 @@
 //! IEEE 1800-2023 clause 18: constrained random value generation.
+//!
+//! Expectations updated for #566: `%p` prints vector members as `'h` hex,
+//! a packed union's first member, `%0p` as `%p`, and no space before an
+//! associative array's closing brace.
 
 use crate::harness::{Order, check};
 
@@ -130,7 +134,7 @@ fn c18_constrained_random_deep() {
             "T|18.5.8|obj array r=1 v=0,2,4,6 n=8",
             "T|18.7|with nested contradiction r=0",
             "T|18.5|bidirectional x=6",
-            "T|18.7|with data='{250, 251, 252, 253} kind<3=1",
+            "T|18.7|with data='{'hfa, 'hfb, 'hfc, 'hfd} kind<3=1",
             "T|18.4|logic rand no x=1 signed s<-100=1",
             "T|18.5.5|queue unique sum r=1 ok=1",
             "T|18.12|std array '{0, 1, 4, 9}",

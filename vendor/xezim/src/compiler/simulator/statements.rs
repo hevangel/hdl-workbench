@@ -105,6 +105,38 @@ impl Simulator {
         }
     }
 
+    /// Leaf width of the class member `<h>#d` declared with dynamic or
+    /// queue rows (`T d[][]`, `T d[][$]`), when `name` is that member.
+    pub(super) fn class_dyn_row_width(&self, name: &str) -> Option<u32> {
+        let (h, prop) = name.split_once('#')?;
+        if prop.contains('[') || prop.contains('.') {
+            return None;
+        }
+        let handle = h.parse::<usize>().ok()?;
+        let cd = self.class_prop_declarer(handle, prop)?;
+        let tail = cd.dynamic_tail_properties.get(prop)?;
+        matches!(
+            tail.first(),
+            Some(
+                crate::ast::types::UnpackedDimension::Unsized(_)
+                    | crate::ast::types::UnpackedDimension::Queue { .. }
+            )
+        )
+        .then(|| {
+            self.spec_member_elem_width(&cd, handle, prop)
+                .or_else(|| cd.queue_properties.get(prop).map(|&(w, _)| w))
+                .unwrap_or(32)
+                .max(1)
+        })
+    }
+
+    /// Drop every element of the row collection `row` (`<h>#d[i]`).
+    pub(super) fn clear_dyn_row(&mut self, row: &str) {
+        for key in self.signals.keys_with_elem_prefix(&format!("{}[", row)) {
+            self.signals.remove(&key);
+        }
+    }
+
     /// The declared associative tail below a dynamic outer array, scoped to
     /// a local, object property, or unpacked-struct member (§7.4.5).
     #[cold]
@@ -298,13 +330,48 @@ impl Simulator {
             self.set_queue_size(name, n);
             return;
         }
+        // §7.4.5: a class member `T d[][]` (dynamic rows): each element is
+        // a collection of its own, empty until `d[i] = new[m]` sizes it.
+        if let Some(w) = self.class_dyn_row_width(name) {
+            let self_copy = src.as_deref() == Some(name);
+            let keep = src
+                .as_deref()
+                .map_or(0, |sn| self.get_queue_size(sn).min(n));
+            for i in if self_copy { keep } else { 0 }..n {
+                let row = format!("{}[{}]", name, i);
+                self.clear_dyn_row(&row);
+                self.module.dynamic_arrays.insert(row.clone());
+                self.module.arrays.insert(row.clone(), (0, 63, w));
+                self.set_queue_size(&row, 0);
+            }
+            // §7.5.1: each kept row of another array is copied with its size
+            // and elements; every row was cleared (#595).
+            if let Some(sn) = src.as_deref().filter(|_| !self_copy) {
+                for i in 0..keep {
+                    let (drow, srow) = (format!("{name}[{i}]"), format!("{sn}[{i}]"));
+                    self.copy_dyn_tree(&drow, &srow);
+                }
+            }
+            self.set_queue_size(name, n);
+            return;
+        }
         let keep = match &src {
             Some(sn) => self.get_queue_size(sn).min(n),
             None => 0,
         };
         if let Some(sn) = &src {
             for i in 0..keep {
-                self.queue_copy_elem(sn, i, &name, i);
+                // §7.5.1: a row that is itself a dynamic array or queue
+                // (`int d[][]`) is copied with its size and elements; read as
+                // one value it was x (#595).
+                let srow = format!("{sn}[{i}]");
+                if sn.as_str() != name && self.module.dynamic_arrays.contains(&srow) {
+                    let drow = format!("{name}[{i}]");
+                    self.register_dyn_row_like(&drow, &srow);
+                    self.copy_dyn_tree(&drow, &srow);
+                } else {
+                    self.queue_copy_elem(sn, i, &name, i);
+                }
             }
         }
         // `T a[][16]`: each slot is itself a fixed array
@@ -428,6 +495,12 @@ impl Simulator {
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
     #[inline(never)]
+    /// A statement-coverage marker inserted by `--code-coverage`.
+    fn is_cov_marker(s: &Statement) -> bool {
+        matches!(&s.kind, StatementKind::Expr(e)
+            if matches!(&e.kind, ExprKind::SystemCall { name, .. } if name == super::COV_HIT_TASK))
+    }
+
     pub(super) fn exec_stmt_foreach(
         &mut self,
         stmt: &Statement,
@@ -472,6 +545,14 @@ impl Simulator {
         if let Some(local) = self.dyn_name_lookup(&name) {
             name = local.to_string();
         }
+        // §7.8/§12.7.3: `foreach (aq[k][j])` over a row of an associative
+        // array of collections walks that row (`aq[k]`), not `aq`'s keys.
+        if indices.len() == 1 && self.is_associative_array(&name) {
+            let kv = self.eval_expr(indices[0]);
+            let row = format!("{}[{}]", name, self.assoc_key_str(&name, &kv));
+            return (self.module.dynamic_arrays.contains(&row) || self.is_associative_array(&row))
+                .then_some(row);
+        }
         if self.foreach_dims(&name).is_none()
             && let Some(scoped) = self.hint_scoped(&name)
         {
@@ -495,6 +576,115 @@ impl Simulator {
             name.push_str(&format!("[{value}]"));
         }
         Some(name)
+    }
+
+    /// §12.7.3: a loop variable runs from its dimension's LEFT bound to its
+    /// RIGHT bound. The per-dimension "declared descending" flags of the
+    /// fixed array `name` (`int d [1:2][3:1]` gives `[false, true]`); the
+    /// shape tables normalize every range to (lo, hi).
+    pub(super) fn foreach_unpacked_descs(&self, name: &str, ndims: usize) -> Vec<bool> {
+        let mut descs: Vec<bool> = self
+            .module
+            .unpacked_decl_dims
+            .get(name)
+            .map(|d| d.iter().map(|&(l, r)| l > r).collect())
+            .unwrap_or_default();
+        descs.resize(ndims, false);
+        descs
+    }
+
+    /// The iteration shape of `foreach (a[i]...[k][vars])` over a FIXED
+    /// unpacked array `a`: the dimensions after the `k` selected ones, then
+    /// the element's packed dimensions. None for any other collection, a
+    /// range select, or a row that is itself a queue, dynamic or associative
+    /// array (those have their own stores; see `foreach_selected_collection`).
+    fn foreach_fixed_subarray_dims(
+        &self,
+        array: &Expression,
+        nvars: usize,
+    ) -> Option<(Vec<(i64, i64)>, Vec<bool>)> {
+        let is_range =
+            |e: &Expression| matches!(e.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. });
+        let mut base = array;
+        let mut k = 0usize;
+        while let ExprKind::Index { expr, index } = &base.kind {
+            if is_range(index) {
+                return None;
+            }
+            k += 1;
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || h.path[0].selects.iter().any(is_range) {
+            return None;
+        }
+        k += h.path[0].selects.len();
+        if k == 0 || nvars == 0 {
+            return None;
+        }
+        let mut name = h.path[0].name.name.clone();
+        if let Some(local) = self.dyn_name_lookup(&name) {
+            name = local.to_string();
+        }
+        if self.foreach_dims(&name).is_none()
+            && let Some(scoped) = self.hint_scoped(&name)
+        {
+            name = scoped;
+        }
+        if self.module.dynamic_arrays.contains(&name) || self.is_associative_array(&name) {
+            return None;
+        }
+        let dims = self.foreach_dims(&name)?;
+        if dims.len() < k {
+            return None;
+        }
+        // A row (or element) that is itself a collection.
+        let mut first = name.clone();
+        for &(lo, _) in &dims {
+            first.push_str(&format!("[{lo}]"));
+        }
+        if self.module.dynamic_arrays.contains(&first)
+            || self.module.associative_arrays.contains_key(&first)
+            || self.signals.contains_key(&format!("{first}.size"))
+        {
+            return None;
+        }
+        let mut rest: Vec<(i64, i64)> = dims[k..].to_vec();
+        let mut descs = self.foreach_unpacked_descs(&name, dims.len())[k..].to_vec();
+        if rest.len() < nvars {
+            if let Some(pdims) = self.module.packed_full_dims.get(&name) {
+                for &(l, r) in pdims {
+                    if rest.len() >= nvars {
+                        break;
+                    }
+                    rest.push((l.min(r), l.max(r)));
+                    descs.push(l > r);
+                }
+            } else if rest.len() + 1 == nvars {
+                // A lone packed dimension the packed tables do not record
+                // (`logic [3:0] b [2]`): the element width, `[w-1:0]` unless
+                // declared ascending.
+                let ew = self
+                    .module
+                    .arrays
+                    .get(&name)
+                    .map(|&(_, _, w)| w)
+                    .or_else(|| self.module.arrays_2d.get(&name).map(|&(_, _, w)| w))
+                    .or_else(|| self.module.arrays_nd.get(&name).map(|(_, w)| *w));
+                if let Some(w) = ew.filter(|&w| w > 1) {
+                    rest.push((0, w as i64 - 1));
+                    descs.push(!self.module.ascending_packed.contains_key(&name));
+                }
+            }
+        }
+        if rest.len() < nvars {
+            return None;
+        }
+        rest.truncate(nvars);
+        descs.truncate(nvars);
+        Some((rest, descs))
     }
 
     pub(super) fn exec_stmt_foreach_inner(
@@ -637,6 +827,50 @@ impl Simulator {
                 self.auto_loop_vars.push(nm.clone());
             }
         }
+        // §8.3.2/§6.20.2 (issue #388): `foreach (pkg::Cls::T[k])` —
+        // `foreach (Cls::T[k])` from a foreign class, bare `foreach (T[k])`
+        // in a method of the declaring class — iterates a class-scope ARRAY
+        // constant (localparam array, header value-parameter array, static
+        // fixed-array property). The constant has no module-scope
+        // collection cell, so the generic arms below found no rows and the
+        // body never ran.
+        if vars.len() == 1 {
+            if let Some(c) = self.resolve_class_scope_array_const(array) {
+                let iv = vars[0].as_ref().map(|v| v.name.clone());
+                if let Some(n) = &iv {
+                    self.widths.insert(n.clone(), 32);
+                }
+                // §12.7.3: visit the indices in DECLARED order — a
+                // descending `[5:4]` constant iterates 5 then 4, not the
+                // normalized ascending pair.
+                let order: Vec<i64> = if c.left > c.right {
+                    (c.right..=c.left).rev().collect()
+                } else {
+                    (c.left..=c.right).collect()
+                };
+                'csc: for i in order {
+                    if self.finished {
+                        break 'csc;
+                    }
+                    if let Some(n) = &iv {
+                        self.set_loop_var(n, Self::signed_loop_val(i));
+                    }
+                    self.continue_flag = false;
+                    *iterations = iterations.saturating_add(1);
+                    self.exec_statement(body);
+                    if self.break_flag {
+                        break 'csc;
+                    }
+                    self.continue_flag = false;
+                }
+                self.auto_loop_vars.truncate(fe_auto_len);
+                self.restore_loop_vars(&fe_saved);
+                if !self.return_flag && self.disable_target.is_none() {
+                    self.break_flag = false;
+                }
+                return;
+            }
+        }
         // §12.7.3/§7.4.5: `foreach (a[i, j])` over a fixed array of queues
         // walks each row's own size.
         if vars.len() == 2
@@ -681,6 +915,29 @@ impl Simulator {
         // that end in a collection (`int a[3][3][$]`, `int a[2][2][int]`,
         // a class property too): the last variable walks each element's
         // own size or keys, not the element's packed bits.
+        // §12.7.3: an omitted variable skips that dimension. Before a
+        // collection dimension that leaves the element's size undefined
+        // (every row has its own), so the loop is rejected rather than
+        // walking the element's packed bits (it iterated 32 times over an
+        // `int` row).
+        if vars.len() >= 2
+            && self.indexed_colls_live()
+            && let Some((an, dims)) = self.fixed_dims_of_colls(array)
+            && vars.len() == dims.len() + 1
+            && vars[..dims.len()].iter().any(|v| v.is_none())
+            && vars.last().is_some_and(Option::is_some)
+        {
+            let m = format!(
+                "[xezim][error] foreach ({}[...]): a loop variable before a queue, dynamic or \
+                 associative dimension cannot be omitted (§12.7.3: the collection's size \
+                 depends on that index)",
+                an
+            );
+            self.record_output(m.clone());
+            self.stdout_writeln(&m);
+            self.abort_run();
+            return;
+        }
         if vars.len() >= 2
             && self.indexed_colls_live()
             && let Some((an, dims)) = self.fixed_dims_of_colls(array)
@@ -773,6 +1030,19 @@ impl Simulator {
             }
             return;
         }
+        // §12.7.3: `foreach (a[i][j])` inside `foreach (a[i])` iterates the
+        // SELECTED sub-array: its loop variables map onto the dimensions after
+        // the selected ones. The selects were dropped, so `j` walked the first
+        // dimension again (2 of 3 columns of `int a[2][3]`).
+        if let Some((dims, descs)) = self.foreach_fixed_subarray_dims(array, vars.len()) {
+            self.exec_foreach_nested_dir(&dims, vars, body, None, Some(&descs), iterations);
+            self.auto_loop_vars.truncate(fe_auto_len);
+            self.restore_loop_vars(&fe_saved);
+            if !self.return_flag && self.disable_target.is_none() {
+                self.break_flag = false;
+            }
+            return;
+        }
         // `foreach (obj.assoc_member[k])` — iterate that object's
         // instance-scoped associative array (base may be a 2-seg
         // Ident `b.edges` or a MemberAccess).
@@ -836,7 +1106,12 @@ impl Simulator {
                 // single-var key-scan below would leave the inner
                 // index X and mis-parse `i][j` composite keys.
                 if vars.len() >= 2 {
-                    if let Some(dims) = self.foreach_dims(&an) {
+                    if let Some(mut dims) = self.foreach_dims(&an) {
+                        // A dynamic outer dimension (`T a[][N]`) iterates
+                        // its current size, not the 64-slot buffer.
+                        if self.module.dynamic_arrays.contains(&an) {
+                            dims[0] = (0, self.get_queue_size(&an) as i64 - 1);
+                        }
                         if dims.len() >= vars.len() {
                             self.exec_foreach_nested(
                                 &dims[..vars.len()],
@@ -858,7 +1133,15 @@ impl Simulator {
                 if vars.len() == 1 {
                     if let Some(dims) = self.foreach_dims(&an) {
                         if dims.len() >= 2 {
-                            self.exec_foreach_nested(&dims[..1], vars, body, None, iterations);
+                            let descs = self.foreach_unpacked_descs(&an, 1);
+                            self.exec_foreach_nested_dir(
+                                &dims[..1],
+                                vars,
+                                body,
+                                None,
+                                Some(&descs),
+                                iterations,
+                            );
                             self.auto_loop_vars.truncate(fe_auto_len);
                             self.restore_loop_vars(&fe_saved);
                             if !self.return_flag && self.disable_target.is_none() {
@@ -1303,7 +1586,15 @@ impl Simulator {
             {
                 if let Some(dims) = self.foreach_dims(&name) {
                     if dims.len() >= 2 {
-                        self.exec_foreach_nested(&dims[..1], vars, body, None, iterations);
+                        let descs = self.foreach_unpacked_descs(&name, 1);
+                        self.exec_foreach_nested_dir(
+                            &dims[..1],
+                            vars,
+                            body,
+                            None,
+                            Some(&descs),
+                            iterations,
+                        );
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
                         if !self.return_flag && self.disable_target.is_none() {
@@ -1357,7 +1648,11 @@ impl Simulator {
                     // ascending for the odometer). Fall back to the
                     // flat width only for a lone packed dim we did not
                     // record (e.g. a bare `reg [W-1:0]` element).
-                    let mut descs: Vec<bool> = vec![false; dims.len()];
+                    let mut descs: Vec<bool> = if purely_packed {
+                        Vec::new()
+                    } else {
+                        self.foreach_unpacked_descs(&name, dims.len())
+                    };
                     if dims.len() < vars.len() {
                         if let Some(pdims) = prop_packed_dims
                             .as_ref()
@@ -1819,13 +2114,16 @@ impl Simulator {
         let tp_width = tp_concrete
             .as_deref()
             .and_then(|c| self.concrete_type_width(c));
-        let w0 = match tp_width.or_else(|| self.bound_agg_width(data_type)) {
+        // §8.25: a local sized by a class parameter or localparam
+        // (`bit [N-1:0] x;` in a method of `C #(N)`) takes the executing
+        // specialization's value; the module's parameter table has no `N`
+        // (#681).
+        let w0 = match tp_width
+            .or_else(|| self.bound_agg_width(data_type))
+            .or_else(|| self.class_param_sized_width(data_type))
+        {
             Some(w) => w,
-            None => super::elaborate::resolve_type_width(
-                data_type,
-                Some(&self.module.parameters),
-                Some(&self.module.typedefs),
-            ),
+            None => self.resolve_type_width_in_process_scope(data_type),
         };
         // A class-handle-typed variable holds a 32-bit handle, not
         // the class's content layout (which `resolve_type_width`
@@ -2672,14 +2970,29 @@ impl Simulator {
                         // Without them a `foreach` over a local `int a[int]`
                         // bound the negative key -5 as 4294967291, and the
                         // element read through it missed.
-                        match super::elaborate::assoc_key_type_info(
-                            key_dt.as_deref(),
-                            &self.module.parameters,
-                            &self.module.typedefs,
-                            &self.module.typedef_types,
-                        )
-                        .0
-                        {
+                        // §8.25: a key sized by a class parameter
+                        // (`bit seen[bit [N-1:0]]` in a method of `C #(N)`)
+                        // takes the executing specialization's width (#681).
+                        let class_key = key_dt.as_deref().and_then(|k| {
+                            let w = self.class_param_sized_width(k)?;
+                            let signed = matches!(
+                                k,
+                                crate::ast::types::DataType::IntegerVector {
+                                    signing: Some(crate::ast::types::Signing::Signed),
+                                    ..
+                                }
+                            );
+                            Some((w, signed))
+                        });
+                        match class_key.or_else(|| {
+                            super::elaborate::assoc_key_type_info(
+                                key_dt.as_deref(),
+                                &self.module.parameters,
+                                &self.module.typedefs,
+                                &self.module.typedef_types,
+                            )
+                            .0
+                        }) {
                             Some(iw) => {
                                 self.module.assoc_index_widths.insert(name.clone(), iw);
                             }
@@ -2824,7 +3137,47 @@ impl Simulator {
                 } else {
                     bare.clone()
                 };
+                if name == bare
+                    && let Some(frame) = self.local_dyn.last_mut()
+                    && !frame.iter().any(|(local, _)| local == &bare)
+                {
+                    frame.push((bare.clone(), name.clone()));
+                }
+                // §7.4.4 (#519): a fixed MULTI-dimensional local keeps its
+                // full shape — it was registered from its first dimension
+                // as a 1-D array, and the elaborated shape of a same-named
+                // local of another subroutine stayed in the other table, so
+                // a later `std::randomize` read whichever shape it met first.
+                // Each declaration now owns the name in exactly one table.
+                let nd_shape: Option<Vec<(i64, i64)>> = if dims.len() >= 2 {
+                    dims.iter()
+                        .map(|dm| {
+                            super::elaborate::extract_array_range(
+                                std::slice::from_ref(dm),
+                                &self.module.parameters,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .filter(|sh| sh.iter().all(|&(l, h)| h >= l && h - l < 4096))
+                } else {
+                    None
+                };
+                if let Some(shape) = nd_shape {
+                    self.module.arrays.remove(&name);
+                    if shape.len() == 2 {
+                        self.module
+                            .arrays_2d
+                            .insert(name.clone(), (shape[0], shape[1], w));
+                        self.module.arrays_nd.remove(&name);
+                    } else {
+                        self.module.arrays_nd.insert(name.clone(), (shape, w));
+                        self.module.arrays_2d.remove(&name);
+                    }
+                    continue;
+                }
                 self.module.arrays.insert(name.clone(), (lo, hi, w));
+                self.module.arrays_2d.remove(&name);
+                self.module.arrays_nd.remove(&name);
                 if descending {
                     self.module.descending_arrays.insert(name.clone());
                 }
@@ -3624,15 +3977,40 @@ impl Simulator {
         // §10.4.2 / §25.9: evaluate receiver calls once while capturing an
         // NBA target, before rebasing it to the interface instance. Re-enter
         // with those calls pinned so callbacks still fire once below.
-        if let StatementKind::NonblockingAssign { lvalue, rvalue, .. } = &stmt.kind
+        if let StatementKind::NonblockingAssign { lvalue, rvalue, delay } = &stmt.kind
             && (Self::recv_chain_call(rvalue).is_some() || Self::recv_chain_call(lvalue).is_some())
             && let Some(base) = self.pin_stmt_recv_calls(&[rvalue, lvalue])
         {
-            self.exec_statement(stmt);
+            if self.is_unpacked_aggregate_operand(lvalue) || self.is_unpacked_aggregate_operand(rvalue) {
+                let rvalue = self.freeze_conditional_path(rvalue, true);
+                let lvalue = self.freeze_conditional_path(lvalue, true);
+                self.exec_statement(&Statement::new(StatementKind::NonblockingAssign {
+                    lvalue, rvalue, delay: delay.clone(),
+                }, stmt.span));
+            } else {
+                self.exec_statement(stmt);
+            }
             self.recv_call_memo.truncate(base);
             return;
         }
         // §38.36.1 cbStmt, before the statement runs (interpreted code only).
+        if let StatementKind::NonblockingAssign {
+            lvalue,
+            delay,
+            rvalue,
+        } = &stmt.kind
+            && let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), rvalue)
+        {
+            self.exec_statement(&Statement::new(
+                StatementKind::NonblockingAssign {
+                    lvalue: lvalue.clone(),
+                    delay: delay.clone(),
+                    rvalue: selected,
+                },
+                stmt.span,
+            ));
+            return;
+        }
         if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_STMT) != 0 {
             self.vpi_stmt_hook(stmt, false);
         }
@@ -3873,7 +4251,25 @@ impl Simulator {
                 // segment but the last, and the queued signal is the RESOLVED
                 // output net (matched from the block's signal list by exact
                 // name or `.sig` suffix) so `tick_clocking_blocks` drives it.
-                if let ExprKind::Ident(hier) = &lvalue.kind {
+                // A drive of a select (`cb.v[2]`, `vif.cb.u[1]`, `cb.x[3:2]`)
+                // is recognized through its clockvar and drives only the
+                // selected part.
+                let mut cb_sels: Vec<&Expression> = Vec::new();
+                let mut cb_base = lvalue;
+                while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } =
+                    &cb_base.kind
+                {
+                    cb_sels.push(cb_base);
+                    cb_base = expr;
+                }
+                let cb_base_flat;
+                if !cb_sels.is_empty()
+                    && let Some(f) = Self::member_chain_as_flat_ident(cb_base)
+                {
+                    cb_base_flat = f;
+                    cb_base = &cb_base_flat;
+                }
+                if let ExprKind::Ident(hier) = &cb_base.kind {
                     if hier.path.len() >= 2 {
                         let cb_segs: Vec<&str> = hier
                             .path
@@ -3901,13 +4297,44 @@ impl Simulator {
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
+                                let last_sels = &hier.path[hier.path.len() - 1].selects;
+                                let target = if cb_sels.is_empty() && last_sels.is_empty() {
+                                    None
+                                } else {
+                                    let mut t = Expression::new(
+                                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                            root: None,
+                                            path: vec![crate::ast::expr::HierPathSegment {
+                                                name: crate::ast::Identifier {
+                                                    name: net.clone(),
+                                                    span: lvalue.span,
+                                                },
+                                                selects: last_sels.clone(),
+                                            }],
+                                            span: lvalue.span,
+                                            cached_signal_id: std::cell::Cell::new(None),
+                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                        }),
+                                        lvalue.span,
+                                    );
+                                    for layer in cb_sels.iter().rev() {
+                                        let mut l = (*layer).clone();
+                                        if let ExprKind::Index { expr, .. }
+                                        | ExprKind::RangeSelect { expr, .. } = &mut l.kind
+                                        {
+                                            *expr = Box::new(t);
+                                        }
+                                        t = l;
+                                    }
+                                    Some(self.freeze_lvalue_indices(&t))
+                                };
                                 // §14.16 `##N`: wait N further clocking events.
                                 if let Some(n) = intra_cycles {
                                     if n > 0 {
                                         self.clocking_cycle_pending
                                             .entry(cb)
                                             .or_default()
-                                            .push((n, net, val));
+                                            .push((n, net, val, target));
                                         return;
                                     }
                                 }
@@ -3924,6 +4351,10 @@ impl Simulator {
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
                                 if self.clocking_last_edge.get(&cb).copied() == Some(self.time) {
+                                    if let Some(t) = &target {
+                                        self.drive_clocking_select(t, val, skew);
+                                        return;
+                                    }
                                     if let Some(&id) = self.signal_name_to_id.get(net.as_str()) {
                                         let w = self.signal_widths[id];
                                         self.schedule_delayed_with_delay(id, val.resize(w), skew);
@@ -3933,7 +4364,7 @@ impl Simulator {
                                 self.clocking_output_pending
                                     .entry(cb)
                                     .or_default()
-                                    .push((net, val));
+                                    .push((net, val, target));
                                 return;
                             }
                         }
@@ -3985,6 +4416,7 @@ impl Simulator {
                             static_key: Some(key),
                             static_slice: None,
                             this_handle: None,
+                            root_frame: self.nba_root_frame(lvalue),
                         },
                         d,
                     );
@@ -4034,6 +4466,7 @@ impl Simulator {
                             static_key,
                             static_slice: None,
                             this_handle,
+                            root_frame: self.nba_root_frame(lvalue),
                         });
                     }
                 } else if let Some(id) = self.resolve_nba_target(lvalue) {
@@ -4077,6 +4510,7 @@ impl Simulator {
                             static_key,
                             static_slice: None,
                             this_handle,
+                            root_frame: self.nba_root_frame(lvalue),
                         },
                         d,
                     );
@@ -4564,6 +4998,18 @@ impl Simulator {
                 self.record_ast_loop_heat(i);
             }
             StatementKind::SeqBlock { stmts, name } => {
+                // §9.3.1: a labelled procedural assertion is this block. A
+                // `--code-coverage` statement marker beside it is not a
+                // statement of the design: counted, it dropped the label of
+                // every instrumented one (an `initial` block's, #586).
+                if let Some(n) = name {
+                    let mut real = stmts.iter().filter(|s| !Self::is_cov_marker(s));
+                    if matches!(real.next(), Some(s) if matches!(s.kind, StatementKind::Assertion(_)))
+                        && real.next().is_none()
+                    {
+                        self.assert_wrap_label = Some(n.name.clone());
+                    }
+                }
                 // §6.21: a block-local declaration SHADOWS a same-named module
                 // signal — without a frame the frameless VarDecl exec lands on
                 // the signal itself and the block's writes clobber the module
@@ -4912,7 +5358,21 @@ impl Simulator {
                 self.continue_flag = true;
             }
             StatementKind::Return(expr) => {
+                if let Some(rhs) = expr
+                    && let Some(selected) = self.selected_aggregate_rhs(None, rhs)
+                {
+                    self.exec_statement(&Statement::new(
+                        StatementKind::Return(Some(selected)),
+                        stmt.span,
+                    ));
+                    return;
+                }
+
                 if let Some(e) = expr {
+                    // Parentheses do not change an unpacked return's shape.
+                    // Recognize the collection before falling back to a
+                    // scalar Value (which would turn an empty queue into {0}).
+                    let e = Self::unparen(e);
                     // One call for a receiver call in the returned chain
                     // (`return me().o.x;`), shared by the probes below.
                     let pinned = Self::recv_chain_call(e)
@@ -5142,6 +5602,7 @@ impl Simulator {
                     {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.release_killed_process_state(pid);
                             self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
@@ -5176,6 +5637,7 @@ impl Simulator {
                 if let Some(&pid) = self.disable_labels.get(&name.name) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
+                        self.release_killed_process_state(pid);
                         self.vc_cancel_process(pid);
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
@@ -5225,6 +5687,7 @@ impl Simulator {
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.release_killed_process_state(pid);
                             self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
@@ -5273,6 +5736,7 @@ impl Simulator {
                     // at dispatch, and purge every place the process can be
                     // parked so it never resumes and never satisfies a join.
                     self.killed_pids.insert(pid);
+                    self.release_killed_process_state(pid);
                     self.vc_cancel_process(pid);
                     self.process_parents.remove(&pid);
                     self.process_contexts.remove(&pid);
@@ -5367,6 +5831,12 @@ impl Simulator {
             }
             StatementKind::Assertion(a) => {
                 use crate::ast::stmt::AssertionKind;
+                // The site's label: a module item's own (§16.5), or the name
+                // of the block the parser wrapped a labelled procedural
+                // statement in (§9.3.1).
+                let wrap_label = self.assert_wrap_label.take();
+                let site_label: Option<String> =
+                    a.label.as_ref().map(|l| l.name.clone()).or(wrap_label);
                 // LRM §16.5 — concurrent (`assert property (…)`) defers
                 // evaluation to the observed region. We queue an
                 // `ObservedProbe`; the drain in `drain_observed_region`
@@ -5508,7 +5978,7 @@ impl Simulator {
                         let idx = match existing {
                             Some(i) => i,
                             None => {
-                                self.register_sva_site(a, events, body);
+                                self.register_sva_site(a, events, body, site_label.as_deref());
                                 self.sva_sites.len() - 1
                             }
                         };
@@ -5533,10 +6003,22 @@ impl Simulator {
                         }
                         return;
                     }
-                    let probe_name = format!("prop@{}", a.span.start);
+                    // The unclocked property's outcomes land on the site's
+                    // own entry (file, line, kind and label), not on a
+                    // locationless one keyed by a synthetic name.
+                    let src = self.current_src_file();
+                    let stat_key = Self::assert_stat_key(a.span.start, src);
+                    self.note_assert_label(stat_key, site_label.as_deref());
+                    let kind: u8 = match a.kind {
+                        AssertionKind::Assert => 0,
+                        AssertionKind::Assume => 1,
+                        AssertionKind::Cover => 2,
+                    };
                     let this_handle = self.this_stack.last().and_then(|t| *t);
                     self.pending_observed.push(ObservedProbe {
-                        name: probe_name,
+                        stat_key,
+                        loc: (src, a.span.start),
+                        kind,
                         predicate: resolved_expr,
                         this_handle,
                     });
@@ -5554,7 +6036,7 @@ impl Simulator {
                 };
                 let true_branch = self.eval_expr(&a.expr).is_true();
                 if let Some(kind) = a.deferred {
-                    self.queue_deferred_assert(a, kind, true_branch);
+                    self.queue_deferred_assert(a, kind, true_branch, site_label.as_deref());
                     return;
                 }
                 // Track per-site tallies for end-of-sim summary + JSON DB.
@@ -5564,9 +6046,11 @@ impl Simulator {
                     AssertionKind::Cover => 2,
                 };
                 let src = self.current_src_file();
+                let stat_key = Self::assert_stat_key(a.span.start, src);
+                self.note_assert_label(stat_key, site_label.as_deref());
                 let entry = self
                     .assertion_stats
-                    .entry(Self::assert_stat_key(a.span.start, src))
+                    .entry(stat_key)
                     .or_insert(AssertionStat {
                         kind: kind_tag,
                         loc: Some((src, a.span.start)),
@@ -5770,6 +6254,18 @@ impl Simulator {
                 target,
                 ..
             } => {
+                // §15.5: `-> h.evs[i]` — an element of a class event array.
+                if let Some(key) = target
+                    .as_deref()
+                    .and_then(|t| self.expr_instance_event_elem(t))
+                {
+                    if *nonblocking {
+                        self.pending_nba_instance_triggers.push(key);
+                    } else {
+                        self.fire_instance_event(key);
+                    }
+                    return;
+                }
                 if *nonblocking {
                     // §15.5.2: defer to the NBA region of the current slot.
                     // Resolve a class-field instance key NOW (while `this` is
@@ -5789,7 +6285,7 @@ impl Simulator {
                         let key = target
                             .as_ref()
                             .and_then(|t| self.event_ref_key(t))
-                            .unwrap_or_else(|| name.name.clone());
+                            .unwrap_or_else(|| self.lexical_event_name(&name.name));
                         self.pending_nba_triggers.push(key);
                     }
                     return;

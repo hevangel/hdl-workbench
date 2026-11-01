@@ -405,9 +405,10 @@ fn run_with_admission(source: &str, tier: &str) -> (String, usize, usize) {
         for entry in std::fs::read_dir(&cache).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|ext| ext == "bin") {
-                let outcome: xezim::compiler::bytecode::PersistedMethodOutcome =
-                    bincode::deserialize(&std::fs::read(path).unwrap())
-                        .expect("valid method cache");
+                let outcome = xezim::compiler::bytecode::decode_persisted_method_outcome(
+                    &std::fs::read(path).unwrap(),
+                )
+                .expect("valid method cache");
                 if matches!(
                     outcome,
                     xezim::compiler::bytecode::PersistedMethodOutcome::Block { .. }

@@ -253,6 +253,8 @@ mod reduce_loop_unroll;
 mod repeat_real_count;
 #[path = "misc/replication_and_cast_operands.rs"]
 mod replication_and_cast_operands;
+#[path = "misc/runtime_error_exit_status.rs"]
+mod runtime_error_exit_status;
 #[path = "misc/select_depth.rs"]
 mod select_depth;
 #[path = "misc/select_semantics_11_5_1.rs"]
@@ -525,3 +527,56 @@ mod undefined_macro_recovery;
 
 #[path = "misc/constant_scopes_488.rs"]
 mod constant_scopes_488;
+#[path = "misc/imported_enum_name_collision.rs"]
+mod imported_enum_name_collision;
+
+#[path = "misc/named_block_struct_member.rs"]
+mod named_block_struct_member;
+
+#[path = "misc/include_intra_delay_567.rs"]
+mod include_intra_delay_567;
+
+#[path = "misc/override_timescale_package_delay_571.rs"]
+mod override_timescale_package_delay_571;
+#[path = "misc/macro_args_next_line_578.rs"]
+mod macro_args_next_line_578;
+#[path = "misc/annex_n_random.rs"]
+mod annex_n_random;
+#[path = "misc/array_pattern_and_monitor_errors.rs"]
+mod array_pattern_and_monitor_errors;
+#[path = "misc/resetall_after_one_line_module_600.rs"]
+mod resetall_after_one_line_module_600;
+#[path = "misc/args_file_bare_top_601.rs"]
+mod args_file_bare_top_601;
+#[path = "misc/macro_formals_multiline_606.rs"]
+mod macro_formals_multiline_606;
+#[path = "misc/until_with_604.rs"]
+mod until_with_604;
+#[path = "misc/cover_bin_iff_605.rs"]
+mod cover_bin_iff_605;
+#[path = "misc/config_declaration_603.rs"]
+mod config_declaration_603;
+#[path = "misc/sva_delay_count_609.rs"]
+mod sva_delay_count_609;
+#[path = "misc/cover_bin_with_611.rs"]
+mod cover_bin_with_611;
+#[path = "misc/restrict_property_614.rs"]
+mod restrict_property_614;
+#[path = "misc/sva_local_array_618.rs"]
+mod sva_local_array_618;
+#[path = "misc/macro_usage_before_paste_616.rs"]
+mod macro_usage_before_paste_616;
+#[path = "misc/undef_followed_by_text_619.rs"]
+mod undef_followed_by_text_619;
+#[path = "misc/opt_in_relaxations.rs"]
+mod opt_in_relaxations;
+#[path = "misc/parser_gaps_651_658.rs"]
+mod parser_gaps_651_658;
+#[path = "misc/macro_empty_actual.rs"]
+mod macro_empty_actual;
+#[path = "misc/package_ref_signature.rs"]
+mod package_ref_signature;
+#[path = "misc/always_star_spacing.rs"]
+mod always_star_spacing;
+#[path = "misc/artifact_with_sources_738.rs"]
+mod artifact_with_sources_738;

@@ -16,7 +16,8 @@ impl Simulator {
         // (e.g. `special_comp_type`) through the enclosing spec —
         // `resolve_typedef_spec` reads `self.current_spec`.
         let saved = self.current_spec.clone();
-        let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &saved);
+        let lexical = self.lexical_spec();
+        let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &lexical);
         if let Some((ref base, ref sig)) = extracted {
             self.ensure_spec_statics(base, sig);
         }
@@ -61,7 +62,37 @@ impl Simulator {
         self.class_has_method(&cn, mname)
     }
 
+    /// §26.3 / §35.5.4: preserve a package import's declaring scope while
+    /// ordinary objects and local declarations retain their receiver meaning.
+    pub(super) fn package_dpi_call_key(&self, func: &Expression) -> Option<String> {
+        let package_dpi = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                    Some((h.path[0].name.name.as_str(), member.name.as_str())),
+                _ => None,
+            },
+            ExprKind::Ident(h) if h.path.len() == 2
+                && h.path.iter().all(|s| s.selects.is_empty()) =>
+                Some((h.path[0].name.name.as_str(), h.path[1].name.name.as_str())),
+            _ => None,
+        };
+        if let Some((pkg, name)) = package_dpi
+            && self.module.packages.contains(pkg)
+            && !self.this_prop_hides(pkg)
+            && !self.local_stack.last().is_some_and(|m| m.contains_key(pkg))
+            && !self.signal_name_to_id.contains_key(pkg)
+        {
+            return Some(format!("{pkg}::{name}"));
+        }
+        None
+    }
+
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        if let Some(key) = self.package_dpi_call_key(func) {
+            if let Some(value) = self.exec_dpi_import_call(&key, args) {
+                return value;
+            }
+        }
         // §7.5.2, §7.9.1, §7.10.2: a collection method on a function's
         // returned queue, dynamic or associative array (`f().size()`).
         if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
@@ -638,31 +669,7 @@ impl Simulator {
                     } else {
                         self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0
                     };
-                    let table = if mname == "rand_mode" {
-                        &mut self.rand_mode_disabled
-                    } else {
-                        &mut self.constraint_mode_disabled
-                    };
-                    if enable {
-                        if let Some(set) = table.get_mut(&h) {
-                            if let Some(n) = &target_name {
-                                set.remove(n);
-                            } else {
-                                set.clear();
-                            }
-                        }
-                    } else {
-                        let set = table.entry(h).or_insert_with(HashSet::default);
-                        if let Some(n) = target_name {
-                            set.insert(n);
-                        }
-                        // For whole-object disable, we'd need the full list of
-                        // rand props / constraint names; insert a sentinel that
-                        // exec_randomize recognises.
-                        else {
-                            set.insert("*".to_string());
-                        }
-                    }
+                    self.set_object_random_mode(h, mname == "rand_mode", target_name.as_deref(), enable);
                     return Value::zero(32);
                 }
             }
@@ -1850,14 +1857,57 @@ impl Simulator {
             // methods are stored separately from instance methods, so the
             // instance dispatch path would miss them and return null.
             // (e.g. `uvm_create`'s `req.get_type()`.)
-            if let Some(base_cls) = self
-                .receiver_static_class(expr, handle)
-                .map(|c| c.split('#').next().unwrap_or(&c).to_string())
-            {
+            if let Some(decl_full) = self.receiver_static_class(expr, handle) {
+                let base_cls = decl_full.split('#').next().unwrap_or(&decl_full).to_string();
                 if self.is_static_method(&base_cls, &member.name) {
-                    if let Some(res) =
-                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle)
-                    {
+                    // §8.25: same as the flattened `req::get_type()` arm — a
+                    // static method through a null receiver declared with a
+                    // SPECIALIZATION runs in that specialization's context
+                    // (the body's bare self-references denote the current
+                    // specialization). Seed `current_spec` from the declared
+                    // type; the live-object recovery inside
+                    // `exec_static_method_via_object` cannot see a null handle.
+                    let saved_spec = if handle == 0 {
+                        // A variable receiver's declaration names its
+                        // specialization through `var_type_args` (the flat
+                        // `var_class_types` text is the bare class name), so
+                        // resolve the receiver VARIABLE, not just the type
+                        // text; `this.member` receivers resolve through the
+                        // property table the same way.
+                        let recv_var: Option<&str> = match &expr.kind {
+                            ExprKind::Ident(h)
+                                if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                            {
+                                Some(&h.path[0].name.name)
+                            }
+                            ExprKind::MemberAccess { expr: base, member } => {
+                                match &base.kind {
+                                    ExprKind::Ident(b)
+                                        if b.path.len() == 1
+                                            && b.path[0].selects.is_empty()
+                                            && (b.path[0].name.name == "this"
+                                                || b.path[0].name.name == "super") =>
+                                    {
+                                        Some(&member.name)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let s = self.spec_for_null_receiver(recv_var, &decl_full);
+                        s
+                    } else {
+                        None
+                    };
+                    let saved =
+                        saved_spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                    let res =
+                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle);
+                    if let Some(prev) = saved {
+                        self.current_spec = prev;
+                    }
+                    if let Some(res) = res {
                         return res;
                     }
                 }
@@ -2624,27 +2674,7 @@ impl Simulator {
                             return Value::from_u64(if disabled { 0 } else { 1 }, 32);
                         }
                         let enable = self.eval_expr(&args[0]).to_u64().unwrap_or(0) != 0;
-                        let table = if mname == "rand_mode" {
-                            &mut self.rand_mode_disabled
-                        } else {
-                            &mut self.constraint_mode_disabled
-                        };
-                        if enable {
-                            if let Some(set) = table.get_mut(&h_val) {
-                                if let Some(n) = &target_name {
-                                    set.remove(n);
-                                } else {
-                                    set.clear();
-                                }
-                            }
-                        } else {
-                            let set = table.entry(h_val).or_insert_with(HashSet::default);
-                            if let Some(n) = target_name {
-                                set.insert(n);
-                            } else {
-                                set.insert("*".to_string());
-                            }
-                        }
+                        self.set_object_random_mode(h_val, mname == "rand_mode", target_name.as_deref(), enable);
                         return Value::zero(32);
                     }
                 }
@@ -3053,14 +3083,37 @@ impl Simulator {
                     } else {
                         decl_cls_opt
                     };
-                    if let Some(base_cls) =
-                        base_cls.map(|c| c.split('#').next().unwrap_or(&c).to_string())
-                    {
+                    if let Some(decl_full) = base_cls {
+                        let base_cls =
+                            decl_full.split('#').next().unwrap_or(&decl_full).to_string();
                         let m = method_name.clone();
                         if self.is_static_method(&base_cls, &m) {
-                            if let Some(res) =
-                                self.exec_static_method_via_object(&base_cls, &m, args, handle)
-                            {
+                            // §8.25: a static method called through a NULL
+                            // receiver whose declared type is a SPECIALIZATION
+                            // (`req::get_type()` where req is declared
+                            // `C#(T)` — `uvm_create_on`'s shape) runs in that
+                            // specialization's context: the body's bare
+                            // self-references (the `C` type argument of a
+                            // member typedef like
+                            // `uvm_object_registry#(C,"C") type_id`, written by
+                            // `uvm_object_utils(C)`) denote the CURRENT
+                            // specialization, not the default. The live-object
+                            // spec recovery in `exec_static_method_via_object`
+                            // cannot see a null handle, so seed `current_spec`
+                            // from the DECLARED type here.
+                            let saved_spec = if handle == 0 {
+                                self.spec_for_null_receiver(Some(obj_name.as_str()), &decl_full)
+                            } else {
+                                None
+                            };
+                            let saved = saved_spec
+                                .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                            let res =
+                                self.exec_static_method_via_object(&base_cls, &m, args, handle);
+                            if let Some(prev) = saved {
+                                self.current_spec = prev;
+                            }
+                            if let Some(res) = res {
                                 return res;
                             }
                         }
@@ -3177,9 +3230,15 @@ impl Simulator {
             // dispatch when the vif is re-bound.
             if hier.path.len() >= 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
                 let head = hier.path[0].name.name.as_str();
-                let head_owned = self
-                    .iface_alias_for(head)
-                    .unwrap_or_else(|| head.to_string());
+                // §25.9: rebase has already resolved a rooted interface
+                // receiver. Reapplying a same-named class alias would expand
+                // `sys_if.port.get_tx()` to `sys_if.port.port.get_tx()`.
+                let head_owned = if hier.root.is_none() {
+                    self.iface_alias_for(head)
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| head.to_string());
                 let mut segs: Vec<&str> = vec![head_owned.as_str()];
                 segs.extend(hier.path[1..].iter().map(|s| s.name.name.as_str()));
                 let full = segs.join(".");
@@ -3234,6 +3293,24 @@ impl Simulator {
                     {
                         let mname = hier.path.last().unwrap().name.name.clone();
                         return self.exec_method_call(h, &mname, args);
+                    }
+                    // §8.4: `c.m()` on a class variable that holds null. The
+                    // remaining fallbacks (static call, constructor, DPI,
+                    // builtin) cannot take it, so it returned a silent 0 and
+                    // ran nothing; the reference simulator reports the null
+                    // dereference. A static method never needs the object.
+                    if h == 0
+                        && hier.path.len() == 2
+                        && let Some(decl) = self.class_of_var(&hier.path[0].name.name)
+                    {
+                        let base = decl.split('#').next().unwrap_or(&decl).to_string();
+                        let mname = hier.path[1].name.name.clone();
+                        if self.class_has_method(&base, &mname)
+                            && !self.is_static_method(&base, &mname)
+                        {
+                            self.report_null_handle_call(&mname);
+                            return Value::zero(32);
+                        }
                     }
                     // A covergroup of another instance (`u0.cg.sample()`).
                     if let Some(idx) = self.cg_index(h) {
@@ -3442,6 +3519,25 @@ impl Simulator {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
+            }
+            // A module-class method naming an instance subroutine that
+            // resolved nowhere: report the skipped call instead of dropping
+            // it silently.
+            if hier.path.len() == 1
+                && self.module_class_method_active()
+                && self
+                    .class_member_names()
+                    .subroutine_suffixes
+                    .contains(name.as_str())
+            {
+                self.warn_system_task_once(
+                    &format!("call:{}", name),
+                    &format!(
+                        "Warning: call to '{}' in a method of a class declared in a module \
+                         resolved to no subroutine of its instance; call skipped",
+                        name
+                    ),
+                );
             }
         }
         Value::zero(32)

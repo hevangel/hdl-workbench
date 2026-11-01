@@ -81,7 +81,8 @@ impl Simulator {
             if &magic != PREPARED_COMB_MAGIC {
                 return Err("bad format marker".to_string());
             }
-            bincode::deserialize_from(reader).map_err(|e| e.to_string())
+            bincode::serde::decode_from_std_read(&mut reader, xezim_core::xez_bincode_config())
+                .map_err(|e| e.to_string())
         })();
         let cache = match result {
             Ok(cache) if self.prepared_comb_cache_is_valid(&cache) => cache,
@@ -174,7 +175,12 @@ impl Simulator {
                 time0_deferred: &self.comb_time0_deferred,
                 cont_driven: &self.cont_driven,
             };
-            bincode::serialize_into(&mut writer, &payload).map_err(|e| e.to_string())?;
+            bincode::serde::encode_into_std_write(
+                &payload,
+                &mut writer,
+                xezim_core::xez_bincode_config(),
+            )
+            .map_err(|e| e.to_string())?;
             writer.flush().map_err(|e| e.to_string())?;
             drop(writer);
             std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
@@ -225,6 +231,8 @@ impl Simulator {
         // The array table is snapshotted because the loop below needs `&mut
         // self`; it is names→ranges only, not ASTs.
         let arrays_snapshot = self.module.arrays.clone();
+        let arrays_2d_snapshot = self.module.arrays_2d.clone();
+        let params_snapshot = self.module.parameters.clone();
         let descending_snapshot = self.module.descending_arrays.clone();
         let decl_dims_snapshot = self.module.unpacked_decl_dims.clone();
         // §23.9/§6.10: a HIERARCHICAL continuous assign can target a
@@ -260,24 +268,33 @@ impl Simulator {
         let dump_unresolved = std::env::var_os("XEZIM_DUMP_UNRESOLVED").is_some();
         for mut ca in cas
             .into_iter()
-            .chain({
-                let params_snapshot = self.module.parameters.clone();
+            .chain(
                 pending_ca
                     .into_iter()
-                    .map(move |p| p.materialize(&params_snapshot))
-            })
+                    .map(|p| p.materialize(&params_snapshot)),
+            )
             .flat_map(|ca| {
-                match crate::compiler::elaborate::whole_array_assign_parts_dir(
+                crate::compiler::elaborate::whole_array_assign_parts_dir(
                     &ca.lhs,
                     &ca.rhs,
                     ca.delay,
                     &arrays_snapshot,
                     Some(&descending_snapshot),
                     Some(&decl_dims_snapshot),
-                ) {
-                    Some(parts) => parts,
-                    None => vec![ca],
-                }
+                )
+                .or_else(|| {
+                    crate::compiler::elaborate::whole_array_row_assign_parts(
+                        &ca.lhs,
+                        &ca.rhs,
+                        ca.delay,
+                        &arrays_snapshot,
+                        &arrays_2d_snapshot,
+                        &params_snapshot,
+                        Some(&descending_snapshot),
+                        Some(&decl_dims_snapshot),
+                    )
+                })
+                .unwrap_or_else(|| vec![ca])
             })
             .flat_map(|ca| {
                 let chain: Option<Vec<String>> = match &ca.lhs.kind {
@@ -666,6 +683,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -749,6 +767,7 @@ impl Simulator {
                     &self.widths,
                 );
                 compiler.set_scope_hint(scope_hint.clone());
+                compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                 compiler.set_params(&self.module.parameters);
                 compiler.set_param_leaf_idx(self.param_leaf_index());
                 compiler.set_cast_widths(&self.cast_widths);
@@ -1271,7 +1290,8 @@ impl Simulator {
                 if !is_always_comb {
                     SKIP_FN_BODY_READS.with(|c| c.set(true));
                 }
-                Self::collect_stmt_reads(&ab.stmt, &self.module, &mut reads, &mut writes);
+                let whole =
+                    Self::collect_stmt_reads_whole(&ab.stmt, &self.module, &mut reads, &mut writes);
                 SKIP_FN_BODY_READS.with(|c| c.set(false));
                 // Top-prefix-strip helper: `<top>.<rest>` → `<rest>`. Used
                 // to resolve hierarchical refs whose path includes the
@@ -1334,22 +1354,11 @@ impl Simulator {
                 // block re-queue itself every settle pass (the pass-through write
                 // then the field write commit two different values per eval), which
                 // churns to the settle limit. Strip a read whose '.'-base prefix is
-                // in the write set.
+                // in the write set — and a bare base that is read only through
+                // members this block writes (`self_written_read`).
                 let sens_reads: HashSet<String> = reads
                     .iter()
-                    .filter(|r| {
-                        if writes.contains(*r) {
-                            return false;
-                        }
-                        let mut base: &str = r.as_str();
-                        while let Some(pos) = base.rfind('.') {
-                            base = &base[..pos];
-                            if writes.contains(base) {
-                                return false;
-                            }
-                        }
-                        true
-                    })
+                    .filter(|r| !Self::self_written_read(r, &reads, &writes, &whole))
                     .cloned()
                     .collect();
                 // A bare read may resolve BOTH to a top-level signal and to
@@ -1505,6 +1514,7 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.set_scope_hint(scope_hint.clone());
+                    compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
                     compiler.set_tasks(&self.module.tasks);
                     compiler.set_functions(&self.module.functions);
                     compiler.set_params(&self.module.parameters);
