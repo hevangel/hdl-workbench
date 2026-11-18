@@ -1,0 +1,337 @@
+{
+  "browser": "Firefox/Camoufox",
+  "browser_version": "152.0.4-beta.30",
+  "base_url": "http://xezim-luna04-builder:4173/",
+  "viewer_state": {
+    "url": "http://xezim-luna04-builder:4173/assets/surfer/index.html",
+    "title": "Surfer",
+    "canvasCount": 1,
+    "bodyText": ""
+  },
+  "harness_events": [
+    "2026-10-22T10:36:27.820Z browser Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+    "2026-10-22T10:36:27.821Z fixture-url http://xezim-luna04-builder:4173/fixture-counter.vcd",
+    "2026-10-22T10:36:28.271Z viewer-ready {\"type\":\"surfer-ready\"}",
+    "2026-10-22T10:36:28.517Z sent {\"command\":\"LoadUrl\",\"url\":\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"}",
+    "2026-10-22T10:36:31.158Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"AddVariables\\\":[{\\\"path\\\":{\\\"strs\\\":[\\\"top\\\"],\\\"id\\\":\\\"None\\\"},\\\"name\\\":\\\"count\\\",\\\"id\\\":\\\"None\\\",\\\"index\\\":null}]}\"}",
+    "2026-10-22T10:36:32.802Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"CursorSet\\\":[1,[25]]}\"}",
+    "2026-10-22T10:36:33.960Z created-blob-url blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c",
+    "2026-10-22T10:36:33.961Z sent {\"command\":\"LoadUrl\",\"url\":\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"}",
+    "2026-10-22T10:36:36.599Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"AddVariables\\\":[{\\\"path\\\":{\\\"strs\\\":[\\\"top\\\"],\\\"id\\\":\\\"None\\\"},\\\"name\\\":\\\"count\\\",\\\"id\\\":\\\"None\\\",\\\"index\\\":null}]}\"}",
+    "2026-10-22T10:36:38.154Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"CursorSet\\\":[1,[25]]}\"}"
+  ],
+  "browser_errors": [],
+  "console_errors": [],
+  "browser_events": [
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/assets/surfer/index.html"
+    },
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/assets/surfer/surfer.js"
+    },
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/assets/surfer/integration.js"
+    },
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/assets/surfer/surfer_bg.wasm"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/wasm_panic.rs:63  Hook set up"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/batch_commands.rs:84  Parsing batch commands"
+    },
+    {
+      "kind": "console",
+      "type": "warning",
+      "text": "[JavaScript Warning: \"WEBGL_debug_renderer_info is deprecated in Firefox and will be removed. Please use RENDERER.\" {file: \"http://xezim-luna04-builder:4173/assets/surfer/surfer.js\" line: 836}]"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\", Clear)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:116  Wave source is url"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: http://xezim-luna04-builder:4173/fixture-counter.vcd"
+    },
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/fixture-counter.vcd"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(791ms), Url(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"), Clear, ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of http://xezim-luna04-builder:4173/fixture-counter.vcd in 20ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/state.rs:301  VCD file loaded"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(812ms), Url(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"), ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1269  Loaded the body of http://xezim-luna04-builder:4173/fixture-counter.vcd in 20ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(3.394s), ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 18ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)"
+    },
+    {
+      "kind": "response",
+      "status": 200,
+      "url": "http://xezim-luna04-builder:4173/fixture-counter.vcd"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\", Clear)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(6.208s), Url(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"), Clear, ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c in 17ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/state.rs:301  VCD file loaded"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(6.226s), Url(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"), ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1269  Loaded the body of blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c in 18ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:36  Returning from perform work"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/async_util.rs:33  Starting async task"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(8.834s), ..)"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 17ms"
+    },
+    {
+      "kind": "console",
+      "type": "log",
+      "text": "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)"
+    }
+  ],
+  "wasm_logs": [
+    "INFO  libsurfer/src/wasm_panic.rs:63  Hook set up",
+    "TRACE  libsurfer/src/batch_commands.rs:84  Parsing batch commands",
+    "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\", Clear)",
+    "INFO  libsurfer/src/wave_source.rs:116  Wave source is url",
+    "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: http://xezim-luna04-builder:4173/fixture-counter.vcd",
+    "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)",
+    "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+    "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+    "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(791ms), Url(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"), Clear, ..)",
+    "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of http://xezim-luna04-builder:4173/fixture-counter.vcd in 20ms",
+    "INFO  libsurfer/src/state.rs:301  VCD file loaded",
+    "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+    "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+    "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+    "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(812ms), Url(\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"), ..)",
+    "INFO  libsurfer/src/lib.rs:1269  Loaded the body of http://xezim-luna04-builder:4173/fixture-counter.vcd in 20ms",
+    "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])",
+    "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+    "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+    "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+    "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(3.394s), ..)",
+    "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 18ms",
+    "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)"
+  ],
+  "blob_attempt": {
+    "loaded": true,
+    "wasm_logs": [
+      "TRACE  libsurfer/src/lib.rs:288  LoadWaveformFileFromUrl(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\", Clear)",
+      "INFO  libsurfer/src/wave_source.rs:373  Loading wave from url: blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c",
+      "TRACE  libsurfer/src/lib.rs:288  FileDownloaded(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\", b\"$date\\n  2026-10-21\\n$end\\n$version\\n  xezim-studio LUNA-00B fixture\\n$end\\n$timescale 1 ns $end\\n$scope module top $end\\n$var wire 1 a clk $end\\n$var wire 4 b count [3:0] $end\\n$upscope $end\\n$enddefinitions $end\\n#0\\n0a\\nb0000 b\\n#5\\n1a\\nb0001 b\\n#10\\n0a\\nb0010 b\\n#15\\n1a\\nb0011 b\\n#20\\n0a\\nb0100 b\\n#25\\n1a\\nb0101 b\\n#30\\n0a\\nb0110 b\\n#35\\n1a\\nb0111 b\\n#40\\n0a\\nb1000 b\\n#45\\n1a\\nb1001 b\\n#50\\n0a\\nb1010 b\\n#55\\n1a\\nb1011 b\\n#60\\n0a\\nb1100 b\\n#65\\n1a\\nb1101 b\\n#70\\n0a\\nb1110 b\\n#75\\n1a\\nb1111 b\\n\", Clear)",
+      "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "TRACE  libsurfer/src/lib.rs:288  WaveHeaderLoaded(Instant(6.208s), Url(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"), Clear, ..)",
+      "INFO  libsurfer/src/lib.rs:1212  Loaded the hierarchy and meta-data of blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c in 17ms",
+      "INFO  libsurfer/src/state.rs:301  VCD file loaded",
+      "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "TRACE  libsurfer/src/lib.rs:288  WaveBodyLoaded(Instant(6.226s), Url(\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"), ..)",
+      "INFO  libsurfer/src/lib.rs:1269  Loaded the body of blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c in 18ms",
+      "TRACE  libsurfer/src/lib.rs:288  AddVariables([VariableRef { path: ScopeRef { strs: [\"top\"], id: None }, name: \"count\", id: None, index: None }])",
+      "WARN  libsurfer/src/wave_source.rs:616  failed to create thread pool: ThreadPoolBuildError { kind: IOError(Error { kind: Unsupported, message: \"operation not supported on this platform\" }) }",
+      "INFO  libsurfer/src/async_util.rs:36  Returning from perform work",
+      "INFO  libsurfer/src/async_util.rs:33  Starting async task",
+      "TRACE  libsurfer/src/lib.rs:288  SignalsLoaded(Instant(8.834s), ..)",
+      "INFO  libsurfer/src/lib.rs:1326  Loaded 1 variables in 17ms",
+      "TRACE  libsurfer/src/lib.rs:288  CursorSet(25)"
+    ]
+  },
+  "screenshots": [
+    "01-viewer-ready.png",
+    "02-fixture-loaded.png",
+    "03-signal-added.png",
+    "04-cursor-set.png",
+    "05-blob-attempt.png",
+    "06-blob-signal-cursor.png"
+  ],
+  "harness_status": "pinned viewer ready",
+  "harness_log": "2026-10-22T10:36:27.820Z browser Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0\n2026-10-22T10:36:27.821Z fixture-url http://xezim-luna04-builder:4173/fixture-counter.vcd\n2026-10-22T10:36:28.271Z viewer-ready {\"type\":\"surfer-ready\"}\n2026-10-22T10:36:28.517Z sent {\"command\":\"LoadUrl\",\"url\":\"http://xezim-luna04-builder:4173/fixture-counter.vcd\"}\n2026-10-22T10:36:31.158Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"AddVariables\\\":[{\\\"path\\\":{\\\"strs\\\":[\\\"top\\\"],\\\"id\\\":\\\"None\\\"},\\\"name\\\":\\\"count\\\",\\\"id\\\":\\\"None\\\",\\\"index\\\":null}]}\"}\n2026-10-22T10:36:32.802Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"CursorSet\\\":[1,[25]]}\"}\n2026-10-22T10:36:33.960Z created-blob-url blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\n2026-10-22T10:36:33.961Z sent {\"command\":\"LoadUrl\",\"url\":\"blob:http://xezim-luna04-builder:4173/d4549398-d7f0-4077-849c-42f58064438c\"}\n2026-10-22T10:36:36.599Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"AddVariables\\\":[{\\\"path\\\":{\\\"strs\\\":[\\\"top\\\"],\\\"id\\\":\\\"None\\\"},\\\"name\\\":\\\"count\\\",\\\"id\\\":\\\"None\\\",\\\"index\\\":null}]}\"}\n2026-10-22T10:36:38.154Z sent {\"command\":\"InjectMessage\",\"message\":\"{\\\"CursorSet\\\":[1,[25]]}\"}"
+}

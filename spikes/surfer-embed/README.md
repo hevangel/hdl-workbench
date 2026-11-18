@@ -1,24 +1,45 @@
-# Surfer browser integration smoke harness
+# Pinned Surfer WASM browser integration proof
 
-This package-free harness observes the upstream browser integration protocol. It embeds the public Surfer app, serves a real counter VCD with CORS enabled, and sends the message shapes observed in pinned source. The public app is unpinned; a green run here is not release acceptance for vendored Surfer assets.
+This spike serves the pinned Surfer WASM bundle from the same origin as the parent harness and counter fixture. It verifies the documented iframe `LoadUrl` wrapper, the observed `InjectMessage` path for adding `top.count` and setting the cursor to 25 ns, and Blob URL loading.
 
-## Run
+## Pinned bundle
 
-In PowerShell:
+- Upstream release/source: Surfer `v0.7.0`, commit `bd749b1f786c1c62cd67893ca71346cbe6983915`.
+- License: EUPL-1.2. The upstream license is included at `assets/LICENSE-EUPL-1.2.txt`.
+- Browser WASM SHA-256: `1341ad01c59f5169209239728417d14f430183abd92515f22bf07cd7c86937ae` (`assets/surfer/surfer_bg.wasm`). All shipped asset checksums are in `assets/SHA256SUMS`.
+- Build: Rust `1.99.1`, Cargo `1.99.1`, target `wasm32-unknown-unknown`, Trunk `0.21.14`; exact upstream `f128` and `instruction-decoder` submodule commits are recorded in the integration report.
 
-    cd .\spikes\surfer-embed
-    node .\server.mjs
+`assets/surfer/index.html` is the upstream Trunk output with relative `/dist/` paths and a small `SURFER_SETUP_HOOKS` readiness notification, following the upstream integration instructions. The JS and WASM binaries are the pinned build output without source changes.
 
-Open http://127.0.0.1:4173/ in Chromium and wait at least 15 seconds. The page logs each posted message. Inspect the Surfer frame for the top.count waveform and a cursor at tick 25. The fixture uses a 1 ns timescale and transitions from 0 to 15 every 5 ns.
+## Run locally
 
-The script waits after the iframe document's load event because the pinned source provides no documented readiness callback for a parent page. This delay is only a smoke-test accommodation; production should add a readiness hook when building pinned assets. This harness has not passed in the available environment: the browser runner cannot reach the local loopback server, and the hosted iframe is not pinned or same-origin. See `session_history/initial_build/surfer-integration-report.md` before treating any message as supported.
+From the repository root in PowerShell:
 
-## Pin and license
+```powershell
+cd .\spikes\surfer-embed
+node .\server.mjs
+```
 
-- Upstream: https://gitlab.com/surfer-project/surfer
-- Release: v0.7.0
-- Source SHA: bd749b1f786c1c62cd67893ca71346cbe6983915
-- License: EUPL-1.2; preserve upstream LICENSE-EUPL-1.2.txt beside redistributed assets.
-- Upstream documents its WASM artifact as the pages_build CI artifact, not as a v0.7.0 release asset. The v0.7.0 tag artifact URL returned GitLab 404 during this spike. The source can be built at the pinned SHA, but no reproducible built-asset digest was obtained in this environment.
+Open `http://127.0.0.1:4173/`. Click **Load fixture**, **Add top.count**, and **Set cursor to 25 ns**. The bundled test fixture uses a 1 ns timescale; `top.count` equals 5 at tick 25. The frame and fixture are served on the same origin.
 
-Production should serve the locally built files under this app's origin and iframe that same-origin path. This harness deliberately uses the public origin so it can inspect the candidate message flow while the pinned artifact is unavailable; it does not validate same-origin packaging or successful message handling.
+## Automated Firefox test
+
+The checked-in test uses Python Playwright `1.59.0` and Camoufox `0.4.11` (Firefox `152.0.4-beta.30`) and runs headed under Xvfb because Surfer's renderer requires WebGL. In the provisioned Docker setup used for this proof:
+
+```powershell
+docker cp .\spikes\surfer-embed\. xezim-luna04-builder:/tmp/surfer-localhost
+docker exec -d xezim-luna04-builder sh -lc 'python3 -m http.server 4173 --bind 0.0.0.0 --directory /tmp/surfer-localhost'
+docker network connect knowledge_base_default xezim-luna04-builder
+Get-Content .\spikes\surfer-embed\test_surfer_integration.py -Raw | docker exec -i kb_camoufox sh -c 'cat > /tmp/test_surfer_integration.py'
+docker exec -e DISPLAY=:99 kb_camoufox python /tmp/test_surfer_integration.py --headed --url http://xezim-luna04-builder:4173/ --output-dir /tmp/surfer-artifacts
+```
+
+The browser test asserts VCD body load, `Loaded 1 variables`, and `CursorSet(25)` in the viewer's WASM logs for the HTTP URL path and the Blob URL path. It saves screenshots and `browser-test-log.json` under `artifacts/` in this branch. `04-cursor-set.png` and `06-blob-signal-cursor.png` show the waveform, the `count [3:0]` signal, and the red cursor at 25 ns.
+
+## Result and limits
+
+The test passed in Firefox/Camoufox `152.0.4-beta.30` (UA reports Firefox 152.0) with no browser page errors or console errors. Both same-origin HTTP and parent-created `blob:` URLs loaded the fixture; `AddVariables` added one variable and `CursorSet(25)` moved the visible cursor in both cases.
+
+`LoadUrl` is documented by the pinned iframe wrapper. `InjectMessage` forwards internal Rust `Message` values; upstream marks that inner API unstable. The observed `AddVariables` and `CursorSet` JSON payloads are pinned-build specific and must stay behind an adapter with versioned tests.
+
+The WASM run logged `failed to create thread pool` with `Unsupported` in this container for asynchronous data work, but the fixture body, signal, and cursor still loaded and rendered. Larger waveform performance and worker behavior need testing in supported browsers. Headless Camoufox without WebGL fails with `WebGL isn't supported`; use the headed Xvfb setup in the test command. WCP methods in Rust are not exposed to the parent page by this Trunk glue, so this proof does not establish a browser WCP bridge.
