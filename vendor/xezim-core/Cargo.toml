@@ -13,7 +13,6 @@ ahash = { version = "0.8", features = ["serde"] }
 # machinery. 0.1.52 bundles the mimalloc v3 C library (v3.3.2); pinned so a
 # fresh lockfile cannot resolve to an older v2-era release.
 mimalloc = { version = "0.1.52", optional = true }
-rand = "0.8"
 sv-parser = { path = "xezim-parser" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

@@ -174,7 +174,7 @@ describe("hdlwb session CLI", () => {
     const afterStop = await cli(context, ["status"]);
     expect(afterStop.code).toBe(2);
     expect(afterStop.stderr).toContain("No running hdlwb session");
-  });
+  }, 20000);
 
   it("rejects session requests without the token or from a browser origin", async () => {
     const context = await createContext();

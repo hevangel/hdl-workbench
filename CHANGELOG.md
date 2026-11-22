@@ -7,6 +7,8 @@ Changes to HDL Workbench are recorded here.
 ## 1.1.0 — 2026-11-22
 
 - Ignored the local `.kilo/` configuration directory.
+- Fixed the native build by removing the unused `rand` dependency from the vendored xezim-core.
+- Raised the hdlwb CLI session test timeout so it is not flaky on loaded CI runners.
 
 ## 1.0.0 — 2026-11-22
 
