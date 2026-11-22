@@ -16,14 +16,59 @@ wire the SystemVerilog side to it.
 
 ```bash
 # xezim/tests/dpi/simple_dpi.c  ->  simple_dpi.so
-cc -shared -fPIC -I path/to/xezim/include simple_dpi.c -o simple_dpi.so
+clang -shared -fPIC -I path/to/xezim/include simple_dpi.c -o simple_dpi.so
 
 # Run
 xezim --dpi-lib ./simple_dpi.so simple_dpi_test.sv
 ```
 
-That's it. The same recipe works for `.cc`/`.cpp` files (use `g++` instead of `cc`) and
-for multi-file builds (list more sources / headers before `-o`).
+That's it. The same recipe works for `.cc`/`.cpp` files (use `clang++`
+instead of `clang`) and for multi-file builds (list more sources / headers
+before `-o`).
+
+---
+
+## C and C++ sources in the file list
+
+xezim can also build the library itself. Name the C/C++ sources with the
+SystemVerilog files, on the command line or in a `-f` file:
+
+```
+add.c
+t.sv
+```
+
+```bash
+xezim -f files.f -s t
+```
+
+Every `.c`, `.cc`, `.cpp`, `.cxx`, `.c++` and `.C` file of the run is
+compiled with `$CC` (C) or `$CXX` (C++), else `clang`/`clang++`, else
+`cc`/`c++`, as `-fPIC -O2 -I<xezim's headers>`, so `#include "svdpi.h"`
+and `#include "vpi_user.h"` work without an `-I`. The objects, and any
+`.o` or `.a` file named among the sources, are linked into one shared
+library (with `$CXX` when there is C++), which is loaded like `--dpi-lib`.
+A `.so`/`.dylib`/`.dll` named among the sources is loaded as it is.
+
+`-CFLAGS "<args>"` and `-LDFLAGS "<args>"` add compiler and linker
+arguments (`-CFLAGS "-I csrc -DMODEL=2"`, `-LDFLAGS -lm`); they come after
+xezim's own, so `-CFLAGS "-O0 -g"` builds a debuggable library.
+
+The build is cached in `xezim/dpi` under `$XEZIM_CACHE_DIR`,
+`$XDG_CACHE_HOME` or `~/.cache`; with none of them set, in `xezim-<uid>` in
+the temporary directory, which must belong to you and be writable by no
+one else. Each source's object is keyed by its preprocessed text and
+compile command, and the library by those objects, the listed object
+files' contents and the link command, so an edit to a source or to a
+header it includes rebuilds the library, and an unchanged one is reused
+without compiling. `-LDFLAGS` can name files outside the key (an archive,
+a `-l` library), so with `-LDFLAGS` the library is linked again on every
+run, from the cached objects. A compile or link error stops the run before
+it starts.
+
+A compiled artifact (`--compile -o design.xzc`) holds the elaborated design
+only, so name the DPI files again when running it
+(`xezim design.xzc add.c`); `--compile` warns when it leaves them out.
 
 ---
 
@@ -109,7 +154,7 @@ endmodule
 Build and run:
 
 ```bash
-cc -shared -fPIC -I . simple_dpi.c -o simple_dpi.so
+clang -shared -fPIC -I . simple_dpi.c -o simple_dpi.so
 xezim --dpi-lib ./simple_dpi.so simple_dpi_test.sv
 # DPI_RESULT=42
 # TEST_PASS
@@ -126,7 +171,7 @@ This is the exact recipe used by
 Same flags, swap the compiler and add `-std=c++17` (or whatever you need):
 
 ```bash
-g++ -shared -fPIC -std=c++17 -I path/to/xezim/include dpi_module.cc -o dpi_module.so
+clang++ -shared -fPIC -std=c++17 -I path/to/xezim/include dpi_module.cc -o dpi_module.so
 ```
 
 The `extern "C"` wrapper that surrounds your `import "DPI-C"` implementations is the
@@ -168,7 +213,7 @@ extensions, no VHPI. The simulator-specific `uvm_is_vhdl_path` and
 `uvm_register_*_vhdl` helpers are not part of IEEE 1800.2 and are not provided.
 
 ```bash
-g++ -shared -fPIC -std=c++17 -Wno-format-security \
+clang++ -shared -fPIC -std=c++17 -Wno-format-security \
     -I path/to/xezim/include -I path/to/uvm/src/dpi \
     path/to/xezim/include/uvm_dpi_xezim.cc \
     -o uvm.so
@@ -177,7 +222,7 @@ xezim ... --dpi-lib uvm.so
 
 - Add `-DXEZIM_UVM_POLLING=1` for a 2020 kit, to include its
   `uvm_hdl_polling.c`; 1800.2-2017 doesn't ship that file.
-- The driver also builds as C: `gcc -x c -shared -fPIC ...` with the same
+- The driver also builds as C: `clang -x c -shared -fPIC ...` with the same
   flags otherwise.
 - `-Wno-format-security` silences a warning from `uvm_hdl_polling.c`, which
   passes a non-literal format string to `sprintf`. The fix belongs upstream.
@@ -196,12 +241,12 @@ a regex engine, a compression codec. Pattern:
 
 ```bash
 # 1) Compile your shim to an object file
-g++ -shared -fPIC -std=c++17 -fPIC -DXEZIM_SPIKE_REAL=1 \
+clang++ -shared -fPIC -std=c++17 -fPIC -DXEZIM_SPIKE_REAL=1 \
     -I path/to/xezim/include -I $SPIKE_PREFIX/include \
     -c xezim_spike_dpi.cpp -o xezim_spike_dpi.o
 
 # 2) Link the shim + the external library into one .so
-g++ -shared -fPIC \
+clang++ -shared -fPIC \
     -L $SPIKE_PREFIX/lib -Wl,-rpath,$SPIKE_PREFIX/lib \
     xezim_spike_dpi.o \
     -lriscv -lfesvr -lsoftfloat \
@@ -250,7 +295,7 @@ my_project/
 ```
 
 ```bash
-cc -shared -fPIC -I path/to/xezim/include -I . my_dpi.c -o my_dpi.so
+clang -shared -fPIC -I path/to/xezim/include -I . my_dpi.c -o my_dpi.so
 xezim --dpi-lib ./my_dpi.so -I . tb_my_dpi.sv
 ```
 
@@ -264,7 +309,7 @@ dpi/
 ```
 
 ```bash
-g++ -shared -fPIC -I path/to/xezim/include -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
+clang++ -shared -fPIC -I path/to/xezim/include -I dpi/include uvm_dpi.cc -o dpi/lib/libuvm_dpi.so
 xezim --dpi-lib dpi/lib/libuvm_dpi.so -I dpi/include tb.sv
 ```
 
@@ -286,6 +331,11 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   pass `-Wl,-rpath,$PREFIX/lib` at link time. Because the symbols are global,
   one `--dpi-lib` library can call into another (a protocol library on top of
   a bridge library, say), in either command-line order.
+* An import that no `--dpi-lib` library defines is looked up among the
+  libraries the process already has loaded (`dlsym(RTLD_DEFAULT, …)`), as
+  a Verilator model links any C function, so a C library function needs
+  no library of its own:
+  `import "DPI-C" function string getenv(input string name);`.
 * A library that cannot be loaded is an error: xezim prints why and exits 1
   without simulating. Calling an imported function that no loaded library
   defines is a `Fatal` that ends the run (exit 1); imports that are never
@@ -369,8 +419,8 @@ writes into its generated DPI header:
 
 | Platform | Shared-object ext. | Compiler | One-file recipe |
 |---|---|---|---|
-| Linux | `.so` | `cc` / `g++` | `cc -shared -fPIC -I . foo.c -o foo.so` |
-| macOS | `.dylib` | `cc` / `clang++` | `cc -shared -fPIC -I . foo.c -o foo.dylib` |
+| Linux | `.so` | `clang` / `clang++` | `clang -shared -fPIC -I . foo.c -o foo.so` |
+| macOS | `.dylib` | `clang` / `clang++` | `clang -shared -fPIC -I . foo.c -o foo.dylib` |
 | Windows | `.dll` | `cl.exe` (MSVC) or `gcc` (MinGW) | `cl /LD /I . foo.c /Fe:foo.dll` |
 
 xezim's `--dpi-lib` accepts the platform-correct extension automatically. On
@@ -381,7 +431,7 @@ it only `dlopen`s).
 
 On macOS, a library that calls exported SV subroutines must leave those
 symbols for the loader to resolve: add `-Wl,-undefined,dynamic_lookup` to the
-link (`cc -shared -fPIC -Wl,-undefined,dynamic_lookup ...`). On Linux with
+link (`clang -shared -fPIC -Wl,-undefined,dynamic_lookup ...`). On Linux with
 musl, build xezim with `RUSTFLAGS="-C target-feature=-crt-static"`: a static
 musl executable cannot load shared libraries at all.
 
@@ -420,8 +470,8 @@ exercises five patterns end-to-end:
 | `dpi_shortreal_string_test` | `shortreal_string_dpi.c` | `shortreal` plus C string returns |
 | `dpi_vpi_backdoor_compliance_test` | `vpi_backdoor_compliance.c` | VPI force/read of signal hierarchies |
 
-All six are built with the same `cc -shared -fPIC -I <xezim_dir>` invocation —
-no per-test build system, just six shell-out-to-`cc` calls inside the test
+All six are built with the same `clang -shared -fPIC -I <xezim_dir>` invocation —
+no per-test build system, just six shell-out-to-`clang` calls inside the test
 harness.
 
 ---
@@ -432,7 +482,7 @@ Besides serving as a DPI callee, xezim can load a *classic* VPI application —
 one that registers system tasks/functions and walks the design:
 
 ```bash
-cc -shared -fPIC -I <xezim_dir> -o my_vpi.so my_vpi.c
+clang -shared -fPIC -I <xezim_dir> -o my_vpi.so my_vpi.c
 xezim --vpi-lib my_vpi.so design.sv        # alias: -m my_vpi.so
 ```
 
@@ -459,11 +509,29 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
   returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
-  refused (xezim cannot rewind a run).
+  refused (xezim cannot rewind a run); and the Clause 39.5 assertion controls
+  `vpiAssertionDisable`, `vpiAssertionEnable`, `vpiAssertionReset`,
+  `vpiAssertionKill`, `vpiAssertionEnableStep`, `vpiAssertionDisableStep`
+  (`vpiAssertionClockSteps`), `vpiAssertionSysOn`, `vpiAssertionSysOff`,
+  `vpiAssertionSysEnd`, `vpiAssertionSysKill` and `vpiAssertionSysReset` act on concurrent assertion
+  directives (a property declaration or instance handle is refused; step
+  enable/disable selects the attempt by its start time; DisableStep takes
+  no step-mode argument; controls share enable/disable and lock state with `$asserton`,
+  `$assertoff`, `$assertkill` and `$assertcontrol`; VPI Kill leaves the
+  assertion enabled; SysKill disables new attempts and retains callbacks;
+  SysEnd prevents subsequent restart and callback registration).
 - `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
   `vpi_get64`.
 - Callbacks: `vpi_register_cb` for every reason of IEEE 1800-2017 §38.36
-  (see below), `vpi_get_cb_info`, `vpi_remove_cb`.
+  (see below), `vpi_register_assertion_cb` (Clause 39.4.2) for concurrent
+  assertions (`cbAssertionStart`, `Success`, `Failure`, `VacuousSuccess`,
+  `DisabledEvaluation`, `StepSuccess`, `StepFailure`, `Disable`, `Enable`,
+  `Reset`, `Kill`; action and lock reasons are refused; `info` is always
+  non-NULL with `detail` NULL and, for `Disable`/`Enable`/`Reset`,
+  `attemptStartTime` set to the callback time; `cbAssertionStepSuccess` fires
+  for each tick an attempt remains in flight including its start tick, and
+  `cbAssertionStepFailure` accompanies each failure), `vpi_get_cb_info`,
+  `vpi_remove_cb`.
 - Multichannel descriptors: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`,
   `vpi_mcd_name`, `vpi_mcd_printf`/`vpi_mcd_vprintf`. They share the channel
   table of `$fopen`, so a descriptor opened in C can be written from
@@ -632,15 +700,24 @@ hook.
   `vpi_chk_error`.
 
 **Not implemented:** every routine of IEEE 1800-2017 clause 38 is declared in
-`include/vpi_user.h` and implemented as described above. The one gap is the
+`include/vpi_user.h` and implemented as described above. The Clause 39
+assertion API covers labelled concurrent assertions (`vpiAssert`, `vpiAssume`,
+`vpiCover`, `vpiPropertyDecl`, `vpiPropertyInst`),
+`vpi_register_assertion_cb` (refusing action and lock reasons), the
+enable/disable/reset/kill/step/system operations of `vpi_control`, and the
+`vpiAssert*Covered` counts in `vpi_get` (see "Assertions" below;
+`detail.failExpr` and `detail.step` are NULL, and attempt metadata is not
+checkpointed so after `$restart` attempts in flight report the restore time
+as their start). System assertion callbacks (`cbAssertionSys*`), action/lock
+controls, immediate/deferred assertions, `vpi_get_assertion_info`, and the
 SystemVerilog thread, frame and class-object callback reasons of
-`sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`): xezim has no thread,
-frame or class-object VPI objects, and `vpi_register_cb` rejects them.
+`sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`) are not implemented.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
-`tests/dpi/vpi_systf.{c,sv}`, `tests/strings/vpi_routines.rs` (user data,
-systf info, arrays, delays and every value format), and the design walks in
-`tests/strings/vpi_object_model_walk.rs`.
+`tests/dpi/vpi_systf.{c,sv}`, `tests/dpi/vpi_assertion.{c,sv}`,
+`tests/strings/vpi_assertion_controls.rs`, `tests/strings/vpi_routines.rs`
+(user data, systf info, arrays, delays and every value format), and the
+design walks in `tests/strings/vpi_object_model_walk.rs`.
 
 ### VPI object model
 
@@ -701,7 +778,9 @@ characters for a string), `vpiSigned`, `vpiScalar`/`vpiVector`, `vpiArray`,
 parameter — the relations
 `vpiLeftRange`/`vpiRightRange` (constants: the outermost packed range, or
 the outermost unpacked range of an array — for a dynamic array or queue its
-current bounds `[0:size-1]`, for an associative array none), `vpiRange`
+current bounds `[0:size-1]`, for an associative array none; an element of an
+unpacked array, `top.ids[0]` of `logic [31:0] ids [4]`, has the range of its
+own type, the next unpacked range for a subarray, and a bit has none), `vpiRange`
 (every packed range, or every unpacked range of an array), and
 `vpiTypespec`. A typespec
 (`vpiLogicTypespec`, `vpiIntTypespec`, `vpiEnumTypespec`, `vpiStructTypespec`,
@@ -777,9 +856,26 @@ and reports a `vpi_chk_error` error, as it does for a named event, a scope, a
 process and the other objects without a value. `vpi_put_value` rejects all of
 them the same way.
 
+**Assertions.** `vpiAssertion` iterates a scope's labelled concurrent
+assertions (`vpiAssert`, `vpiAssume`, `vpiCover`), property instances
+(`vpiPropertyInst`) and property declarations (`vpiPropertyDecl`);
+`vpiConcurrentAssertion` iterates the assertion statements only. Directives
+and property declarations resolve by `vpi_handle_by_name`, whereas
+`vpiPropertyInst` is reached by iteration only (`vpi_handle_by_name` on the
+shared name returns the declaration). Each answers `vpiType`, `vpiName`,
+`vpiFullName`, `vpiFile`, `vpiLineNo`, `vpiScope`/`vpiInstance` and
+`vpiAssertAttemptCovered` / `vpiAssertSuccessCovered` /
+`vpiAssertFailureCovered`. Coverage counts are per source location (shared by
+all instances of the module); on an `assert` or `assume`,
+`vpiAssertSuccessCovered` includes vacuous successes; on a `cover`,
+`vpiAssertFailureCovered` is always 0 (cover failures are not tallied); and
+`vpiAssertAttemptCovered` is successes + failures (an approximation; on a
+`cover` it equals the success count).
+
 **Not modelled** in the object model: statements (a process's `vpiStmt` is
 only its named block, when it is one), classes and their objects, clocking
-blocks, concurrent assertions, `let` and `checker` declarations,
+blocks, immediate/deferred assertions and sequence declarations, `let` and
+`checker` declarations,
 typedef and import objects (`vpiTypedef`, `vpiImport`), `vpiDriver` and
 `vpiLoad`, attributes, `vpiParamAssign`/`vpiDefParam`, `vpiGenVar`,
 `vpiSpecParam`, array objects for instance and primitive arrays

@@ -95,7 +95,7 @@ fn number(n: u32, span: Span) -> Expression {
             signed: false,
             base: NumberBase::Decimal,
             value: n.to_string(),
-            cached_val: Cell::new(None),
+            cached_val: crate::ast::cache::LiteralCache::new(None),
         }),
         span,
     )
@@ -122,7 +122,7 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
         Statement::new(
             StatementKind::SeqBlock {
                 name: None,
-                stmts: v,
+                stmts: v.into(),
             },
             span,
         )
@@ -131,6 +131,7 @@ fn block(mut v: Vec<Statement>, span: Span) -> Statement {
 
 /// A reported scope: a module instance, or the package (or `$unit`, or the
 /// declaring module) that holds classes and subroutines outside instances.
+#[derive(serde::Serialize)]
 struct Scope {
     /// Printed name: the hierarchical instance path, or the package name.
     name: String,
@@ -139,6 +140,7 @@ struct Scope {
     src: Option<u32>,
 }
 
+#[derive(serde::Serialize)]
 struct StmtSite {
     scope: u32,
     span: Span,
@@ -146,6 +148,7 @@ struct StmtSite {
     counter: u32,
 }
 
+#[derive(serde::Serialize)]
 struct Arm {
     span: Span,
     label: &'static str,
@@ -154,6 +157,7 @@ struct Arm {
     counter: Option<u32>,
 }
 
+#[derive(serde::Serialize)]
 struct BranchSite {
     scope: u32,
     span: Span,
@@ -163,7 +167,7 @@ struct BranchSite {
 }
 
 /// One 64-bit word of a tracked signal, as toggle coverage last saw it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Word {
     /// Value at the last sample.
     v: u64,
@@ -177,6 +181,7 @@ struct Word {
 }
 
 /// Per-bit rise/fall counts of the tracked signals.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Toggle {
     /// Signal id -> tracked index, `u32::MAX` when not tracked.
     slot: Vec<u32>,
@@ -265,6 +270,7 @@ impl Toggle {
     }
 }
 
+#[derive(serde::Serialize)]
 pub(crate) struct CodeCov {
     kinds: u8,
     limit: Vec<String>,
@@ -366,8 +372,8 @@ impl Instr<'_> {
         let rebuilt = |kind| Statement::new(kind, span);
         match s.kind {
             StatementKind::SeqBlock { name, stmts } => {
-                let stmts = self.stmts(stmts);
-                out.push(rebuilt(StatementKind::SeqBlock { name, stmts }));
+                let stmts = self.stmts(stmts.to_vec());
+                out.push(rebuilt(StatementKind::SeqBlock { name, stmts: stmts.into() }));
             }
             // Each fork branch stays one process.
             StatementKind::ParBlock {
@@ -495,6 +501,7 @@ impl Instr<'_> {
             // bodies the executor and other constructs own.
             kind @ (StatementKind::Null
             | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. }
             | StatementKind::Typedef(_)
             | StatementKind::Coverpoint { .. }
             | StatementKind::Cross { .. }
@@ -1217,6 +1224,18 @@ impl Simulator {
             let copy = |k: &str, sp: Span| {
                 !k.contains('.') && !k.contains("::") && dotted.contains(&(k.to_string(), sp.start))
             };
+            // Materialize any deferred instance-scoped callable bodies before
+            // instrumenting so per-instance signal references are in place.
+            let deferred_fns: Vec<String> =
+                self.module.deferred_function_bodies.keys().cloned().collect();
+            for key in deferred_fns {
+                Self::materialize_deferred_fn_in_place(&mut self.module, &key);
+            }
+            let deferred_tasks: Vec<String> =
+                self.module.deferred_task_bodies.keys().cloned().collect();
+            for key in deferred_tasks {
+                Self::materialize_deferred_task_in_place(&mut self.module, &key);
+            }
             let mut functions = std::mem::take(&mut self.module.functions).into_map();
             for (key, fd) in functions.iter_mut() {
                 if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
@@ -1229,7 +1248,7 @@ impl Simulator {
                         kinds,
                         scope: sc,
                     }
-                    .stmts(items);
+                    .stmts(items.into_vec()).into();
                 }
             }
             self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
@@ -1245,7 +1264,7 @@ impl Simulator {
                         kinds,
                         scope: sc,
                     }
-                    .stmts(items);
+                    .stmts(items.into_vec()).into();
                 }
             }
             self.module.tasks = tasks;
@@ -1315,7 +1334,7 @@ impl Simulator {
                 .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
                 .unwrap_or_default()
         } else {
-            scope
+            scope.to_string()
         };
         let paths = std::mem::take(&mut cov.inst_paths);
         let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
@@ -1541,7 +1560,7 @@ impl Simulator {
                     kinds,
                     scope: sc,
                 }
-                .stmts(body);
+                .stmts(body.into_vec()).into();
             }
             done.insert(ptr, arc.clone());
             classes.insert(key, arc);

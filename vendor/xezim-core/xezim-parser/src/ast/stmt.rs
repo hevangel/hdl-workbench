@@ -1,6 +1,7 @@
 //! SystemVerilog statements (IEEE 1800-2017 §A.6)
 
-use super::expr::Expression;
+use super::expr::{Expression, HierarchicalIdentifier};
+use super::shared_vec::SharedVec;
 use super::types::{DataType, Lifetime, UnpackedDimension};
 use super::{Identifier, Span};
 
@@ -15,6 +16,13 @@ impl Statement {
     pub fn new(kind: StatementKind, span: Span) -> Self {
         Self { kind, span }
     }
+}
+
+/// §9.6.2: the name a `disable` target is matched by at run time: the key
+/// elaboration wrote for a task, else the last segment (a block's label or a
+/// task's name).
+pub fn disable_name(target: &HierarchicalIdentifier) -> &str {
+    target.path.last().map_or("", |s| s.name.name.as_str())
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +54,8 @@ pub enum StatementKind {
     },
     NonblockingAssign {
         lvalue: Expression,
-        delay: Option<Expression>,
+        // Keep absent timing from reserving an expression in every statement.
+        delay: Option<Box<Expression>>,
         rvalue: Expression,
     },
     If {
@@ -130,12 +139,12 @@ pub enum StatementKind {
     },
     SeqBlock {
         name: Option<Identifier>,
-        stmts: Vec<Statement>,
+        stmts: SharedVec<Statement>,
     },
     ParBlock {
         name: Option<Identifier>,
         join_type: JoinType,
-        stmts: Vec<Statement>,
+        stmts: SharedVec<Statement>,
     },
     TimingControl {
         control: TimingControl,
@@ -157,7 +166,8 @@ pub enum StatementKind {
         stmt: Box<Statement>,
     },
     WaitFork,
-    Disable(Identifier),
+    /// §9.6.2: the task or block, as written.
+    Disable(HierarchicalIdentifier),
     Return(Option<Expression>),
     Break,
     Continue,
@@ -214,6 +224,13 @@ pub enum StatementKind {
         idx: u32,
         span: Span,
     },
+    /// §6.20: block-scope `parameter` / `localparam` declaration. Appended
+    /// LAST so existing bincode variant discriminants stay stable.
+    ParamDecl {
+        is_local: bool,
+        data_type: DataType,
+        declarators: Vec<VarDeclarator>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +238,11 @@ pub enum StatementKind {
 pub struct VarDeclarator {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
-    pub init: Option<Expression>,
+    pub init: Option<Box<Expression>>,
+    /// The declaration's own id in its definition's tree (`Bound::decl`);
+    /// `UNSET` when not bound. Written by the lexical binder (§23.9).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub decl: super::binding::Bound,
     pub span: Span,
 }
 
@@ -271,10 +292,10 @@ pub struct CaseItem {
     /// §12.6: the item's pattern in a `case (…) matches` statement. `None` for
     /// an ordinary case item (which uses `patterns` instead).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub pattern: Option<Pattern>,
+    pub pattern: Option<Box<Pattern>>,
     /// §12.6: the item's optional `&&& <guard>` expression.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub guard: Option<Expression>,
+    pub guard: Option<Box<Expression>>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,9 +391,10 @@ pub struct AssertionStatement {
     pub procedural: bool,
     /// §16.14.6: the clock a procedural concurrent assertion infers from
     /// its `always` procedure's event control, used when the property has
-    /// no clock of its own.
+    /// no clock of its own. Box this rare payload so an absent clock does
+    /// not enlarge every statement in a procedural body.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub inferred_clock: Option<EventExpr>,
+    pub inferred_clock: Option<Box<EventExpr>>,
     pub span: Span,
 }
 
@@ -407,4 +429,187 @@ pub enum ProceduralContinuous {
         rvalue: Expression,
     },
     Release(Expression),
+}
+
+#[cfg(test)]
+mod shared_block_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn block(parallel: bool) -> Statement {
+        let stmts = vec![Statement::new(StatementKind::Null, Span::dummy())].into();
+        let kind = if parallel {
+            StatementKind::ParBlock {
+                name: None,
+                join_type: JoinType::Join,
+                stmts,
+            }
+        } else {
+            StatementKind::SeqBlock { name: None, stmts }
+        };
+        Statement::new(kind, Span::dummy())
+    }
+
+    fn body(statement: &Statement) -> &SharedVec<Statement> {
+        match &statement.kind {
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => stmts,
+            _ => panic!("block expected"),
+        }
+    }
+
+    fn body_mut(statement: &mut Statement) -> &mut SharedVec<Statement> {
+        match &mut statement.kind {
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => stmts,
+            _ => panic!("block expected"),
+        }
+    }
+
+    /// §9.3: a process snapshot shares unchanged syntax; rewriting one
+    /// sequential or parallel sibling cannot mutate another process.
+    #[test]
+    fn block_clones_share_until_a_sibling_is_rewritten() {
+        for parallel in [false, true] {
+            let original = block(parallel);
+            let mut sibling = original.clone();
+            assert!(Arc::ptr_eq(
+                body(&original).as_arc(),
+                body(&sibling).as_arc()
+            ));
+            body_mut(&mut sibling)[0].kind = StatementKind::Break;
+            assert!(!Arc::ptr_eq(
+                body(&original).as_arc(),
+                body(&sibling).as_arc()
+            ));
+            assert!(matches!(body(&original)[0].kind, StatementKind::Null));
+            assert!(matches!(body(&sibling)[0].kind, StatementKind::Break));
+        }
+    }
+
+    /// A mutation inside a nested shared block detaches both affected
+    /// levels and leaves every source/sibling body unchanged (§9.3).
+    #[test]
+    fn nested_block_mutation_keeps_source_snapshots_isolated() {
+        let mut original = block(false);
+        body_mut(&mut original)[0] = block(true);
+        let mut changed = original.clone();
+        let untouched = original.clone();
+        body_mut(&mut body_mut(&mut changed)[0])[0].kind = StatementKind::Continue;
+        assert!(matches!(
+            body(&body(&original)[0])[0].kind,
+            StatementKind::Null
+        ));
+        assert!(matches!(
+            body(&body(&untouched)[0])[0].kind,
+            StatementKind::Null
+        ));
+        assert!(matches!(
+            body(&body(&changed)[0])[0].kind,
+            StatementKind::Continue
+        ));
+    }
+
+    #[cfg(feature = "json-cli")]
+    #[test]
+    fn restored_block_bodies_remain_sequence_shaped_and_isolated() {
+        for parallel in [false, true] {
+            let original = block(parallel);
+            let encoded = serde_json::to_value(&original).unwrap();
+            let variant = if parallel { "ParBlock" } else { "SeqBlock" };
+            assert!(encoded["kind"][variant]["stmts"].is_array());
+            let restored: Statement = serde_json::from_value(encoded).unwrap();
+            let mut changed = restored.clone();
+            assert!(Arc::ptr_eq(
+                body(&restored).as_arc(),
+                body(&changed).as_arc()
+            ));
+            body_mut(&mut changed).push(Statement::new(StatementKind::Break, Span::dummy()));
+            assert_eq!(body(&original).len(), 1);
+            assert_eq!(body(&restored).len(), 1);
+            assert_eq!(body(&changed).len(), 2);
+        }
+    }
+    fn nested_assignment() -> Statement {
+        let parsed =
+            crate::parse("module top; initial begin fork begin x=1; end join end endmodule");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let crate::ast::Description::Module(module) = &parsed.source.descriptions[0] else {
+            panic!("module expected")
+        };
+        let crate::ast::decl::ModuleItem::InitialConstruct(initial) = &module.items[0] else {
+            panic!("initial expected")
+        };
+        initial.stmt.clone()
+    }
+
+    fn assigned_name(statement: &Statement) -> &Expression {
+        match &statement.kind {
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                assigned_name(&stmts[0])
+            }
+            StatementKind::BlockingAssign { lvalue, .. } => lvalue,
+            _ => panic!("assignment expected"),
+        }
+    }
+
+    fn seed_context_caches(statement: &Statement) {
+        let expr = assigned_name(statement);
+        expr.cached_width.set(Some(8));
+        let super::super::expr::ExprKind::Ident(name) = &expr.kind else {
+            panic!("name expected")
+        };
+        name.cached_signal_id.set(Some(7));
+        name.cached_resolved_name.set("original.x".into()).unwrap();
+    }
+
+    /// §23.6: private runtime cloning refreshes caches below nested shared
+    /// sequential and parallel blocks, rather than aliasing another scope.
+    #[test]
+    fn fresh_clone_resets_nested_context_caches_without_aliasing_source() {
+        let source = nested_assignment();
+        seed_context_caches(&source);
+        let private = super::super::cache::with_fresh_scope_caches(|| source.clone());
+        assert!(!Arc::ptr_eq(
+            body(&source).as_arc(),
+            body(&private).as_arc()
+        ));
+        let old = assigned_name(&source);
+        let expr = assigned_name(&private);
+        assert_eq!(expr.cached_width.get(), None);
+        expr.cached_width.set(Some(16));
+        assert_eq!(expr.cached_width.get(), Some(16));
+        assert_eq!(old.cached_width.get(), Some(8));
+        let super::super::expr::ExprKind::Ident(name) = &expr.kind else {
+            panic!("name expected")
+        };
+        let super::super::expr::ExprKind::Ident(old_name) = &old.kind else {
+            panic!("name expected")
+        };
+        assert_eq!(name.cached_signal_id.get(), None);
+        assert!(name.cached_resolved_name.get().is_none());
+        name.cached_signal_id.set(Some(9));
+        name.cached_resolved_name.set("private.x".into()).unwrap();
+        assert_eq!(old_name.cached_signal_id.get(), Some(7));
+        assert_eq!(
+            old_name.cached_resolved_name.get().map(String::as_str),
+            Some("original.x")
+        );
+    }
+
+    #[test]
+    fn disabled_clone_disables_nested_context_caches_without_touching_source() {
+        let source = nested_assignment();
+        seed_context_caches(&source);
+        let shared = super::super::cache::without_scope_caches(|| source.clone());
+        let expr = assigned_name(&shared);
+        expr.cached_width.set(Some(16));
+        assert_eq!(expr.cached_width.get(), None);
+        assert_eq!(assigned_name(&source).cached_width.get(), Some(8));
+        let super::super::expr::ExprKind::Ident(name) = &expr.kind else {
+            panic!("name expected")
+        };
+        name.cached_signal_id.set(Some(9));
+        let _ = name.cached_resolved_name.set("ignored.x".into());
+        assert_eq!(name.cached_signal_id.get(), None);
+        assert!(name.cached_resolved_name.get().is_none());
+    }
 }

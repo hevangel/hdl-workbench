@@ -1,5 +1,6 @@
 // top: c16_seq2
 module c16_seq2;
+  initial $assertvacuousoff(0);
   bit clk; bit a, b, c, d, rst;
   int cyc;
   always #5 clk = ~clk;
@@ -18,10 +19,10 @@ module c16_seq2;
   `CHK(q_repstar, a ##1 b[*] ##1 c |-> 1)
 // XZFAIL   `CHK(q_repplus, a ##1 b[+] ##1 c |-> 1)
   `CHK(q_snext, a |-> s_nexttime b)
-// XZFAIL   `CHK(q_nextn, a |-> nexttime [2] c)
-// XZFAIL   `CHK(q_ev_range, a |-> eventually [1:3] c)
-// XZFAIL   `CHK(q_sev_range, a |-> s_eventually [1:3] c)
-// XZFAIL   `CHK(q_salways, a |-> s_always [0:1] !d)
+  `CHK(q_nextn, a |-> nexttime [2] c)
+  `CHK(q_ev_range, a |-> eventually [1:3] c)
+  `CHK(q_sev_range, a |-> s_eventually [1:3] c)
+  `CHK(q_salways, a |-> s_always [0:1] !d)
 // XZFAIL   `CHK(q_until_with, a |=> b until_with c)
   `CHK(q_suntil, a |=> b s_until c)
   `CHK(q_strong, a |-> strong(##[1:2] c))

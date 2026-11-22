@@ -38,7 +38,7 @@ fn walk_sources(tag: &str, src: &str, sources: &[(&str, &str)], top: Option<&str
     }
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
     let so = d.join("walk.so");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-I"])
         .arg(&include)
         .arg("-I")
@@ -137,7 +137,8 @@ static void reg_task(const char *name, PLI_INT32 (*fn)(PLI_BYTE8 *)) {
 "###;
 
 /// The design the first three walks share. Line numbers are asserted, so
-/// keep its text stable.
+/// keep its text stable. The program's initial procedure waits past the
+/// walk: the run ends when it does (§24.3).
 const DESIGN: &str = r###"`timescale 1ns/1ps
 package cfg_pkg;
   parameter int WIDTH = 8;
@@ -181,7 +182,7 @@ module dff_chk (input clk, input d, output reg q);
 endmodule
 program prog (input logic clk);
   int pcount;
-  initial pcount = 7;
+  initial begin pcount = 7; #100; end
 endprogram
 module top;
   import cfg_pkg::*;
@@ -1110,5 +1111,51 @@ void (*vlog_startup_routines[])(void) = {reg, 0};
             "OM|top.m.a file=first.sv line=1",
             "OM|top.m.b file=second.sv line=1"
         ]
+    );
+}
+
+/// §27.5, §27.6: the object model names generate scopes as elaboration does:
+/// a direct nest adds no scope, an implicit name avoids an explicit one.
+const SCOPE_TREE_C: &str = r###"#include "common.h"
+static void tree(vpiHandle s) {
+    vpi_printf("OM|scope %s\n", fname(s));
+    vpiHandle it = vpi_iterate(vpiInternalScope, s), c;
+    while (it && (c = vpi_scan(it))) tree(c);
+}
+static PLI_INT32 walk(PLI_BYTE8 *u) {
+    (void)u;
+    tree(H("top"));
+    return 0;
+}
+static void reg(void) { reg_task("$walk", walk); }
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"###;
+
+#[test]
+fn design_walk_direct_nest_and_padded_scope_names() {
+    let got = walk(
+        "vpi_om_scope_tree",
+        SCOPE_TREE_C,
+        r#"module top;
+  parameter genblk3 = 0;
+  if (1) if (1) begin : d int x; end
+  if (0) ; else case (1) 1: begin int y; end endcase
+  if (1) begin int z; end
+  if (1) begin if (1) begin : n int w; end end
+  initial $walk;
+endmodule
+"#,
+        Some("top"),
+    );
+    check(
+        &got,
+        &[
+            "OM|scope top",
+            "OM|scope top.d",
+            "OM|scope top.genblk2",
+            "OM|scope top.genblk03",
+            "OM|scope top.genblk4",
+            "OM|scope top.genblk4.n",
+        ],
     );
 }

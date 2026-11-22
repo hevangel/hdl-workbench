@@ -28,7 +28,7 @@ function capture(command, args) {
   if (result.status !== 0) {
     const output = result.stderr.trim();
     if (command === "rustc") {
-      throw new Error(`Rust 1.99.1 is required. Install rustup and the pinned toolchain from rust-toolchain.toml.${output ? `\n${output}` : ""}`);
+      throw new Error(`Rust 1.100.0 is required. Install rustup and the pinned toolchain from rust-toolchain.toml.${output ? `\n${output}` : ""}`);
     }
     if (command === "wasm-bindgen") {
       throw new Error(`wasm-bindgen CLI ${wasmBindgenVersion} is required. Install it with: cargo install wasm-bindgen-cli --version ${wasmBindgenVersion} --locked${output ? `\n${output}` : ""}`);
@@ -39,8 +39,8 @@ function capture(command, args) {
 }
 
 const rustVersion = capture("rustc", ["--version"]);
-if (!rustVersion.includes("1.99.1")) {
-  throw new Error(`Expected Rust 1.99.1 from rust-toolchain.toml, got: ${rustVersion}`);
+if (!rustVersion.includes("1.100.0")) {
+  throw new Error(`Expected Rust 1.100.0 from rust-toolchain.toml, got: ${rustVersion}`);
 }
 
 const bindgenVersion = capture("wasm-bindgen", ["--version"]);

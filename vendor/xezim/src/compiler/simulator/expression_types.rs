@@ -42,11 +42,34 @@ impl Simulator {
                     .any(|m| m.contains_key(&*name))
             });
         if in_any_frame {
+            if let Some(flag) = self.task_frame_string_flag(name.as_ref()) {
+                return flag;
+            }
             if let Some(t) = self.var_class_types.get(&*name) {
                 return t == "string";
             }
             if let Some(t) = self.var_typedef_types.get(&*name) {
                 return t == "string";
+            }
+            if !self.method_local_base.is_empty() {
+                return self.string_signals.contains(name.as_ref());
+            }
+        } else {
+            let active_cls = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .map(|i| i.class_name.as_str())
+                .or_else(|| self.class_context_stack.last().and_then(|c| c.as_deref()));
+            if let Some(cls) = active_cls {
+                if self.class_declares_property(cls, name.as_ref()) {
+                    return self
+                        .class_string_props_of(cls)
+                        .iter()
+                        .any(|p| p == name.as_ref());
+                }
             }
         }
         if let Some(t) = self
@@ -174,6 +197,12 @@ impl Simulator {
                     // `finish_item(uvm_sequence_item item)`), it holds THAT
                     // formal's class, not this frame's.
                     if let Some(t) = self.local_class_type_of(&name) {
+                        return Some(t);
+                    }
+                    // The frame's typedef, before the flat maps a concurrent
+                    // process's same-named local of another type overwrote
+                    // (`c.num()` of a `color_e c` read a `fruit_e c`'s).
+                    if let Some(t) = self.local_typedef_type_of(&name).filter(|t| !t.is_empty()) {
                         return Some(t);
                     }
                     // A class-typed procedural local declared in this scope.
@@ -432,6 +461,24 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.2.2/§8.8: an anonymous struct-array element has no
+                // typedef name, but its field still supplies the constructor
+                // type. Query the declaration without evaluating selectors.
+                if matches!(base.kind, ExprKind::Index { .. }) {
+                    let mut root = base.as_ref();
+                    while let ExprKind::Index { expr, .. } = &root.kind {
+                        root = expr;
+                    }
+                    if let ExprKind::Ident(h) = &root.kind {
+                        let key = self.resolve_hier_name(h);
+                        if let Some(dt) = self.module.var_decl_types.get(key.as_ref())
+                            && let Some((field_type, _)) = self.member_decl_type(dt, &member.name)
+                            && let Some(name) = self.declared_typeref_name(&field_type)
+                        {
+                            return Some(name);
+                        }
+                    }
+                }
                 // A member of one element of an interface instance array
                 // (`B[0].proxy`): the element's members are signals under
                 // `B[0].`, carrying their declared type. Without this, the
@@ -512,8 +559,11 @@ impl Simulator {
             // by BARE name and shared by every process, so an unrelated task
             // suspended with a same-named local of another class decided this
             // name's type and `$typename` reported that class (issue #239).
+            // A property reached through a handle (`h.p`) is not the handle:
+            // the first segment names the variable only for a bare name.
             let bname = &hier.path[0].name.name;
-            for key in [&*name, bname.as_str()] {
+            let bare = hier.path.len() == 1;
+            for key in [&*name, bname.as_str()].into_iter().take(1 + bare as usize) {
                 if let Some(base) = self.local_class_type_of(key) {
                     let ta = self.var_type_args.get(key).cloned().unwrap_or_default();
                     return Some((base, ta));
@@ -523,7 +573,7 @@ impl Simulator {
                 let ta = self.var_type_args.get(&*name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
-            if let Some(base) = self.var_class_types.get(bname) {
+            if bare && let Some(base) = self.var_class_types.get(bname) {
                 let ta = self.var_type_args.get(bname).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
@@ -651,9 +701,16 @@ impl Simulator {
                     .get(base)
                     .is_some_and(|cd| cd.declaring_module.is_some()) =>
             {
-                format!("class {}", self.hier_path(base).replace('.', "/"))
+                let (path, leaf) = base.rsplit_once('.').unwrap_or(("", base));
+                let leaf = leaf.rsplit_once("::").map_or(leaf, |(_, name)| name);
+                let visible = if path.is_empty() {
+                    leaf.to_string()
+                } else {
+                    format!("{path}.{leaf}")
+                };
+                format!("class {}", self.hier_path(&visible).replace('.', "/"))
             }
-            None => format!("class {}", base),
+            None => format!("class {}", self.class_source_name(base)),
         }
     }
 
@@ -662,6 +719,15 @@ impl Simulator {
     /// spelling `pkg::C` (§26.3, see `xezim_core::pkg_scope`); this strips
     /// that prefix again for output that names the class.
     pub(super) fn class_source_name<'a>(&self, base: &'a str) -> &'a str {
+        if self
+            .module
+            .classes
+            .get(base)
+            .is_some_and(|cd| cd.declaring_module.is_some())
+            && let Some((_, name)) = base.rsplit_once("::")
+        {
+            return name;
+        }
         self.module
             .class_decl_pkg
             .get(base)
@@ -718,6 +784,78 @@ impl Simulator {
             }
         }
         Some(self.class_spec_typename(&cls, None))
+    }
+
+    /// §20.6.1, §8.25: `$typename` of a class property declared with a
+    /// specialization (`drv_c #(W) p;` in a `holder_c #(16)` object) names
+    /// that specialization, a value argument that is a parameter of the
+    /// holder read in the holder object's own specialization. `None` for any
+    /// other operand.
+    pub(super) fn prop_decl_class_typename(&mut self, arg: &Expression) -> Option<String> {
+        if !matches!(arg.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            return None;
+        }
+        let (handle, prop) = self.class_prop_receiver(arg)?;
+        let cd = self.class_prop_declarer(handle, &prop)?;
+        let DataType::TypeReference {
+            name, type_args, ..
+        } = cd.property_types.get(&prop)?
+        else {
+            return None;
+        };
+        let base = name.name.name.clone();
+        if type_args.is_empty() || name.has_scope() || !self.module.classes.contains_key(&base) {
+            return None;
+        }
+        let saved = self.seed_callee_spec_from_instance(handle, &cd.name);
+        self.this_stack.push(Some(handle));
+        self.class_context_stack.push(Some(cd.name.clone()));
+        let args: Vec<Expression> = type_args
+            .iter()
+            .map(|a| self.typename_param_arg(a, &cd.param_order))
+            .collect();
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.restore_spec_pooled(saved);
+        Some(self.format_class_typename(&base, &args))
+    }
+
+    /// The specialization argument `a`, with a bare name of one of `params`
+    /// (the holder's value parameters) replaced by its current value.
+    fn typename_param_arg(&mut self, a: &Expression, params: &[String]) -> Expression {
+        match &a.kind {
+            ExprKind::NamedArg {
+                name,
+                expr: Some(x),
+            } => Expression::new(
+                ExprKind::NamedArg {
+                    name: name.clone(),
+                    expr: Some(Box::new(self.typename_param_arg(x, params))),
+                },
+                a.span,
+            ),
+            ExprKind::Ident(h)
+                if h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && params.contains(&h.path[0].name.name) =>
+            {
+                let v = self.eval_expr(a);
+                match (v.has_xz(), v.to_i64()) {
+                    (false, Some(n)) if n >= 0 => Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: NumberBase::Decimal,
+                            value: n.to_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
+                        }),
+                        a.span,
+                    ),
+                    _ => a.clone(),
+                }
+            }
+            _ => a.clone(),
+        }
     }
 
     /// Format a single specialization argument (a type or a value).
@@ -885,6 +1023,83 @@ impl Simulator {
                 return Some(r);
             }
         }
+        if Self::chain_root_is_super(e)
+            && let Some(r) = self.super_chain_as_this(e)
+        {
+            return Some(r);
+        }
+        Self::super_as_this(e)
+    }
+
+    /// Whether the member and select chain `e` starts at `super` — a walk
+    /// without allocation, so the reads that reach [`Self::super_rewrite`]
+    /// pay nothing for the chain rewrite.
+    fn chain_root_is_super(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Ident(h) => {
+                    return h.path.first().is_some_and(|s| s.name.name == "super");
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// §8.15: `super.frame.lanes[0]` — a member or select chain rooted at
+    /// `super.m` reads and writes `this.m`'s chain, unless `m` is redeclared
+    /// (the select paths resolve a shadowed member themselves). `None` when
+    /// `e` is no such chain.
+    #[inline(never)]
+    fn super_chain_as_this(&self, e: &Expression) -> Option<Expression> {
+        let rebuilt = match &e.kind {
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(self.super_chain_root(expr)?),
+                index: index.clone(),
+            },
+            ExprKind::RangeSelect {
+                expr,
+                left,
+                right,
+                kind,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(self.super_chain_root(expr)?),
+                left: left.clone(),
+                right: right.clone(),
+                kind: *kind,
+            },
+            ExprKind::MemberAccess { expr, member } if !matches!(expr.kind, ExprKind::Ident(_)) => {
+                ExprKind::MemberAccess {
+                    expr: Box::new(self.super_chain_root(expr)?),
+                    member: member.clone(),
+                }
+            }
+            _ => return None,
+        };
+        Some(Expression::new(rebuilt, e.span))
+    }
+
+    /// The `this`-rooted spelling of the receiver `e` of a chain under
+    /// [`Self::super_chain_as_this`].
+    fn super_chain_root(&self, e: &Expression) -> Option<Expression> {
+        let first = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 && h.path[0].name.name == "super" => {
+                &h.path[1].name.name
+            }
+            ExprKind::MemberAccess { expr, member }
+                if matches!(&expr.kind, ExprKind::Ident(bh)
+                    if bh.path.len() == 1 && bh.path[0].name.name == "super") =>
+            {
+                &member.name
+            }
+            _ => return self.super_chain_as_this(e),
+        };
+        if self.shadowed_prop_names.contains(first.as_str()) {
+            return None;
+        }
         Self::super_as_this(e)
     }
 
@@ -911,7 +1126,39 @@ impl Simulator {
                     && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
                 let m = h.path.last()?.name.name.as_str();
-                if !self.prop_maybe_shadowed(m) || h.path[0].name.name == "super" {
+                if h.path[0].name.name == "super" {
+                    return None;
+                }
+                if !self.prop_maybe_shadowed(m) {
+                    // §8.14: a shadowed property INSIDE the chain (`b.f.tag`
+                    // with `b` of the base type) names the base's copy too;
+                    // rewrite the chain up to it and hang the rest off the
+                    // rewritten handle.
+                    for k in (1..h.path.len() - 1).rev() {
+                        if !self.prop_maybe_shadowed(&h.path[k].name.name) {
+                            continue;
+                        }
+                        let mut head = h.clone();
+                        head.path.truncate(k + 1);
+                        head.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                        head.cached_resolved_name = crate::ast::cache::NameCache::new();
+                        let Some(mut out) = self.shadowed_member_rewrite(&Expression::new(
+                            ExprKind::Ident(head),
+                            e.span,
+                        )) else {
+                            continue;
+                        };
+                        for seg in &h.path[k + 1..] {
+                            out = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(out),
+                                    member: seg.name.clone(),
+                                },
+                                e.span,
+                            );
+                        }
+                        return Some(out);
+                    }
                     return None;
                 }
                 let p = hier_prefix(h);
@@ -924,7 +1171,23 @@ impl Simulator {
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 if !self.prop_maybe_shadowed(member.name.as_str()) {
-                    return None;
+                    // §8.14: `this.f.n` / `b.f.inner.n` — a shadowed member
+                    // below the receiver selects the copy the receiver's
+                    // declared class sees, as the read of `this.f` does.
+                    if !matches!(
+                        base.kind,
+                        ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    ) {
+                        return None;
+                    }
+                    let rb = self.shadowed_member_rewrite(base)?;
+                    return Some(Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(rb),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ));
                 }
                 let prefix = match &base.kind {
                     ExprKind::Ident(bh)
@@ -947,21 +1210,31 @@ impl Simulator {
             }
             _ => return None,
         };
-        // The static class of the prefix.
+        // The static class of the prefix. A package-qualified declaration
+        // (`pkg::base_c h`), an element of a collection of handles (`q[0]`),
+        // a static handle (`Box::slot`) or a member chain have one too,
+        // which the type-name lookup does not spell as a class key (#944).
         let static_cls: String = if matches!(prefix.kind, ExprKind::This) {
             self.class_context_stack.last().cloned().flatten()?
         } else {
-            let tn = self.get_expr_type_name(&prefix)?;
-            let tn = match self.extract_spec_from_string(&tn) {
-                Some((base, _)) => base,
-                None => tn,
-            };
-            if self.module.classes.contains_key(&tn) {
-                tn
-            } else {
+            let named = self.get_expr_type_name(&prefix).and_then(|tn| {
+                let tn = match self.extract_spec_from_string(&tn) {
+                    Some((base, _)) => base,
+                    None => tn,
+                };
+                // The class's own key, not its package-qualified alias: the
+                // storage keys below spell the declarer by it.
+                let leaf = tn.rsplit("::").next().unwrap_or(&tn);
+                if self.module.classes.contains_key(leaf) {
+                    return Some(leaf.to_string());
+                }
+                if self.module.classes.contains_key(&tn) {
+                    return Some(tn);
+                }
                 self.resolve_simple_typedef_class(&tn)
-                    .filter(|c| self.module.classes.contains_key(c))?
-            }
+                    .filter(|c| self.module.classes.contains_key(c))
+            });
+            named.or_else(|| self.ref_view_class(&prefix))?
         };
         let declarer_from = |start: &str| -> Option<String> {
             let mut cur = Some(start.to_string());
@@ -980,11 +1253,44 @@ impl Simulator {
             None
         };
         let target = declarer_from(&static_cls)?;
-        let handle = self.eval_handle_expr(&prefix).filter(|&h| h != 0)?;
+        let handle = self
+            .eval_handle_expr(&prefix)
+            .or_else(|| self.static_head_handle(&prefix))
+            .filter(|&h| h != 0)?;
         let inst = self.heap.get(handle)?.as_ref()?;
         let leaf = declarer_from(&inst.class_name)?;
-        if leaf == target {
+        let tcd = self.module.classes.get(&target)?;
+        let target_static =
+            tcd.static_properties.contains(m) || tcd.param_defaults.iter().any(|(p, _)| p == m);
+        // A static the object's own class declares, hiding a base instance
+        // property, has no cell in the object either (`d.s.n`).
+        if leaf == target && !target_static {
             return None;
+        }
+        // §8.9/§8.14: the visible declaration is a static (or a constant)
+        // that a derived class hides with an instance property: the
+        // reference names the class's shared cell, never a copy in the
+        // object (`this.s` in the base's method, `base_h.s`).
+        if target_static {
+            if self.class_is_parameterized(&target) {
+                return None;
+            }
+            let seg = |name: &str| HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            };
+            let sh = HierarchicalIdentifier {
+                root: None,
+                path: vec![seg(&target), seg(m)],
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
+            };
+            return Some(Expression::new(ExprKind::Ident(sh), span));
         }
         let qkey = format!("{}::{}", target, m);
         if !inst.properties.contains_key(qkey.as_str()) {
@@ -997,6 +1303,49 @@ impl Simulator {
             },
             span,
         ))
+    }
+
+    /// `shadowed_member_rewrite` under a bit-, part- or element select of a
+    /// packed member (`this.v[3:0] = x` in a base method, §8.14/§11.5.1).
+    /// A collection member is left alone: its elements are not stored under
+    /// the member's key.
+    pub(super) fn shadowed_select_rewrite(&self, e: &Expression) -> Option<Expression> {
+        let base_of = |b: &Expression| -> Option<Expression> {
+            if let Some(r) = self.shadowed_select_rewrite(b) {
+                return Some(r);
+            }
+            let r = self.shadowed_member_rewrite(b)?;
+            if let ExprKind::MemberAccess { member, .. } = &r.kind
+                && let Some((cls, m)) = member.name.split_once("::")
+                && let Some(cd) = self.module.classes.get(cls)
+                && (cd.array_properties.contains_key(m)
+                    || cd.array_nd_properties.contains_key(m)
+                    || cd.queue_properties.contains_key(m)
+                    || cd.assoc_properties.contains_key(m))
+            {
+                return None;
+            }
+            Some(r)
+        };
+        let kind = match &e.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => ExprKind::RangeSelect {
+                expr: Box::new(base_of(expr)?),
+                kind: kind.clone(),
+                left: left.clone(),
+                right: right.clone(),
+            },
+            ExprKind::Index { expr, index } => ExprKind::Index {
+                expr: Box::new(base_of(expr)?),
+                index: index.clone(),
+            },
+            _ => return None,
+        };
+        Some(Expression::new(kind, e.span))
     }
 
     pub(super) fn super_as_this(e: &Expression) -> Option<Expression> {
@@ -1012,8 +1361,8 @@ impl Simulator {
             {
                 let mut nh = h.clone();
                 nh.path[0].name.name = "this".to_string();
-                nh.cached_signal_id = std::cell::Cell::new(None);
-                nh.cached_resolved_name = std::cell::OnceCell::new();
+                nh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                nh.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Some(Expression::new(ExprKind::Ident(nh), e.span))
             }
             // Inside a method body the same text is a MemberAccess chain.
@@ -1042,8 +1391,26 @@ impl Simulator {
         // this, `super.p` resolved to no handle and flattened to a phantom
         // name: reads returned 0 and writes vanished with no diagnostic, even
         // for a uniquely-named inherited property.
-        if name == "super" {
+        // `this` needs the same rung for the FLAT identifier form: a dotted
+        // lvalue frozen by the NBA scheduler (`super.bp <= v` normalizes to
+        // `Ident([super, bp])`, then `super_rewrite`/`super_as_this` rewrites
+        // it to `Ident([this, bp])`) reaches the §4c class-property write
+        // with the head spelled as a plain `this` segment. `ExprKind::This`
+        // is special-cased on the read path, but a bare `Ident([this])` is
+        // not, so the head evaluated to 0 and the scheduled write vanished.
+        // `this` is a reserved keyword: no local, signal or static can be
+        // named `this`, so short-circuiting to the active handle is exact.
+        if name == "super" || name == "this" {
             return self.this_stack.last().copied().flatten();
+        }
+        // §13.5.2: an aliased `ref` formal is the caller's storage NOW; the
+        // frame keeps the call-time copy (a method receiver `mb.num()` on a
+        // handle constructed after the call read null from it).
+        if self.ref_redirect_possible()
+            && let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name))
+            && let Some(v) = self.ref_alias_peek(storage)
+        {
+            return v.to_u64().map(|h| h as usize);
         }
         if let Some(locals) = self.local_stack.last() {
             if let Some(v) = locals.get(name) {
@@ -1080,7 +1447,15 @@ impl Simulator {
         if !is_static_prop {
             if let Some(Some(handle)) = self.this_stack.last() {
                 if let Some(Some(inst)) = self.heap.get(*handle) {
-                    if let Some(v) = inst.properties.get(name) {
+                    // §8.14: a property a derived class redeclares names the
+                    // copy the executing method's class sees.
+                    let shadowed = if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(name)
+                    {
+                        self.shadowed_prop_key(name, false)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = inst.properties.get(shadowed.as_deref().unwrap_or(name)) {
                         return v.to_u64().map(|h| h as usize);
                     }
                 }

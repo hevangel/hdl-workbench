@@ -4,6 +4,20 @@ use super::*;
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+fn trace_array_storage(name: &str, cells: usize, width: u32) -> xezim_core::oom_trace::Scope {
+    let scope = xezim_core::oom_trace::scope("array storage", "", "", name);
+    xezim_core::oom_trace::checkpoint(
+        "allocate array",
+        &[("cells", cells), ("element_bits", width as usize)],
+    );
+    scope
+}
+
+/// Scopes `materialize_implicit_contassign_nets` walked while placing
+/// implicit nets, for the profile (`[PROF] implicit_net_scope_steps`).
+pub(super) static IMPLICIT_NET_SCOPE_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
     /// property entries, and the heap bytes of their names.
@@ -336,6 +350,11 @@ impl Simulator {
                 data_type: DataType::TypeReference { name: tn, .. },
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type: DataType::TypeReference { name: tn, .. },
+                declarators,
+                ..
             } = &st.kind
                 && declarators.iter().any(|d| d.dimensions.is_empty())
             {
@@ -461,14 +480,11 @@ impl Simulator {
                     continue;
                 }
                 for member in &su.members {
-                    let ew = super::elaborate::packed_inner_elem_width(
+                    let (ew, fdims) = super::elaborate::packed_member_meta(
                         &member.data_type,
                         &module.parameters,
                         &module.typedefs,
-                    );
-                    let fdims = super::elaborate::packed_full_dims_of(
-                        &member.data_type,
-                        &module.parameters,
+                        &module.typedef_types,
                     );
                     for mdecl in &member.declarators {
                         let key = format!("{}.{}", prefix, mdecl.name.name);
@@ -517,10 +533,24 @@ impl Simulator {
                 *owners.entry(base).or_default() += 1;
             }
         }
+        let package_arrays: HashSet<&str> = module
+            .pkg_var_decls
+            .keys()
+            .filter_map(|key| {
+                (module.arrays.contains_key(key)
+                    || module.arrays_2d.contains_key(key)
+                    || module.arrays_nd.contains_key(key)
+                    || module.dynamic_arrays.contains(key)
+                    || module.associative_arrays.contains_key(key))
+                .then(|| key.split_once("::").map(|(_, leaf)| leaf))
+                .flatten()
+            })
+            .collect();
         let contested: HashSet<String> = owners
             .into_iter()
             .filter(|(base, n)| {
                 *n >= 2
+                    || package_arrays.contains(*base)
                     || module.wildcard_shadowed.contains(*base)
                     || module.foreign_displaced.contains(*base)
                     // A package first hoisted after the local declaration
@@ -576,8 +606,10 @@ impl Simulator {
         for k in keys {
             if let Some(sig) = module.pkg_var_decls.get(&k).cloned() {
                 let (_, base) = k.split_once("::").unwrap();
-                if let Some(ty) = module.var_decl_types.get(base).cloned() {
-                    module.var_decl_types.entry(k.clone()).or_insert(ty);
+                if let Some(ty) = module.var_decl_types.get_shared(base).cloned() {
+                    if !module.var_decl_types.contains_key(&k) {
+                        module.var_decl_types.insert_shared(k.clone(), ty);
+                    }
                 }
                 if module.string_signals.contains(base) {
                     module.string_signals.insert(k.clone());
@@ -608,8 +640,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: lvalue.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         lvalue.span,
                     );
@@ -623,7 +656,10 @@ impl Simulator {
         use crate::ast::types::{SimpleType, UnpackedDimension as UD};
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
         classes.sort();
-        let params = module.parameters.clone();
+        // Borrow the live parameter table (only read for const bounds here);
+        // the sole writer in this function is `module.classes`, a disjoint
+        // field, so no copy is needed.
+        let params = &module.parameters;
         for cn in classes {
             let Some(cd) = module.classes.get(&cn) else {
                 continue;
@@ -675,7 +711,7 @@ impl Simulator {
                         // (see `static_fixed_arrays` in elaborate.rs).
                         Some(UD::Expression { expr, .. }) => {
                             if let Some(n) =
-                                super::elaborate::const_eval_i64_with_params(expr, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(expr, Some(params))
                             {
                                 if n > 0 {
                                     cd.static_fixed_arrays.push((pname, 0, n - 1, w));
@@ -684,8 +720,8 @@ impl Simulator {
                         }
                         Some(UD::Range { left, right, .. }) => {
                             if let (Some(l), Some(r)) = (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 cd.static_fixed_arrays.push((pname, l.min(r), l.max(r), w));
                             }
@@ -701,8 +737,8 @@ impl Simulator {
                         .iter()
                         .map(|dm| match dm {
                             UD::Range { left, right, .. } => match (
-                                super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                                super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                                super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                                super::elaborate::const_eval_i64_with_params(right, Some(params)),
                             ) {
                                 (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
                                 _ => None,
@@ -710,7 +746,7 @@ impl Simulator {
                             UD::Expression { expr, .. } => {
                                 match super::elaborate::const_eval_i64_with_params(
                                     expr,
-                                    Some(&params),
+                                    Some(params),
                                 ) {
                                     Some(n) if n > 0 => Some((0, n - 1)),
                                     _ => None,
@@ -744,7 +780,7 @@ impl Simulator {
                         let cap = max_size
                             .as_ref()
                             .and_then(|e| {
-                                super::elaborate::const_eval_i64_with_params(e, Some(&params))
+                                super::elaborate::const_eval_i64_with_params(e, Some(params))
                             })
                             .map(|n| (n + 1).max(1) as u32);
                         cd.queue_properties.insert(pname, (w, cap));
@@ -753,7 +789,7 @@ impl Simulator {
                         cd.queue_properties.insert(pname, (w, None));
                     }
                     Some(UD::Expression { expr, .. }) => {
-                        match super::elaborate::const_eval_i64_with_params(expr, Some(&params)) {
+                        match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
                             Some(n) if n > 0 => {
                                 cd.array_properties.insert(pname, (0, n - 1, w));
                             }
@@ -764,8 +800,8 @@ impl Simulator {
                     }
                     Some(UD::Range { left, right, .. }) => {
                         if let (Some(l), Some(r)) = (
-                            super::elaborate::const_eval_i64_with_params(left, Some(&params)),
-                            super::elaborate::const_eval_i64_with_params(right, Some(&params)),
+                            super::elaborate::const_eval_i64_with_params(left, Some(params)),
+                            super::elaborate::const_eval_i64_with_params(right, Some(params)),
                         ) {
                             cd.array_properties.insert(pname, (l.min(r), l.max(r), w));
                         }
@@ -784,24 +820,25 @@ impl Simulator {
         match &e.kind {
             ExprKind::Number(NumberLiteral::Integer {
                 size,
+                signed,
                 base,
                 value,
                 cached_val,
                 ..
             }) => {
-                let w = size.unwrap_or(32);
-                if let Some((vb, xz, cw)) = cached_val.get() {
-                    if cw == w {
-                        return Value::from_inline(vb, xz, w).to_u64();
-                    }
-                }
                 let r = match base {
                     NumberBase::Binary => 2,
                     NumberBase::Octal => 8,
                     NumberBase::Hex => 16,
                     NumberBase::Decimal => 10,
                 };
-                Value::from_str_radix(value, r, w).to_u64()
+                let w = size.unwrap_or_else(|| Value::unsized_integer_width(value, r, *signed));
+                if let Some((vb, xz, cw)) = cached_val.get() {
+                    if cw == w {
+                        return Value::from_inline(vb, xz, w).to_u64();
+                    }
+                }
+                Value::from_literal_text(value, r, w).to_u64()
             }
             ExprKind::Paren(inner) => Self::const_expr_u64(inner, params),
             ExprKind::Ident(h) => params
@@ -878,24 +915,32 @@ impl Simulator {
 
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
-            existing: &HashSet<&str>,
             parents_by_leaf: &HashMap<&str, Vec<&str>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
+            // A parent's score is the number of leaves it declares. A leaf
+            // has no `.`, so `parent.leaf` exists exactly when `parent` is
+            // in that leaf's list: count the lists instead of formatting
+            // and looking up every (parent, leaf) pair.
+            let mut scores: HashMap<&str, usize> = HashMap::default();
+            let mut steps = 0u64;
+            for leaf in leaves {
+                if let Some(parents) = parents_by_leaf.get(leaf.as_str()) {
+                    steps += parents.len() as u64;
+                    for &parent in parents {
+                        *scores.entry(parent).or_default() += 1;
+                    }
+                }
+            }
+            IMPLICIT_NET_SCOPE_STEPS.fetch_add(steps, std::sync::atomic::Ordering::Relaxed);
             for leaf in leaves {
                 let Some(parents) = parents_by_leaf.get(leaf.as_str()) else {
                     continue;
                 };
                 for parent in parents {
-                    let mut score = 0usize;
-                    for candidate_leaf in leaves {
-                        let candidate = format!("{}.{}", parent, candidate_leaf);
-                        if existing.contains(candidate.as_str()) {
-                            score += 1;
-                        }
-                    }
+                    let score = scores.get(parent).copied().unwrap_or(0);
                     let depth = parent.split('.').count();
                     if score > best_score
                         || (score == best_score && depth > best_depth)
@@ -953,6 +998,7 @@ impl Simulator {
         }
 
         let mut to_create: HashSet<String> = HashSet::default();
+        let mut best_scopes: HashMap<Vec<String>, Option<String>> = HashMap::default();
         for ca in &module.continuous_assigns {
             let mut leaves = HashSet::default();
             let mut reads = HashSet::default();
@@ -969,6 +1015,16 @@ impl Simulator {
             if leaves.is_empty() {
                 continue;
             }
+            // The scope only places a leaf that is not declared yet: with
+            // every leaf declared there is nothing to create.
+            let mut missing = leaves
+                .iter()
+                .filter(|leaf| !existing.contains(leaf.as_str()));
+            let lone_missing = match (missing.next(), missing.next()) {
+                (None, _) => continue,
+                (Some(leaf), None) => Some(leaf.as_str()),
+                _ => None,
+            };
             let lhs_raw = ident_raw(&ca.lhs);
             let rhs_raw = ident_raw(&ca.rhs);
             let lhs_leaf = ident_leaf(&ca.lhs);
@@ -978,8 +1034,34 @@ impl Simulator {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
             } else if lhs_leaf.is_some() && rhs_leaf.is_none() {
                 rhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
+            } else if lone_missing.is_some_and(|lone| {
+                leaves.iter().all(|leaf| {
+                    leaf.as_str() == lone
+                        || parents_by_leaf
+                            .get(leaf.as_str())
+                            .is_none_or(|p| p.is_empty())
+                })
+            }) {
+                // The search picks a scope among those declaring one of the
+                // leaves. When the one undeclared leaf (an unpacked array's
+                // name has no signal of its own) is also the only one other
+                // scopes declare, whichever scope wins declares it and
+                // nothing is created. The search walks every such scope,
+                // once per assign: it was quadratic in the instance count
+                // for an array element connected to a like-named port of
+                // each instance.
+                None
             } else {
-                best_scope_for_leaves(&leaves, &existing, &parents_by_leaf)
+                // The same leaves in the same order give the same scope.
+                let key: Vec<String> = leaves.iter().cloned().collect();
+                match best_scopes.get(&key) {
+                    Some(scope) => scope.clone(),
+                    None => {
+                        let scope = best_scope_for_leaves(&leaves, &parents_by_leaf);
+                        best_scopes.insert(key, scope.clone());
+                        scope
+                    }
+                }
             };
 
             let Some(scope) = scope else {
@@ -1002,7 +1084,7 @@ impl Simulator {
             module.signals.insert(
                 name.clone(),
                 Signal {
-                    name,
+                    name: name.into(),
                     width: 1,
                     is_signed: false,
                     is_real: false,
@@ -1106,6 +1188,71 @@ impl Simulator {
                 }
             }
         }
+        // The packed-struct vector a member term names, and the member's bit
+        // offset and width in it: `a.clk` with `a` a packed struct (directly,
+        // or under the block's instance scope), or a nested member path.
+        // None for anything else, a name that is a signal of its own included.
+        fn packed_member(
+            module: &ElaboratedModule,
+            e: &Expression,
+            scope: &str,
+        ) -> Option<(String, i64, u32)> {
+            let mut e = e;
+            while let ExprKind::Paren(inner) = &e.kind {
+                e = inner;
+            }
+            let ExprKind::Ident(h) = &e.kind else {
+                return None;
+            };
+            if h.path.len() < 2 || h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let full = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            let mut spellings: Vec<String> = if scope.is_empty() || h.root.is_some() {
+                vec![full]
+            } else {
+                vec![format!("{}.{}", scope, full), full]
+            };
+            // §23.6: `top.a.clk` names the top module's `a`, stored as `a`.
+            if let Some(rest) = spellings
+                .last()
+                .and_then(|f| f.strip_prefix(module.name.as_str()))
+                .and_then(|r| r.strip_prefix('.'))
+            {
+                spellings.push(rest.to_string());
+            }
+            for name in &spellings {
+                // A nearer standalone signal shadows a packed member of the same
+                // spelling in an outer scope. Its event already has its own signal.
+                if module.signals.contains_key(name.as_str()) {
+                    return None;
+                }
+                let mut cut = name.len();
+                while let Some(pos) = name[..cut].rfind('.') {
+                    let (base, field) = (&name[..pos], &name[pos + 1..]);
+                    if module.signals.contains_key(base) {
+                        // A signal that is no packed structure with this
+                        // member leaves the next spelling to try.
+                        if let Some((_, off, w)) = module
+                            .packed_struct_fields
+                            .get(base)
+                            .and_then(|fields| fields.iter().find(|(m, _, _)| m == field))
+                            .filter(|(_, _, w)| *w > 0)
+                        {
+                            return Some((base.to_string(), *off as i64, *w));
+                        }
+                        break;
+                    }
+                    cut = pos;
+                }
+            }
+            None
+        }
         let mk_ident = |name: &str, span: crate::ast::Span| -> Expression {
             Expression::new(
                 ExprKind::Ident(HierarchicalIdentifier {
@@ -1118,8 +1265,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 span,
             )
@@ -1130,7 +1278,7 @@ impl Simulator {
         let mut repl_cache: HashMap<String, Vec<(i64, i64)>> = HashMap::default();
         let mut writer_index: Option<edgesel_writers::WriterIndex> = None;
         let mut new_assigns: Vec<super::elaborate::ContinuousAssignment> = Vec::new();
-        let mut new_signals: Vec<String> = Vec::new();
+        let mut new_signals: Vec<(String, u32)> = Vec::new();
         let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
         // #7 keeps child always blocks PENDING (un-rewritten) until
         // classification — but the select-on-port shape this pass fixes is
@@ -1158,6 +1306,16 @@ impl Simulator {
             }
             deferred.push(DeferredAlways::Eager(Self::materialize_pending_always(p)));
         }
+        // A design may declare a signal with the internal alias spelling.
+        // Allocate a distinct name for every newly watched packed range.
+        let mut next_edge_alias = 0usize;
+        let mut allocate_edge_alias = || loop {
+            let name = format!("__xz_edgesel{next_edge_alias}");
+            next_edge_alias += 1;
+            if !module.signals.contains_key(name.as_str()) {
+                break name;
+            }
+        };
         let params = &module.parameters;
         let headers = always
             .iter_mut()
@@ -1179,33 +1337,108 @@ impl Simulator {
                 }
             }));
         for (stmt, scope, mut patched) in headers {
-            let StatementKind::TimingControl {
-                control: TimingControl::Event(EventControl::EventExpr(exprs)),
-                ..
-            } = &mut stmt.kind
-            else {
-                if dbg {
-                    eprintln!(
-                        "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        scope,
-                        std::mem::discriminant(&stmt.kind)
-                    );
+            let discriminant = std::mem::discriminant(&stmt.kind);
+            // `always begin @(...); ... end` starts with its event control
+            // too (`extract_sensitivity`); only the member rewrite below
+            // applies to that shape.
+            let (exprs, wrapped) = match &mut stmt.kind {
+                StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } => (exprs, false),
+                StatementKind::SeqBlock { stmts, .. } => {
+                    match stmts.first_mut().map(|s| &mut s.kind) {
+                        Some(StatementKind::TimingControl {
+                            control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                            ..
+                        }) => (exprs, true),
+                        _ => continue,
+                    }
                 }
-                continue;
+                _ => {
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
+                            scope, discriminant
+                        );
+                    }
+                    continue;
+                }
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
                 // Port substitution leaves `@(dq[3])` as a select of the
                 // connection (`bus[15:8][3]`); spell such a term as the net
                 // bit it reads first (see `event_bits`).
-                if let Some(f) =
-                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                if !wrapped
+                    && let Some(f) =
+                        event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
                 {
                     ee.expr = f;
                     if let Some(p) = patched.as_mut() {
                         p.push(term);
                     }
                 }
-                if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
+                // §7.2.1, §9.4.2: a term on a member of a packed struct
+                // (`@(posedge a.clk)`, also what `.clk(a.clk)` substitutes into
+                // a child's `@(posedge clk)`) is an event on that member: an
+                // edge on its LSB, a change of its bits. The struct is one
+                // vector, so the base-name fallback watched the vector's LSB,
+                // another member, and woke on every member's change. Watch an
+                // alias net driven by the member's bits instead.
+                if let Some((vector, off, width)) = packed_member(module, &ee.expr, &scope) {
+                    let span = ee.expr.span;
+                    let canon = format!("{}|member {}+{}", vector, off, width);
+                    let alias = aliases.entry(canon).or_insert_with(|| {
+                        let lit = |v: i64| {
+                            Box::new(Expression::new(
+                                ExprKind::Number(NumberLiteral::Integer {
+                                    size: None,
+                                    signed: false,
+                                    base: NumberBase::Decimal,
+                                    value: v.to_string(),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                                }),
+                                span,
+                            ))
+                        };
+                        let rhs = Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(mk_ident(&vector, span)),
+                                kind: RangeKind::Constant,
+                                left: lit(off + width as i64 - 1),
+                                right: lit(off),
+                            },
+                            span,
+                        );
+                        let alias = allocate_edge_alias();
+                        new_signals.push((alias.clone(), width));
+                        new_assigns.push(super::elaborate::ContinuousAssignment {
+                            gate_delay_fall: None,
+                            delay_select: None,
+                            origin: None,
+                            lhs: mk_ident(&alias, span),
+                            rhs,
+                            delay_exprs: None,
+                            delay: 0,
+                            rhs_parent_scoped: false,
+                            delay_fall: None,
+                            delay_off: None,
+                        });
+                        alias
+                    });
+                    if dbg {
+                        eprintln!(
+                            "[EDGESEL] scope='{}' member {}[{}+:{}] -> {}",
+                            scope, vector, off, width, alias
+                        );
+                    }
+                    ee.expr = mk_ident(alias, span);
+                    if let Some(p) = patched.as_mut() {
+                        p.push(term);
+                    }
+                    continue;
+                }
+                if wrapped || !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
@@ -1329,7 +1562,7 @@ impl Simulator {
                                     signed: false,
                                     base: NumberBase::Decimal,
                                     value: ix.to_string(),
-                                    cached_val: std::cell::Cell::new(None),
+                                    cached_val: crate::ast::cache::LiteralCache::new(None),
                                 }),
                                 span,
                             )),
@@ -1338,9 +1571,12 @@ impl Simulator {
                     );
                 }
                 let alias = aliases.entry(canon).or_insert_with(|| {
-                    let alias = format!("__xz_edgesel{}", new_signals.len());
-                    new_signals.push(alias.clone());
+                    let alias = allocate_edge_alias();
+                    new_signals.push((alias.clone(), 1));
                     new_assigns.push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
+                        gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&alias, span),
                         rhs,
@@ -1363,17 +1599,17 @@ impl Simulator {
                 }
             }
         }
-        for name in new_signals {
+        for (name, width) in new_signals {
             module.signals.insert(
                 name.clone(),
                 Signal {
-                    name,
-                    width: 1,
+                    name: name.into(),
+                    width,
                     is_signed: false,
                     is_real: false,
                     is_const: false,
                     direction: None,
-                    value: Value::new(1),
+                    value: Value::new(width),
                     type_name: None,
                 },
             );
@@ -1522,7 +1758,8 @@ impl Simulator {
         }
         for &i in index.pend.get(vleaf).unwrap_or(&none) {
             let p = &module.pending_cont_assign[i];
-            let src = &*p.lhs_source;
+            let lhs_source = p.source_lhs();
+            let src = &*lhs_source;
             let may_name_v = |e: &Expression| -> bool {
                 base_ident(e).is_some_and(|b| {
                     leaf(&b) == vleaf
@@ -1548,7 +1785,7 @@ impl Simulator {
                     &p.ctx.interface_map,
                 )
             };
-            let lhs = rw(src);
+            let lhs = p.materialize_lhs();
             let rhs = matches!(p.rhs_source.kind, ExprKind::Replication { .. })
                 .then(|| rw(&p.rhs_source));
             classify(&lhs, rhs.as_ref());
@@ -1650,7 +1887,11 @@ impl Simulator {
     }
 
     pub fn new(mut module: ElaboratedModule, max_time: u64) -> Self {
+        let _oom_scope = xezim_core::oom_trace::scope("construct simulator", "", &module.name, "");
         let phase_total = crate::time::Instant::now();
+        let checkpoint_requested =
+            checkpoint::command_line_requested() || checkpoint_calls::in_design(&module);
+        let share_task_frames = !checkpoint_requested;
         // The simulator counts ticks of `module.tick_s` (the finest timescale
         // precision; 1 ns by default). Delays were pre-scaled to ticks at
         // elaboration. `max_time` is supplied in nanoseconds, so convert it to
@@ -1687,19 +1928,87 @@ impl Simulator {
         // targets). Eliminating the bulk-populate saves ~150–250 MB on
         // c910-scale designs (585K signals × 2 stores × name + Value
         // duplication).
-        let signals = SignalMap {
-            map: HashMap::default(),
-            elems: HashMap::default(),
-            elem_gens: HashMap::default(),
-            elem_gen_counter: 0,
-        };
-        let widths: HashMap<String, u32> = HashMap::default();
+        let signals = SignalMap::new();
+        let widths = SignalWidths::default();
         let signed_signals: HashSet<String> = HashSet::default();
         let real_signals: HashSet<String> = HashSet::default();
 
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
         event_bits::complete_ascending_ranges(&mut module);
+        // §26.3: the runtime bare-name resolver may qualify an in-scope
+        // reference to a package parameter/variable as `pkg::name`, while
+        // packed geometry is registered under the bare name and the dot
+        // spelling the bytecode compiler uses (`pkg.name`). Mirror the
+        // geometry onto the `pkg::name` key so `pkg::Q[i]` reads slice an
+        // ELEMENT instead of degenerating to a flat bit-select
+        // (`packed_package_parameter_element`). Only for keys backed by a
+        // `::`-qualified parameter, so module-scoped dotted signals are
+        // untouched.
+        {
+            let colon_keys: Vec<String> = module
+                .parameters
+                .keys()
+                .filter(|k| k.contains("::"))
+                .map(|k| k.replace("::", "."))
+                .collect();
+            for dotted in colon_keys {
+                if let Some(&ew) = module.packed_signal_elem_widths.get(&dotted).or_else(|| {
+                    dotted
+                        .rfind('.')
+                        .and_then(|i| module.packed_signal_elem_widths.get(&dotted[i + 1..]))
+                }) {
+                    let colon = dotted.replace('.', "::");
+                    module.packed_signal_elem_widths.insert(colon, ew);
+                }
+                // The full multi-dim bounds must match the ELEM WIDTH source,
+                // so resolve the same (exact-then-bare) way.
+                if let Some(fd) = module
+                    .packed_full_dims
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.packed_full_dims.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module.packed_full_dims.insert(dotted.replace('.', "::"), fd);
+                }
+                // `var_decl_types` is consulted alongside geometry for struct
+                // members; mirror it the same way.
+                if let Some(dt) = module
+                    .var_decl_types
+                    .get(&dotted)
+                    .or_else(|| {
+                        dotted
+                            .rfind('.')
+                            .and_then(|i| module.var_decl_types.get(&dotted[i + 1..]))
+                    })
+                    .cloned()
+                {
+                    module
+                        .var_decl_types
+                        .insert(dotted.replace('.', "::"), dt);
+                }
+            }
+        }
+        // §7.8: the packed type of an associative array describes its
+        // ELEMENTS; the array's name is never a packed vector itself. These
+        // two maps make the name read and write as one (`p[1]` of
+        // `logic [3:0][7:0] p [int]` as packed element 1, `u[1]` of
+        // `logic [0:7] u [int]` as bit 1), ahead of the associative paths.
+        // `packed_full_dims` stays: the associative paths use it for selects
+        // into an element.
+        {
+            let assoc = &module.associative_arrays;
+            module
+                .ascending_packed
+                .retain(|n, _| !assoc.contains_key(n));
+            module
+                .packed_signal_elem_widths
+                .retain(|n, _| !assoc.contains_key(n));
+        }
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.
@@ -1808,18 +2117,42 @@ impl Simulator {
                 let pkgs: std::collections::HashSet<String> =
                     module.packages.iter().cloned().collect();
                 let flat = |items: &[Statement]| -> Vec<Statement> {
-                    items
-                        .iter()
-                        .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
-                        .collect()
+                    crate::ast::cache::without_scope_caches(|| {
+                        items
+                            .iter()
+                            .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                            .collect()
+                    })
                 };
-                for td in module.tasks.values_mut() {
-                    td.items = flat(&td.items);
+                let mut flat_cache: HashMap<usize, crate::ast::shared_vec::SharedVec<Statement>> =
+                    HashMap::default();
+                for (key, td) in module.tasks.iter_mut() {
+                    if module.deferred_task_bodies.contains_key(key) {
+                        continue;
+                    }
+                    let ptr = std::sync::Arc::as_ptr(td.items.as_arc()) as usize;
+                    td.items = flat_cache
+                        .entry(ptr)
+                        .or_insert_with(|| flat(&td.items).into())
+                        .clone();
                 }
                 let fnames: Vec<String> = module.functions.keys().cloned().collect();
                 for n in fnames {
+                    if module.deferred_function_bodies.contains_key(&n) {
+                        continue;
+                    }
+                    let Some(ptr) = module
+                        .functions
+                        .get(&n)
+                        .map(|fd| std::sync::Arc::as_ptr(fd.items.as_arc()) as usize)
+                    else {
+                        continue;
+                    };
                     if let Some(mut fd) = module.functions.remove(&n) {
-                        fd.items = flat(&fd.items);
+                        fd.items = flat_cache
+                            .entry(ptr)
+                            .or_insert_with(|| flat(&fd.items).into())
+                            .clone();
                         module.functions.insert(n, fd);
                     }
                 }
@@ -1892,101 +2225,166 @@ impl Simulator {
                     );
                 }
                 drop(bodies);
-                let wrap = |items: &[Statement], span| Statement {
-                    kind: StatementKind::SeqBlock {
-                        name: None,
-                        stmts: items.to_vec(),
-                    },
-                    span,
+                fn body_has_typeref_decl(items: &[Statement]) -> bool {
+                    items.iter().any(|st| match &st.kind {
+                        StatementKind::VarDecl { data_type, .. } => {
+                            matches!(data_type, DataType::TypeReference { .. })
+                        }
+                        StatementKind::SeqBlock { stmts, .. }
+                        | StatementKind::ParBlock { stmts, .. } => body_has_typeref_decl(stmts),
+                        StatementKind::If {
+                            then_stmt,
+                            else_stmt,
+                            ..
+                        } => {
+                            body_has_typeref_decl(std::slice::from_ref(then_stmt.as_ref()))
+                                || else_stmt
+                                    .as_deref()
+                                    .is_some_and(|e| body_has_typeref_decl(std::slice::from_ref(e)))
+                        }
+                        StatementKind::Case { items, .. } => items
+                            .iter()
+                            .any(|it| body_has_typeref_decl(std::slice::from_ref(&it.stmt))),
+                        StatementKind::For { body, .. }
+                        | StatementKind::While { body, .. }
+                        | StatementKind::DoWhile { body, .. }
+                        | StatementKind::Repeat { body, .. }
+                        | StatementKind::Forever { body }
+                        | StatementKind::Foreach { body, .. }
+                        | StatementKind::TimingControl { stmt: body, .. }
+                        | StatementKind::Wait { stmt: body, .. } => {
+                            body_has_typeref_decl(std::slice::from_ref(body.as_ref()))
+                        }
+                        _ => false,
+                    })
+                }
+                let wrap = |items: &[Statement], span| {
+                    crate::ast::cache::without_scope_caches(|| Statement {
+                        kind: StatementKind::SeqBlock {
+                            name: None,
+                            stmts: items.to_vec().into(),
+                        },
+                        span,
+                    })
                 };
                 // §6.21: the variables of a static task or function keep
                 // their values between calls.
                 // (A class method, here when defined out of its class, is
                 // automatic, §8.6.)
-                for td in module.tasks.values_mut() {
-                    if td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
-                        && td.name.scopes.is_empty()
-                    {
-                        Self::mark_static_locals(&mut td.items);
+                let mut static_mark_cache: HashMap<usize, (bool, bool)> = HashMap::default();
+                let mut needs_static_mark =
+                    |items: &crate::ast::shared_vec::SharedVec<Statement>,
+                     dctx: Option<&std::rc::Rc<super::elaborate::CallableRewriteCtx>>|
+                     -> bool {
+                        let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                        let (mark, has_typeref) =
+                            *static_mark_cache.entry(ptr).or_insert_with(|| {
+                                (
+                                    Self::static_locals_to_mark(items),
+                                    body_has_typeref_decl(items),
+                                )
+                            });
+                        mark || (has_typeref && dctx.is_some_and(|c| !c.ctx.type_binds.is_empty()))
+                    };
+                let tkeys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(k, td)| {
+                        td.lifetime != Some(crate::ast::types::Lifetime::Automatic)
+                            && td.name.scopes.is_empty()
+                            && needs_static_mark(&td.items, module.deferred_task_bodies.get(*k))
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in tkeys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut td.items)
+                        });
                     }
                 }
                 let fkeys: Vec<String> = module
                     .functions
                     .iter()
-                    .filter(|(_, fd)| {
+                    .filter(|(k, fd)| {
                         fd.lifetime != Some(crate::ast::types::Lifetime::Automatic)
                             && fd.name.scopes.is_empty()
-                            && Self::static_locals_to_mark(&fd.items)
+                            && needs_static_mark(&fd.items, module.deferred_function_bodies.get(*k))
                     })
                     .map(|(k, _)| k.clone())
                     .collect();
                 for key in fkeys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
                     if let Some(fd) = module.functions.get(&key) {
                         let mut fd = fd.clone();
-                        Self::mark_static_locals(&mut fd.items);
+                        crate::ast::cache::without_scope_caches(|| {
+                            Self::mark_static_locals(&mut fd.items)
+                        });
                         module.functions.insert(key, fd);
                     }
                 }
-                let mut tdone = Vec::new();
-                for (key, td) in module.tasks.iter() {
-                    if !td
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&td.items, td.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        tdone.push((key.clone(), st));
-                    }
-                }
-                let mut fdone = Vec::new();
-                for (key, fd) in module.functions.iter() {
-                    if !fd
-                        .items
-                        .iter()
-                        .any(|s| Self::shadow_rename_possible(s, &claims))
-                    {
-                        continue;
-                    }
-                    let mut st = wrap(&fd.items, fd.span);
-                    if Self::rename_nested_shadowed(
-                        &mut st,
-                        &claims,
-                        &mut Vec::new(),
-                        &mut n,
-                        "b",
-                        1,
-                        key,
-                        &mut Vec::new(),
-                    ) {
-                        fdone.push((key.clone(), st));
+                let mut shadow_cache: HashMap<usize, bool> = HashMap::default();
+                let mut needs_shadow = |items: &crate::ast::shared_vec::SharedVec<Statement>| -> bool {
+                    let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+                    *shadow_cache.entry(ptr).or_insert_with(|| {
+                        items.iter().any(|s| Self::shadow_rename_possible(s, &claims))
+                    })
+                };
+                let t_shadow_keys: Vec<String> = module
+                    .tasks
+                    .iter()
+                    .filter(|(_, td)| needs_shadow(&td.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in t_shadow_keys {
+                    Self::materialize_task_fields(&mut module.tasks, &mut module.deferred_task_bodies, &module.packages, &key);
+                    if let Some(td) = module.tasks.get_mut(&key) {
+                        let mut st = wrap(&td.items, td.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            td.items = stmts.into();
+                        }
                     }
                 }
-                for (key, st) in tdone {
-                    if let (Some(td), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.tasks.get_mut(&key), st.kind)
-                    {
-                        td.items = stmts;
-                    }
-                }
-                for (key, st) in fdone {
-                    if let (Some(fd), StatementKind::SeqBlock { stmts, .. }) =
-                        (module.functions.get(&key), st.kind)
-                    {
-                        let mut fd = fd.clone();
-                        fd.items = stmts;
-                        module.functions.insert(key, fd);
+                let f_shadow_keys: Vec<String> = module
+                    .functions
+                    .iter()
+                    .filter(|(_, fd)| needs_shadow(&fd.items))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in f_shadow_keys {
+                    Self::materialize_fn_fields(&mut module.functions, &mut module.deferred_function_bodies, &module.packages, &key);
+                    if let Some(fd) = module.functions.get(&key) {
+                        let mut st = wrap(&fd.items, fd.span);
+                        let changed = crate::ast::cache::without_scope_caches(|| {
+                            Self::rename_nested_shadowed(
+                                &mut st,
+                                &claims,
+                                &mut Vec::new(),
+                                &mut n,
+                                "b",
+                                1,
+                                &key,
+                                &mut Vec::new(),
+                            )
+                        });
+                        if changed && let StatementKind::SeqBlock { stmts, .. } = st.kind {
+                            let mut fd = fd.clone();
+                            fd.items = stmts.into();
+                            module.functions.insert(key, fd);
+                        }
                     }
                 }
             }
@@ -2111,8 +2509,9 @@ impl Simulator {
                             selects: Vec::new(),
                         }],
                         span,
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
+                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                        bound: crate::ast::binding::Bound::UNSET,
                     }),
                     span,
                 )
@@ -2259,7 +2658,7 @@ impl Simulator {
                     .signals
                     .entry(nm.clone())
                     .or_insert_with(|| super::elaborate::Signal {
-                        name: nm.clone(),
+                        name: nm.clone().into(),
                         width: 1,
                         is_signed: false,
                         is_real: false,
@@ -2271,6 +2670,9 @@ impl Simulator {
                 module
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
+                        delay_exprs: None,
+                        gate_delay_fall: None,
+                        delay_select: None,
                         origin: None,
                         lhs: mk_ident(&nm, rhs.span),
                         rhs,
@@ -2365,7 +2767,7 @@ impl Simulator {
                     .signals
                     .entry(sz_name.clone())
                     .or_insert_with(|| super::elaborate::Signal {
-                        name: sz_name,
+                        name: sz_name.into(),
                         width: 32,
                         is_signed: false,
                         is_real: false,
@@ -2512,6 +2914,7 @@ impl Simulator {
         let mut signal_widths_vec: Vec<u32> = Vec::with_capacity(n);
         let mut signal_signed_vec: Vec<bool> = Vec::with_capacity(n);
         let mut signal_real_vec: Vec<bool> = Vec::with_capacity(n);
+        let mut shortreal_signals = HashSet::default();
         let mut signal_type_names: HashMap<usize, String> = HashMap::default();
         let phase_static = crate::time::Instant::now();
         // Drain `names` so each String moves into the Arc allocation
@@ -2549,6 +2952,18 @@ impl Simulator {
                 }
                 if sig.is_real {
                     val.is_real = true;
+                    let declared = module.var_decl_types.get(name).or_else(|| {
+                        sig.type_name.as_ref().and_then(|ty| module.typedef_types.get(ty))
+                    });
+                    if sig.type_name.as_deref() == Some("shortreal")
+                        || declared.is_some_and(|dt| matches!(
+                            super::elaborate::resolve_typedef_chain(dt, &module.typedef_types),
+                            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. }
+                        ))
+                    {
+                        shortreal_signals.insert(id);
+                        val = Value::from_f64(val.to_f64() as f32 as f64);
+                    }
                 }
                 // XEZIM_INIT_ZERO=1: coerce all-X initial values to zero.
                 // Default (off) preserves Verilog 4-state semantics. Industry
@@ -2638,7 +3053,10 @@ impl Simulator {
         }
         // §10.11 alias unification: repoint each aliased name at the
         // canonical net's slot — ONE storage, N names. Width agreement was
-        // checked at elaboration.
+        // checked at elaboration. This runs BEFORE the identity port-net
+        // collapse (see below): the collapse re-points a name it merges onto
+        // the slot the name has NOW, so a name that lands on an alias
+        // member lands on the group's slot too.
         for (canon, other) in module.alias_pairs.iter() {
             let (Some(&cid), Some(&oid)) = (
                 signal_name_to_id.get(canon.as_str()),
@@ -2858,6 +3276,14 @@ impl Simulator {
         // Return those pages to the OS before the array storage below claims
         // fresh memory (see `release_free_memory`).
         xezim_core::release_free_memory();
+        xezim_core::oom_trace::checkpoint(
+            "reserve array tables",
+            &[
+                ("array_cells", array_elem_count),
+                ("named_cells", named_elem_count),
+                ("static_signals", signal_table.len()),
+            ],
+        );
         signal_table.reserve(array_elem_count);
         signal_widths_vec.reserve(array_elem_count);
         signal_signed_vec.reserve(array_elem_count);
@@ -2920,6 +3346,10 @@ impl Simulator {
                         + PACKED_PAD
                 })
                 .fold(0usize, usize::saturating_add);
+            xezim_core::oom_trace::checkpoint(
+                "reserve packed arrays",
+                &[("packed_capacity_bytes", bound)],
+            );
             packed_mem_arena.reserve(bound);
         }
         let mut packed_arrays: std::collections::HashSet<String> =
@@ -2927,6 +3357,7 @@ impl Simulator {
         let mut packed_cells: usize = 0;
         for (base, &(lo, hi, w)) in arrays_sorted {
             let count = (hi - lo + 1).max(0) as usize;
+            let _oom_array = trace_array_storage(base, count, w);
             if mem_census && count > 0 {
                 census.push((base.clone(), count, w));
             }
@@ -3075,6 +3506,9 @@ impl Simulator {
                 // needs this — same shape as the §6.11.1 signedness loop.
                 if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     for id in first_id..signal_table.len() {
+                        // §6.8, Table 6-7: real/shortreal cells start at real
+                        // 0.0; the value tag must agree with the metadata.
+                        signal_table[id] = Value::from_f64(0.0);
                         signal_real_vec[id] = true;
                     }
                 }
@@ -3098,7 +3532,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    // Reals also occur in two_state_signals; keep their
+                    // typed 0.0 from the real-inheritance loop (§6.8).
+                    if !signal_real_vec[id] {
+                        signal_table[id] = Value::zero(signal_widths_vec[id]);
+                    }
                 }
             }
         }
@@ -3124,7 +3562,11 @@ impl Simulator {
                 }
                 let n = (hi - lo + 1).max(0) as usize;
                 for id in first_id..first_id + n {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3225,6 +3667,11 @@ impl Simulator {
             module.arrays_2d.iter().collect();
         arrays_2d_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, &((lo1, hi1), (lo2, hi2), w)) in arrays_2d_sorted {
+            let _oom_array = trace_array_storage(
+                base,
+                ((hi1 - lo1 + 1).max(0) as usize).saturating_mul((hi2 - lo2 + 1).max(0) as usize),
+                w,
+            );
             let first_id = signal_table.len();
             for i in lo1..=hi1 {
                 for j in lo2..=hi2 {
@@ -3262,6 +3709,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3270,6 +3718,17 @@ impl Simulator {
             module.arrays_nd.iter().collect();
         arrays_nd_sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (base, (shape, w)) in arrays_nd_sorted {
+            let _oom_array = if xezim_core::oom_trace::enabled() {
+                Some(trace_array_storage(
+                    base,
+                    shape.iter().fold(1usize, |count, &(lo, hi)| {
+                        count.saturating_mul((hi - lo + 1).max(0) as usize)
+                    }),
+                    *w,
+                ))
+            } else {
+                None
+            };
             fn enumerate(dims: &[(i64, i64)], prefix: String, out: &mut Vec<String>) {
                 if dims.is_empty() {
                     out.push(prefix);
@@ -3314,6 +3773,7 @@ impl Simulator {
                 super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
             }) {
                 for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::from_f64(0.0);
                     signal_real_vec[id] = true;
                 }
             }
@@ -3334,7 +3794,7 @@ impl Simulator {
             }
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
-                if name.starts_with(prefix.as_str()) {
+                if name.starts_with(prefix.as_str()) && !signal_real_vec[id] {
                     signal_table[id] = Value::zero(signal_widths_vec[id]);
                 }
             }
@@ -3346,7 +3806,11 @@ impl Simulator {
             let prefix = format!("{}[", base);
             for (name, &id) in signal_name_to_id.iter() {
                 if name.starts_with(prefix.as_str()) {
-                    signal_table[id] = Value::all_z(signal_widths_vec[id]);
+                    signal_table[id] = match module.resolved_net_kinds.get(base.as_str()) {
+                        Some(super::elaborate::ResolvedNetKind::Tri0) => Value::zero(signal_widths_vec[id]),
+                        Some(super::elaborate::ResolvedNetKind::Tri1) => Value::ones(signal_widths_vec[id]),
+                        _ => Value::all_z(signal_widths_vec[id]),
+                    };
                 }
             }
         }
@@ -3547,14 +4011,11 @@ impl Simulator {
         let phase_prev = crate::time::Instant::now();
         let prev_val: Vec<u64> = vec![0u64; named_count];
         let mut prev_xz: Vec<u64> = vec![0u64; named_count];
-        let mut prev_wide: HashMap<usize, Value> = HashMap::default();
+        let prev_wide = HashMap::default();
         for id in 0..named_count {
             let w = signal_widths_vec[id];
             let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
             prev_xz[id] = mask;
-            if w > 64 {
-                prev_wide.insert(id, Value::new(w));
-            }
         }
         let prev_ms = phase_prev.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new prev snapshot");
@@ -3566,7 +4027,7 @@ impl Simulator {
         // because `resolve_type_width` still resolves dimension
         // expressions against it at runtime (per step-2's caller fix).
         let phase_drop = crate::time::Instant::now();
-        module.signals = HashMap::default();
+        module.signals = Default::default();
         let drop_ms = phase_drop.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new drop");
 
@@ -3669,7 +4130,7 @@ impl Simulator {
         let cast_widths: HashMap<String, (u32, bool)> = {
             let mut m: HashMap<String, (u32, bool)> = HashMap::default();
             for (name, dt) in &module.typedef_types {
-                if super::elaborate::is_type_real(dt) {
+                if super::elaborate::is_type_real_resolved(dt, &module.typedef_types) {
                     continue;
                 }
                 let w = super::elaborate::resolve_type_width(
@@ -3691,8 +4152,103 @@ impl Simulator {
             }
             m
         };
+        let packed_named_signed_props: HashMap<String, usize> = module
+            .classes
+            .values()
+            .flat_map(|cd| cd.property_types.iter())
+            .filter_map(|(p, dt)| {
+                super::bytecode::signed_named_packed_elem_depth(dt, &module.typedef_types)
+                    .map(|depth| (p.clone(), depth))
+            })
+            .collect();
+        let packed_named_signed_types = module.typedef_types.values().any(|dt| {
+            matches!(
+                dt,
+                DataType::IntegerAtom { .. }
+                    | DataType::IntegerVector { .. }
+                    | DataType::Enum(_)
+                    | DataType::Struct(_)
+            ) && super::elaborate::is_type_signed_resolved(dt, &module.typedef_types)
+        });
+        // §7.2, §7.4.1: the names of structure members that are packed
+        // arrays of a named signed type, in any structure type the design
+        // declares. A select of a member path consults the member's declared
+        // type only when its last name is one of these.
+        let packed_named_signed_members: HashSet<String> = {
+            let types = &module.typedef_types;
+            let mut names: HashSet<String> = HashSet::default();
+            let class_props = module
+                .classes
+                .values()
+                .flat_map(|cd| cd.property_types.values());
+            for dt in types
+                .values()
+                .chain(module.var_decl_types.values())
+                .chain(class_props)
+            {
+                let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types)
+                else {
+                    continue;
+                };
+                for member in &su.members {
+                    if super::bytecode::signed_named_packed_elem_depth(&member.data_type, types)
+                        .is_some()
+                    {
+                        names.extend(member.declarators.iter().map(|d| d.name.name.clone()));
+                    }
+                }
+            }
+            names
+        };
+        let packed_named_signed: HashMap<String, usize> = {
+            let types = &module.typedef_types;
+            let mut m: HashMap<String, usize> = HashMap::default();
+            for (name, dt) in &module.var_decl_types {
+                if let Some(depth) = super::bytecode::signed_named_packed_elem_depth(dt, types) {
+                    m.insert(name.clone(), depth);
+                }
+                // §7.2: a member of a structure variable (`st.m` with
+                // `lane_t [0:8] m`) keeps its declared type.
+                if let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, types) {
+                    for member in &su.members {
+                        let Some(depth) = super::bytecode::signed_named_packed_elem_depth(
+                            &member.data_type,
+                            types,
+                        ) else {
+                            continue;
+                        };
+                        for d in &member.declarators {
+                            m.insert(format!("{}.{}", name, d.name.name), depth);
+                        }
+                    }
+                }
+            }
+            m
+        };
+        let addressed_statics = Self::addressed_subroutine_statics(&module, &deferred_always);
         let (hoisted_sub_static_names, hoisted_static_subroutines) =
-            Self::hoist_subroutine_statics(&mut module);
+            Self::hoist_subroutine_statics(&mut module, &addressed_statics);
+        let port_formal_two_state: HashMap<String, bool> = {
+            let top = format!("{}.", module.name);
+            module
+                .input_port_actuals
+                .iter()
+                .map(|port| {
+                    let f = port.formal();
+                    (
+                        f.strip_prefix(top.as_str()).unwrap_or(f).to_string(),
+                        port.two_state(),
+                    )
+                })
+                .collect()
+        };
+        let class_real_props = Self::collect_class_real_props(&module);
+        let static_struct_props = Self::collect_static_struct_props(&module);
+        let modport_names: HashSet<String> = module
+            .modport_member_dirs
+            .keys()
+            .map(|(_, mp)| mp.clone())
+            .collect();
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -3714,13 +4270,17 @@ impl Simulator {
             multi_dim_array_names,
             forced_signals: HashMap::default(),
             annex_n_seed: 0,
-            has_assoc_rows: false,
+            has_coll_rows: false,
             partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
+            comb_writer_index: None,
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
             collection_dim_cache: std::cell::RefCell::new(HashMap::default()),
+            csp_cache: std::cell::RefCell::new(HashMap::default()),
             any_struct_formal_markers: false,
+            ref_park_flags: 0,
+            indexed_scopes: std::cell::OnceCell::new(),
             pattern_scratch_seq: 0,
             pattern_scratch_free: Vec::new(),
             force_epoch_gen: 0,
@@ -3729,11 +4289,20 @@ impl Simulator {
             class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
             member_coll_cache: std::cell::RefCell::new(HashMap::default()),
             class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
+            class_prop_struct_cache: std::cell::RefCell::new(HashMap::default()),
+            class_packed_layout_cache: std::cell::RefCell::new(HashMap::default()),
+            aggregate_type_work: Default::default(),
+            aggregate_type_generation: Default::default(),
+            class_value_param_names: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             fb_meta_saves: Vec::new(),
+            fb_geom_saves: Vec::new(),
+            fb_unbound_refs: Vec::new(),
             fb_frame_depths: Vec::new(),
+            fb_two_state_names: Vec::new(),
+            fb_two_state_marks: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -3760,6 +4329,8 @@ impl Simulator {
             signal_widths: signal_widths_vec,
             signal_signed: signal_signed_vec,
             signal_real: signal_real_vec,
+            unpacked_struct_leaves: HashMap::default(),
+            unpacked_struct_sens: HashMap::default(),
             signal_two_state,
             signal_gate_driven,
             signal_is_string,
@@ -3771,8 +4342,10 @@ impl Simulator {
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
             collapsed_port_children: HashSet::default(),
+            port_formal_two_state,
             collapse_settled: None,
             deferred_always,
+            shortreal_signals,
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -3811,10 +4384,12 @@ impl Simulator {
             sva_preponed: HashMap::default(),
             sva_preponed_slot: None,
             sva_owed: false,
+            sva_abort_step: false,
             sva_post_nba_busy: false,
             clocking_snapshots: HashMap::default(),
             clocking_array_leaves: HashSet::default(),
             clocking_meta: HashMap::default(),
+            clocking_in_indexed_scope: false,
             clocking_output_pending: HashMap::default(),
             clocking_prev_clock: HashMap::default(),
             clocking_tick_cache: Vec::new(),
@@ -3822,10 +4397,18 @@ impl Simulator {
             packed_array_copy_values: HashMap::default(),
             clocking_edge: HashMap::default(),
             clocking_mirror_dirty: false,
+            clocking_edge_drive_dirty: false,
             clocking_cycle_pending: HashMap::default(),
+            clocking_select_due: Vec::new(),
             clocking_sig_alias: HashMap::default(),
+            clocking_output_stages: HashMap::default(),
+            clocking_sig_bound_sel: HashMap::default(),
+            clocking_sig_bound_expr: HashMap::default(),
             clocking_out_skew: HashMap::default(),
             clocking_sig_out_skew: HashMap::default(),
+            clocking_out_edge: HashMap::default(),
+            clocking_sig_out_edge: HashMap::default(),
+            clocking_edge_out_pending: HashMap::default(),
             clocking_in_skew: HashMap::default(),
             clocking_sig_in_skew: HashMap::default(),
             clocking_last_edge: HashMap::default(),
@@ -3840,6 +4423,9 @@ impl Simulator {
             deferred_clocking_guarded: Vec::new(),
             pending_reactive: Vec::new(),
             program_pids: HashSet::default(),
+            program_pid_scope: HashMap::default(),
+            program_initial_pids: HashSet::default(),
+            program_initials_live: HashMap::default(),
             reactive_conts: Vec::new(),
             in_reactive_drain: false,
             class_assoc_defaults: HashMap::default(),
@@ -3867,12 +4453,18 @@ impl Simulator {
             settle_limit_last_time: 0,
             proc_settle_defer: false,
             deferred_proc_entries: Vec::new(),
+            deferred_proc_seen: Vec::new(),
+            deferred_proc_unres: false,
             t0_starts_remaining: 0,
             rand_scope_nd: HashMap::default(),
             rand_scope_nd_dyn: HashMap::default(),
             rand_scope_row_owners: HashMap::default(),
             p_top_level: false,
             null_call_reported: Default::default(),
+            cascade_limit_explicit: std::env::var("XEZIM_CASCADE_LIMIT")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .is_some(),
             cascade_limit: std::env::var("XEZIM_CASCADE_LIMIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -3884,6 +4476,7 @@ impl Simulator {
             sdf_select: None,
             sdf_delays: Vec::new(),
             delayed_updates: Vec::new(),
+            delayed_slice_chains: false,
             delayed_nba: Vec::new(),
             delayed_nba_queue: Vec::new(),
             packed_nba: Vec::new(),
@@ -3891,6 +4484,9 @@ impl Simulator {
             has_udp: false,
             timing_checks: Vec::new(),
             timing_watches: Vec::new(),
+            timing_cond_base: Vec::new(),
+            timing_conds: Vec::new(),
+            timing_cond_evals: [0; 2],
             has_timing_checks: false,
             module_paths: None,
             timing_pending: Vec::new(),
@@ -3905,13 +4501,22 @@ impl Simulator {
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
             class_gc_heap_len: 0,
+            class_gc_survivors: Vec::new(),
+            class_gc_scan_from: 0,
+            local_meta_owner: HashMap::default(),
+            local_meta_origins: Vec::new(),
+            local_meta_origin_ids: HashMap::default(),
+            local_meta_cache: HashMap::default(),
+            local_meta_claims: Vec::new(),
             class_gc_live: 0,
+            class_gc_live_signals: 0,
             class_gc_released: 0,
             class_gc_runs: 0,
             virtual_iface_bindings: HashMap::default(),
             static_vif_bindings: HashMap::default(),
             static_vif_names: HashSet::default(),
             vif_capable_statics: std::cell::OnceCell::new(),
+            scoped_unpacked_leaves: std::cell::OnceCell::new(),
             may_bind_static_vif: true,
             static_vif_array_names: HashSet::default(),
             recv_call_memo: Vec::new(),
@@ -3924,6 +4529,10 @@ impl Simulator {
             item_alias: None,
             locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
+            dist_geometry_memo: std::cell::RefCell::new(HashMap::default()),
+            dist_dealt: Vec::new(),
+            class_prop_dims_memo: std::cell::RefCell::new(HashMap::default()),
+            class_prop_signed_memo: std::cell::RefCell::new(HashMap::default()),
             rand_ranges: HashMap::default(),
             rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
@@ -4006,6 +4615,10 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            rand_solve_chain: Vec::new(),
+            rand_solve_nested: false,
+            rand_post_deferred: Vec::new(),
+            rand_post_defer_self: false,
             rand_fail_reports: HashMap::default(),
             rand_fail_hinted: false,
             randomize_budget_depth: 0,
@@ -4040,11 +4653,16 @@ impl Simulator {
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
+            adopted_pids: HashSet::default(),
             process_contexts: HashMap::default(),
             process_scope_hint: HashMap::default(),
             process_m_scope: HashMap::default(),
             process_m_label: HashMap::default(),
             process_origin: HashMap::default(),
+            retired_fork_pids: Vec::new(),
+            retired_fork_sweep_needed: false,
+            #[cfg(test)]
+            retired_fork_reset_visits: 0,
             trace_sched: std::env::var("XEZIM_TRACE_SCHED").ok().and_then(|v| {
                 let v = v.trim();
                 if v.is_empty() || v == "0" {
@@ -4067,6 +4685,9 @@ impl Simulator {
             vm_ret_vals: None,
             fn_ret_collection_stack: Vec::new(),
             fn_ret_assoc_stack: Vec::new(),
+            fn_ret_ctx_stack: Vec::new(),
+            fn_ret_frames: Vec::new(),
+            fn_ret_types: HashMap::default(),
             current_scope: String::new(),
             m_block_scope: String::new(),
             m_block_active: false,
@@ -4105,7 +4726,11 @@ impl Simulator {
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
             shadowed_prop_mask: 0,
+            constraint_scopes: HashMap::default(),
+            inline_constraint_scope: None,
             signed_class_colls: HashSet::default(),
+            coll_store_fit_cache: Default::default(),
+            coll_store_fit_next: 0,
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -4129,11 +4754,21 @@ impl Simulator {
             edge_parallel_work: Vec::new(),
             edge_sequential_work: Vec::new(),
             nba_queue: Vec::new(),
+            nba_queued_partial_ids: HashSet::default(),
+            nba_queue_noted: 0,
             pending_nba_triggers: Vec::new(),
             pending_nba_instance_triggers: Vec::new(),
             active_task_pids: HashMap::default(),
             event_aliases: HashMap::default(),
+            event_obj_ids: HashMap::default(),
+            event_obj_slots: HashMap::default(),
+            next_event_obj_id: 0,
+            class_event_prop_names: None,
+            class_real_props,
+            static_struct_props,
+            modport_names,
             nba_fast: Vec::new(),
+            pattern_nba_leaves: None,
             // Named signals stay on the dense hot path. Unnamed large-array
             // elements use NbaFastIndex's sparse tail.
             nba_fast_index: NbaFastIndex::with_dense_prefix(named_count),
@@ -4174,11 +4809,13 @@ impl Simulator {
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             foreach_arena: Vec::new(),
+            vm_regs_pool: Vec::new(),
             clock_generators: Vec::new(),
             clock_gen_src: Vec::new(),
             t0_timing_free: HashSet::default(),
             t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
+            lazy_initial: HashMap::default(),
             proc_fsm: HashMap::default(),
             fsm_start_pc: 0,
             fsm_suspend: None,
@@ -4222,11 +4859,18 @@ impl Simulator {
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
             warned_delay_spikes: HashSet::default(),
+            warned_uncovered_patterns: HashSet::default(),
+            typed_pattern_seq: 0,
+            enum_recv_cache: HashMap::default(),
+            enum_recv_cache_gen: 0,
+            slice_arg_targets: HashMap::default(),
+            slice_arg_seq: 0,
             t0_delay_deferred: HashSet::default(),
             suspended_loop_frames: HashMap::default(),
             process_loop_bytecode: HashMap::default(),
             process_cond_bytecode: HashMap::default(),
             killed_pids: HashSet::default(),
+            growth_trace_next: 0,
             finished_pids: HashSet::default(),
             suspended_pids: HashSet::default(),
             suspended_proc_info: HashMap::default(),
@@ -4237,9 +4881,11 @@ impl Simulator {
             ref_identity_stack: Vec::new(),
             pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
+            ref_pin_users: HashMap::default(),
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
             hint_key_scratch: std::cell::RefCell::new(String::new()),
+            decl_param_scope_cache: std::cell::RefCell::default(),
             vif_key_scratch: std::cell::RefCell::new(String::new()),
             spec_frag_fold_cache: RefCell::new(HashMap::default()),
             param_leaf_names: std::cell::OnceCell::new(),
@@ -4257,6 +4903,9 @@ impl Simulator {
             struct_coll_member_len_mask: std::cell::Cell::new(0),
             assoc_elem_colls: HashSet::default(),
             local_coll_elems: HashMap::default(),
+            pending_local_shape: None,
+            local_coll_rows_live: false,
+            local_coll_shapes: HashMap::default(),
             dynamic_assoc_dims: HashMap::default(),
             pending_struct_coll_wb: Vec::new(),
             pending_ret_struct: None,
@@ -4265,6 +4914,10 @@ impl Simulator {
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
             string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
             nonvirtual_target_cache: std::cell::RefCell::new(HashMap::default()),
+            class_is_a_cache: std::cell::RefCell::new(HashMap::default()),
+            interface_resolve_cache: std::cell::RefCell::new(HashMap::default()),
+            spec_sig_cache: std::cell::RefCell::new(HashMap::default()),
+            has_any_array_nd_properties: std::cell::Cell::new(None),
             has_method_cache: std::cell::RefCell::new(HashMap::default()),
             covergroup_leaf_names: std::cell::OnceCell::new(),
             class_string_props: std::cell::RefCell::new(HashMap::default()),
@@ -4274,6 +4927,8 @@ impl Simulator {
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             prop_width_memo: std::cell::RefCell::new(HashMap::default()),
+            struct_member_offset_memo: std::cell::RefCell::new(HashMap::default()),
+            packed_struct_member_memo: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
             queue_save_pool: Vec::new(),
             local_dyn_pool: Vec::new(),
@@ -4282,7 +4937,9 @@ impl Simulator {
             method_plans: std::cell::RefCell::new(HashMap::default()),
             meta_frames: Vec::new(),
             meta_pending: 0,
+            declaration_typedefs: None,
             type_tables_gen: 0,
+            formal_struct_layouts: HashMap::default(),
             local_type_pool: Vec::new(),
             sync_name_pool: Vec::new(),
             dyn_key_scratch: String::new(),
@@ -4297,20 +4954,28 @@ impl Simulator {
             compiled_method_boost_qual: HashMap::default(),
             compiled_method_heat_stack: Vec::new(),
             compiled_method_loop_heat: HashMap::default(),
+            compiled_method_has_loop: HashMap::default(),
             compiled_fast_calls: HashMap::default(),
             compiled_fast_static_calls: HashMap::default(),
             compiled_spec_intern: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
-            condition_waiters: Vec::new(),
-            ready_condition_waiters: Vec::new(),
+            condition_waiters: PidVec::default(),
+            ready_condition_waiters: PidVec::default(),
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
             cond_waiter_gate: HashMap::default(),
             cond_repass_recheck: HashMap::default(),
-            inactive_queue: Vec::new(),
+            inactive_queue: PidVec::default(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
+            cond_waiter_rechecks: 0,
+            vm_direct_calls: 0,
+            queue_elem_moves: 0,
+            select_store_copies: 0,
+            local_meta_reapplies: 0,
+            local_meta_swaps: 0,
+            local_meta_scans: 0,
             mailbox_get_waiters: HashMap::default(),
             fork_baselines: HashMap::default(),
             fork_collection_captures: HashMap::default(),
@@ -4325,8 +4990,19 @@ impl Simulator {
             intra_saved_next: 0,
             vc_saved: HashMap::default(),
             event_triggered_time: EventStampStore::default(),
-            event_waiters: Vec::new(),
-            instance_event_waiters: Vec::new(),
+            event_waiters: Default::default(),
+            // The index is told of a write where the dirty-driven edge scan
+            // is, so it needs that scan's write notes.
+            waiter_index_on: std::env::var("XEZIM_WAITER_INDEX")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+                && std::env::var("XEZIM_DIRTY_EDGE")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(true),
+            waiter_index_shadow: std::env::var("XEZIM_WAITER_INDEX_SHADOW")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
+            instance_event_waiters: InstanceEventWaiters::default(),
             late_resume_epoch: 0,
             fe_trusted_types: HashSet::default(),
             pid_src_file: HashMap::default(),
@@ -4358,7 +5034,10 @@ impl Simulator {
             vcd_last_time: u64::MAX,
             vcd_prev_signals: Vec::new(),
             vcd_filter_scopes: Vec::new(),
+            vcd_dump_none: false,
             vcd_dump_depth: 0,
+            vcd_earlier_selections: Vec::new(),
+            vcd_start_time: u64::MAX,
             vcd_var_kinds: Vec::new(),
             vcd_event_last: Vec::new(),
             vcd_limit: None,
@@ -4385,10 +5064,20 @@ impl Simulator {
             xtrace_to_t: u64::MAX,
             fst_file: None,
             fst_scopes: Vec::new(),
+            fst_dump_none: false,
+            wave_suppress: configured_wave_suppress(),
             fst_writer: None,
             cast_widths,
+            packed_named_signed,
+            packed_named_signed_props,
+            packed_named_signed_types,
+            packed_named_signed_members,
+            packed_named_sign_guard: 0,
+            shift_free_operand: 0,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
+            class_handle_member_types_cache: None,
+            class_scoped_enum_cache: None,
             dpi_import_fds: None,
             free_fn_class_names: HashMap::default(),
             free_call_pkgs: HashMap::default(),
@@ -4405,6 +5094,7 @@ impl Simulator {
             prepared_comb_cache_path: None,
             comb_level: Vec::new(),
             comb_has_nba: Vec::new(),
+            comb_self_exempt: Vec::new(),
             comb_par_safe: Vec::new(),
             bsp_buckets: Vec::new(),
             bsp_next_seed: Vec::new(),
@@ -4427,6 +5117,7 @@ impl Simulator {
             comb_time0_fired: false,
             comb_time0_deferred: Vec::new(),
             comb_time0_deferred_done: false,
+            comb_time0_held: Vec::new(),
             comb_dep_offsets: Vec::new(),
             ts_comb: Vec::new(),
             comb_plan: Vec::new(),
@@ -4514,6 +5205,7 @@ impl Simulator {
             edge_exec_wrote: Vec::new(),
             edge_exec_seen: Vec::new(),
             proc_depth: 0,
+            stmts_depth: 0,
             deferred_comb: Vec::new(),
             in_edge_rescan: false,
             edge_rescan_block_hits: HashMap::default(),
@@ -4623,6 +5315,9 @@ impl Simulator {
             vif_return_pending: false,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
+            share_task_frames,
+            task_frame_eligibility: HashMap::default(),
+            task_frame_cache: HashMap::default(),
             class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             exec_cache_pids: HashSet::default(),
@@ -4631,6 +5326,12 @@ impl Simulator {
             zero_delay_defer_pending: false,
             stall_time: 0,
             stall_pid_hits: HashMap::default(),
+            stall_pid_state: HashMap::default(),
+            stall_state0: 0,
+            stall_limit_explicit: std::env::var("XEZIM_STALL_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .is_some(),
             stall_limit: std::env::var("XEZIM_STALL_LIMIT")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -4686,8 +5387,11 @@ impl Simulator {
             dpi_value_change_cbs: HashMap::default(),
             chained_coll_member_names: std::cell::OnceCell::new(),
             elem_inside_hint: Vec::new(),
+            elem_rel_bound: Vec::new(),
             rand_tight_mode: false,
             vpi_cb: Box::default(),
+            vpi_assert: Box::default(),
+            vpi_assert_on: false,
             vpi_cb_mask: 0,
             vpi_slot_started: u64::MAX,
             stdout_unsynced: false,
@@ -4695,6 +5399,12 @@ impl Simulator {
             vpi_self_ptr: std::ptr::null_mut(),
             file_handles: HashMap::default(),
             virtual_files: None,
+            checkpoint_ops: Vec::new(),
+            checkpoint_requested,
+            checkpoint_save_at: Vec::new(),
+            checkpoint_restored: false,
+            checkpoint_muted: false,
+            checkpoint_audit: None,
             file_writes_pending: false,
             file_eof: HashSet::default(),
             ungetc_buf: HashMap::default(),
@@ -4721,14 +5431,20 @@ impl Simulator {
             proc_sampled_blocks: Vec::new(),
             sampled_registering: false,
             pending_t0_triggers: Vec::new(),
+            time0_port_edges: Vec::new(),
+            time0_alias_edges: Vec::new(),
+            edge_t0_pending: Vec::new(),
+            edge_forced_fire: Vec::new(),
             in_pre_process_settle: false,
+            comb_direct_eval: false,
         };
-        sim.has_assoc_rows = !sim.module.assoc_row_dims.is_empty()
+        sim.unpacked_struct_leaves = sim.build_unpacked_struct_leaves();
+        sim.has_coll_rows = !sim.module.coll_shapes.is_empty()
             || sim
                 .module
                 .classes
                 .values()
-                .any(|c| !c.assoc_row_property_dims.is_empty());
+                .any(|c| !c.prop_coll_shapes.is_empty());
         // Static event names get stable IDs before simulation; class, local
         // and selected event identities can still be interned on first use.
         // Interning alone must not make an event appear already triggered.
@@ -4955,26 +5671,34 @@ impl Simulator {
         // Seeding. The default is SvRng::DEFAULT_SEED — a run is reproducible
         // unless it asks not to be, so a failing random test can be re-run
         // bit-for-bit. `+seed=<n>` selects another stream; `+seed=random` draws
-        // one from system entropy and PRINTS it, since a seed you cannot see is
-        // a run you cannot replay.
+        // one from system entropy. The last seed given is the run's, and it is
+        // printed on stdout, so the output and the `-l` log name it: a seed
+        // you cannot see is a run you cannot replay.
+        let mut chosen: Option<(u64, bool)> = None;
         for a in &self.plusargs {
             if let Some(v) = a.strip_prefix("seed=").or_else(|| a.strip_prefix("+seed=")) {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("random") {
                     use rand::Rng;
                     let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
-                    eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
+                    chosen = Some((seed, true));
                 } else if let Ok(seed) = v.parse::<u64>() {
-                    self.rng = SvRng::from_seed(seed);
-                    self.run_seed = Some(seed);
+                    chosen = Some((seed, false));
                 } else {
                     eprintln!(
                         "[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')",
                         v
                     );
                 }
+            }
+        }
+        if let Some((seed, random)) = chosen {
+            self.rng = SvRng::from_seed(seed);
+            self.run_seed = Some(seed);
+            if random {
+                println!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
+            } else {
+                println!("[xezim] seed: {}", seed);
             }
         }
     }

@@ -20,9 +20,8 @@
 //!   the attempt finishes or the deferred report matures.
 //! * Lock/Unlock: a locked assertion ignores every control except Unlock.
 //!
-//! Pinned against the reference simulator: the pass action of a vacuous
-//! success is off until PassOn (§20.12 lists the controls, the default is
-//! the reference's); levels count module instances only, so a generate or
+//! §20.11 enables pass actions on vacuous and nonvacuous successes by
+//! default. Levels count module instances only, so a generate or
 //! named block is part of its instance's level; levels with no list count
 //! from the top modules; `expect` statements ignore the controls, as in the
 //! reference. Unique/priority violation reports follow On/Off/Kill.
@@ -55,10 +54,15 @@ pub(super) const DT_ASSERT: u8 = 1;
 pub(super) const DT_COVER: u8 = 2;
 pub(super) const DT_ASSUME: u8 = 4;
 
-/// One assertion's control state; 0 is the default (enabled, unlocked,
-/// pass action on nonvacuous success only, fail action on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One assertion's control state. Initially all pass and fail actions are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlState(u8);
+
+impl Default for CtlState {
+    fn default() -> Self {
+        Self(Self::PASS_VAC_ON)
+    }
+}
 
 impl CtlState {
     const LOCKED: u8 = 1;
@@ -83,7 +87,7 @@ impl CtlState {
     pub(super) fn fail_action(self) -> bool {
         self.0 & Self::FAIL_OFF == 0
     }
-    fn locked(self) -> bool {
+    pub(super) fn locked(self) -> bool {
         self.0 & Self::LOCKED != 0
     }
     fn set(&mut self, bit: u8, on: bool) {
@@ -124,7 +128,7 @@ impl CtlState {
 }
 
 /// What a control call selects an assertion by.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlIdent {
     /// Instance-relative path of the scope the assertion sits in: instance,
     /// generate and named blocks (a labelled procedural assertion's label is
@@ -137,7 +141,7 @@ pub(super) struct CtlIdent {
 }
 
 /// A concurrent site's identity plus its cached state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CtlSite {
     pub(super) ident: CtlIdent,
     epoch: u64,
@@ -154,7 +158,7 @@ impl CtlSite {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CtlEntry {
     ctl: u8,
     atype: u8,
@@ -180,11 +184,11 @@ fn ctl_dims(ctl: u8) -> u8 {
 fn ctl_writes_default(ctl: u8) -> bool {
     matches!(
         ctl,
-        CTL_ON | CTL_FAIL_ON | CTL_NONVACUOUS_ON | CTL_VACUOUS_OFF | CTL_UNLOCK
+        CTL_ON | CTL_FAIL_ON | CTL_NONVACUOUS_ON | CTL_PASS_ON | CTL_UNLOCK
     )
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct AssertCtl {
     log: Vec<CtlEntry>,
     /// Bumped on every change of `log`; concurrent sites cache against it.
@@ -412,6 +416,15 @@ impl Simulator {
             levels,
             targets: (!targets.is_empty()).then_some(targets),
         };
+        self.assert_ctl_push(entry);
+    }
+
+    /// Append one control to the log, with its immediate effects.
+    fn assert_ctl_push(&mut self, entry: CtlEntry) {
+        // §39.5.1: system termination also prevents task-based re-enabling.
+        if self.vpi_assert.ended {
+            return;
+        }
         if self.assert_ctl.is_none() {
             let mut c = AssertCtl {
                 multi_top: self.root_is_multi_top(),
@@ -425,9 +438,29 @@ impl Simulator {
         if entry.ctl == CTL_KILL {
             self.assert_ctl_kill(&entry);
         }
+        // IEEE 1800-2017 Clause 39: snapshot after `assert_ctl_kill`, whose
+        // callbacks may themselves push controls before `entry` enters the log.
+        let watched = self.vpi_assert_on.then(|| self.vpi_assert_ctl_snapshot());
         let c = self.assert_ctl.as_mut().unwrap();
         c.push(entry);
         self.assert_ctl_on = !c.log.is_empty();
+        if let Some(before) = watched {
+            self.vpi_assert_ctl_changed(before);
+        }
+    }
+
+    /// A control written through the VPI (IEEE 1800-2017 Clause 39.5): the
+    /// same log entry the system task makes, so both see one state.
+    /// `target` is the instance-relative path of one assertion, `None` the
+    /// design.
+    pub(super) fn assert_ctl_vpi(&mut self, ctl: u8, target: Option<String>, atype: u8, dtype: u8) {
+        self.assert_ctl_push(CtlEntry {
+            ctl,
+            atype,
+            dtype,
+            levels: 0,
+            targets: target.map(|t| vec![t]),
+        });
     }
 
     /// The instance-relative path a list argument names: a scope (instance,
@@ -518,9 +551,8 @@ impl Simulator {
         }
         self.deferred_asserts = kept;
         for i in killed {
-            self.sva_sites[i].attempts.clear();
-            self.sva_sites[i].matured.clear();
-            self.sva_proc_pending.retain(|p| p.0 != i);
+            // Each attempt discarded is a cbAssertionKill (Clause 39.4.2).
+            self.vpi_assert_kill_site(i, None);
         }
     }
 

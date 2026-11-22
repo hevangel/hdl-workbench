@@ -31,6 +31,70 @@ pub(super) fn specialized_receiver(
     }
 }
 
+/// §8.25, §23.10: the arguments of a `C#(...)` written in a module instance
+/// name that instance's parameters. Qualify each name the instance declares
+/// as an expression reference to it is qualified, so instances with
+/// different parameter values name different specializations (a bare `W`
+/// resolved to one instance's value for every instance). Named-argument
+/// labels (`.W(`), scoped names (`p::N`, `C::N`), literals and strings keep
+/// their spelling.
+pub(super) fn spec_args_text(
+    text: &str,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+) -> String {
+    if prefix.is_empty() || local_names.is_empty() {
+        return text.to_string();
+    }
+    let b = text.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut virtual_type = false;
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(b.len());
+        } else if c == b'\'' || c.is_ascii_digit() || c == b'$' {
+            // A based literal (`8'hFF`, `'1`), a number, a system name.
+            i += 1;
+            while i < b.len() && (ident(b[i]) || b[i] == b'\'') {
+                i += 1;
+            }
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            let tok = &text[start..i];
+            let before = text[..start].trim_end();
+            let after = text[i..].trim_start();
+            // §25.9 / §3.13: the name after `virtual [interface]` is
+            // an interface TYPE, even when an instance has the same name.
+            // Its parameter expressions still refer to the module scope.
+            let interface_type = virtual_type && tok != "interface";
+            virtual_type = tok == "virtual" || (virtual_type && tok == "interface");
+            if !interface_type && local_names.contains(tok)
+                && !before.ends_with('.')
+                && !before.ends_with("::")
+                && !after.starts_with("::")
+            {
+                out.push_str(prefix);
+                out.push_str(tok);
+                continue;
+            }
+        } else {
+            i += text[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push_str(&text[start..i]);
+    }
+    out
+}
+
 fn receiver_text(e: &Expression) -> Option<String> {
     match &e.kind {
         ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|p| p.selects.is_empty()) => {
@@ -194,6 +258,12 @@ pub(super) fn data_type(
     }
 }
 
+/// §23.9: a nearer declaration of `name` hides it and every block key it
+/// heads (`name.k`, `name[0].k`).
+fn hide(bindings: &mut HashMap<String, Expression>, name: &str) {
+    bindings.retain(|k, _| k.split(['.', '[']).next() != Some(name));
+}
+
 pub(super) fn class(
     cd: &ClassDeclaration,
     prefix: &str,
@@ -207,12 +277,12 @@ pub(super) fn class(
         match &parameter.kind {
             ParameterKind::Type { assignments } => {
                 for a in assignments {
-                    bindings.remove(&a.name.name);
+                    hide(&mut bindings, &a.name.name);
                 }
             }
             ParameterKind::Data { assignments, .. } => {
                 for a in assignments {
-                    bindings.remove(&a.name.name);
+                    hide(&mut bindings, &a.name.name);
                 }
             }
         }
@@ -236,10 +306,16 @@ pub(super) fn class(
     for item in &cd.items {
         match item {
             ClassItem::Typedef(t) => {
-                body_bindings.remove(&t.name.name);
+                hide(&mut body_bindings, &t.name.name);
             }
             ClassItem::Class(c) => {
-                body_bindings.remove(&c.name.name);
+                hide(&mut body_bindings, &c.name.name);
+            }
+            // §8.3: a property hides a block's data of its name (`cfg.depth`).
+            ClassItem::Property(p) => {
+                for d in &p.declarators {
+                    hide(&mut body_bindings, &d.name.name);
+                }
             }
             _ => {}
         }
@@ -253,13 +329,13 @@ pub(super) fn class(
                 p.data_type = data_type(&p.data_type, prefix, bindings);
                 for d in &mut p.declarators {
                     if let Some(e) = &d.init {
-                        d.init = Some(rewrite_expr(
+                        d.init = Some(Box::new(rewrite_expr(
                             e,
                             "",
                             bindings,
                             &empty_names,
                             &empty_interfaces,
-                        ));
+                        )));
                     }
                 }
             }
@@ -277,7 +353,7 @@ pub(super) fn class(
                 let mut method_bindings = bindings.clone();
                 for port in ports {
                     port.data_type = data_type(&port.data_type, prefix, bindings);
-                    method_bindings.remove(&port.name.name);
+                    hide(&mut method_bindings, &port.name.name);
                     if let Some(e) = &port.default {
                         port.default = Some(rewrite_expr(
                             e,
@@ -289,13 +365,16 @@ pub(super) fn class(
                     }
                 }
                 for name in stmt_list_declared_names(body) {
-                    method_bindings.remove(name);
+                    hide(&mut method_bindings, name);
                 }
-                for s in body {
+                // §8.3/§13.4: rewrite from the shared source directly. Mutating
+                // the cloned body first would copy every statement before the
+                // rewriter builds a second copy.
+                *body = crate::ast::cache::without_scope_caches(|| body.iter().map(|s| {
                     // Prefix only class aliases, keeping existing ownership
                     // rules for ordinary method locals and module variables.
-                    *s = rewrite_stmt(s, prefix, &method_bindings, &empty_names, &empty_interfaces);
-                }
+                    rewrite_stmt(s, prefix, &method_bindings, &empty_names, &empty_interfaces)
+                }).collect());
             }
             _ => {}
         }

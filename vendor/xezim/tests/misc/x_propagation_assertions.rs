@@ -16,12 +16,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn xezim() -> String {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim").to_string_lossy().into_owned()
+    // Cargo names the binary it built for the integration tests.
+    env!("CARGO_BIN_EXE_xezim").to_string()
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -529,7 +525,11 @@ endmodule
         "T|PR rose t=15 a=1",
         "T|PA fail t=15 a=1 b=x",
         "T|PB fail t=15 b=x",
+        "T|PA pass t=5 a=x b=x",
         "T|PA pass t=25 a=1 b=1",
+        "T|PA pass t=35 a=x b=1",
+        "T|PA pass t=55 a=0 b=0",
+        "T|PA pass t=75 a=0 b=1",
         "T|PS fail t=25 b=1",
         "T|PR rose t=45 a=1",
         "T|PA fail t=45 a=1 b=x",
@@ -540,7 +540,7 @@ endmodule
         "T|PA fail t=65 a=1 b=z",
         "T|PB fail t=65 b=z",
         "T|PS fail t=75 b=1",
-        "T|sum ap=1 af=3 bp=3 bf=5 rp=0 rf=3 sp=1 sf=3",
+        "T|sum ap=5 af=3 bp=3 bf=5 rp=5 rf=3 sp=5 sf=3",
     ];
     got.sort();
     want.sort();

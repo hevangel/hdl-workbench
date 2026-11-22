@@ -273,7 +273,14 @@ impl Simulator {
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
         }
+        super::checkpoint::audit::start(self);
+        self.checkpoint_start();
+        if self.checkpoint_restored {
+            start = false;
+        }
         self.event_loop(start);
+        super::checkpoint::audit::finish(self);
+        self.checkpoint_unserved();
         if self.ended_waiting_in_c {
             // Stopped, not finished: no `$finish` was called.
             self.finished = false;
@@ -308,7 +315,7 @@ impl Simulator {
                 let span = fb.stmt.span;
                 let stmts = match fb.stmt.kind {
                     StatementKind::SeqBlock { stmts, .. } => stmts,
-                    other => vec![Statement::new(other, fb.stmt.span)],
+                    other => vec![Statement::new(other, fb.stmt.span)].into(),
                 };
                 let pid = self.next_pid;
                 self.next_pid += 1;
@@ -321,7 +328,7 @@ impl Simulator {
                     self.current_scope.clear();
                 }
                 self.process_origin.insert(pid, (span, "final block"));
-                self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+                self.run_process_stmts(pid, &ProcCont::from_vec(stmts.into_vec()));
                 // A final block's $finish should NOT stop subsequent finals;
                 // re-clear after each.
                 self.finished = false;
@@ -333,9 +340,13 @@ impl Simulator {
         if self.vpi_cb_mask != 0 {
             self.vpi_end_of_simulation();
         }
-        if self.code_cov.is_some() {
-            self.emit_coverage_summary();
-        }
+        // Assertion + coverage summary (always when any data was recorded;
+        // the JSON database goes to XEZIM_COV_DB, else to xezim_cov.json when
+        // at least one stat exists). It follows the `final` blocks and the
+        // last slot's deferred reports, which mature above (§16.4): a run
+        // without code coverage wrote it at the end of the event loop,
+        // before those were counted.
+        self.emit_coverage_summary();
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
         self.drain_value_trace();
@@ -1449,7 +1460,7 @@ impl Simulator {
                 };
                 ok && self.stmt_is_plain_stimulus(stmt)
             }
-            StatementKind::VarDecl { .. } => true,
+            StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. } => true,
             _ => false,
         }
     }
@@ -1499,6 +1510,46 @@ impl Simulator {
             | StatementKind::Forever { body }
             | StatementKind::Foreach { body, .. } => Self::count_timing_controls(body),
             _ => 0,
+        }
+    }
+
+    /// Does the subtree hold an expression statement other than a system
+    /// task call: a task enable in any spelling (`t(x);`, `t;`, `o.m;`), or
+    /// an expression that may call one? `stmt_is_blocking` decides those by
+    /// the callee's NAME, so its answer for them is only known once the
+    /// statement carries its instance's names.
+    pub(super) fn stmt_has_call_statement(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::Expr(e) => !matches!(e.kind, ExprKind::SystemCall { .. }),
+            StatementKind::TimingControl { stmt: inner, .. } => {
+                Self::stmt_has_call_statement(inner)
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_call_statement)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_has_call_statement(then_stmt)
+                    || else_stmt
+                        .as_ref()
+                        .is_some_and(|e| Self::stmt_has_call_statement(e))
+            }
+            StatementKind::Case { items, .. } => items
+                .iter()
+                .any(|it| Self::stmt_has_call_statement(&it.stmt)),
+            StatementKind::RandCase { items } => items
+                .iter()
+                .any(|(_, st)| Self::stmt_has_call_statement(st)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => Self::stmt_has_call_statement(body),
+            _ => false,
         }
     }
 
@@ -1568,9 +1619,9 @@ impl Simulator {
             }
             for c in &cands {
                 if let Some(td) = self.module.tasks.get(c.as_str()) {
-                    return td.items.iter().any(|st| self.stmt_is_blocking(st))
-                        || td
-                            .items
+                    let items = self.module.resolved_task_items(c, td);
+                    return items.iter().any(|st| self.stmt_is_blocking(st))
+                        || items
                             .iter()
                             .any(|st| self.stmt_calls_blocking_task(st, scope, depth - 1));
                 }
@@ -1657,10 +1708,7 @@ impl Simulator {
         // it into a process FSM instead when the whole tree compiles. Single-
         // wait bodies stay on their (native) edge/clock-gen fast paths.
         {
-            use std::sync::OnceLock;
-            static FSM_ON: OnceLock<bool> = OnceLock::new();
-            let fsm_on =
-                *FSM_ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+            let fsm_on = self.proc_fsm_mode == 1;
             let tc = Self::count_timing_controls(&ab.stmt);
             if fsm_on
                 && (tc >= 2 || (tc >= 1 && Self::stmt_contains_call(&ab.stmt)))
@@ -1677,7 +1725,9 @@ impl Simulator {
         if !ab.scope.is_empty() {
             *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
         }
+        Self::take_star_kept_own_write();
         let extracted = self.extract_sensitivity(&ab.stmt);
+        let star_reads_own_nba = Self::take_star_kept_own_write();
         // §14.13: a clocking event is delivered after sampling/NBA, rather
         // than as the raw clock edge returned by extract_sensitivity.
         fn leading_event(stmt: &Statement) -> Option<&EventControl> {
@@ -1756,10 +1806,18 @@ impl Simulator {
                 // (`always @(big[i])` on a large memory) has no dependency
                 // edge the comb path could wake on; such a block runs as a
                 // process below.
+                // §9.4.2.2: an `@*` block that reads a variable it writes
+                // with `<=` (`dot <= b; prod <= a * dot;`) has that variable
+                // in its sensitivity, and the NBA update wakes it again in
+                // the same time step. The comb path leaves every variable a
+                // block writes out of its dependencies, so it ran the block
+                // once and `prod` kept the old `dot`, a cycle late. Such a
+                // block runs as a waiting process below instead.
                 if all_level
                     && !clocking_head
                     && !has_named_event
                     && !self_ref
+                    && !star_reads_own_nba
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
@@ -1881,7 +1939,15 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
-                if clocking_head || self.event_needs_value_waiter(&sens, &ab.scope) {
+                // `star_reads_own_nba`: a process arms `@*` only after the
+                // body has run, so the body's own blocking writes (`x[7:4] =
+                // x[7:4] + 1` beside `x[3:0] <= b`) cannot wake it, while the
+                // NBA update does. An edge block re-detects writes made while
+                // it runs and would wake itself on them again and again.
+                if clocking_head
+                    || star_reads_own_nba
+                    || self.event_needs_value_waiter(&sens, &ab.scope)
+                {
                     if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
                         return None;
                     }
@@ -1913,6 +1979,7 @@ impl Simulator {
                                 value_of: None,
                                 wake_rank: 0,
                                 cell: false,
+                                alias_t0: self.alias_t0_kind(&s.signal_name, id),
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -1924,6 +1991,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(stripped, id),
                                 });
                             }
                         }
@@ -1940,6 +2008,7 @@ impl Simulator {
                                     value_of: None,
                                     wake_rank: 0,
                                     cell: false,
+                                    alias_t0: self.alias_t0_kind(&scoped, id),
                                 });
                             }
                         }
@@ -2221,10 +2290,7 @@ impl Simulator {
                 // becomes a bytecode FSM — resumes re-enter at a saved pc
                 // instead of re-walking the AST continuation chain.
                 {
-                    use std::sync::OnceLock;
-                    static ON: OnceLock<bool> = OnceLock::new();
-                    let fsm_on =
-                        *ON.get_or_init(|| std::env::var("XEZIM_PROC_FSM").as_deref() == Ok("1"));
+                    let fsm_on = self.proc_fsm_mode == 1;
                     if fsm_on
                         && self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block")
                     {
@@ -2276,6 +2342,7 @@ impl Simulator {
             &self.module.arrays,
             &self.widths,
         );
+        compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
         compiler.allow_waits = true;
         // System-task statements (`$display`, `$write`, `$finish`, ...)
         // lower to statement fallbacks; the gate below admits only those,
@@ -2286,6 +2353,11 @@ impl Simulator {
         compiler.set_scope_hint(scope_hint);
         compiler.set_tasks(&self.module.tasks);
         compiler.set_functions(&self.module.functions);
+        compiler.set_deferred_callables(
+            &self.module.deferred_function_bodies,
+            &self.module.deferred_task_bodies,
+            &self.module.packages,
+        );
         compiler.set_params(&self.module.parameters);
         compiler.set_param_leaf_idx(self.param_leaf_index());
         compiler.set_cast_widths(&self.cast_widths);
@@ -2295,6 +2367,7 @@ impl Simulator {
         compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
         compiler.set_assoc_arrays(&self.module.associative_arrays);
         compiler.set_packed_full_dims(&self.module.packed_full_dims);
+        Self::set_pattern_type_tables(&self.module, &mut compiler);
         compiler.set_packed_struct_fields(
             self.bc_packed_fields
                 .as_ref()
@@ -4011,7 +4084,9 @@ impl Simulator {
                         | Insn::BlockingAssignBitDyn(sg, _, _) => {
                             w.push((*sg as usize, 0, u32::MAX))
                         }
-                        Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => ranged = false,
+                        Insn::StmtFallback(..)
+                        | Insn::EvalExprFallback(..)
+                        | Insn::LoadDynElem(..) => ranged = false,
                         _ => {}
                     }
                 }

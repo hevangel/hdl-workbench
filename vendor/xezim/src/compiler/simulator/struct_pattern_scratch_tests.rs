@@ -27,7 +27,7 @@ endmodule
                 signed: false,
                 base: NumberBase::Binary,
                 value: value.to_bin(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             crate::ast::Span::dummy(),
         )
@@ -39,8 +39,11 @@ endmodule
         };
         Expression::new(
             ExprKind::AssignmentPattern(vec![
-                AssignmentPatternItem::Named(name("node"), number(handle)),
-                AssignmentPatternItem::Named(name("count"), number(&Value::from_u64(count, 32))),
+                AssignmentPatternItem::Named(name("node").into(), number(handle)),
+                AssignmentPatternItem::Named(
+                    name("count").into(),
+                    number(&Value::from_u64(count, 32)),
+                ),
             ]),
             crate::ast::Span::dummy(),
         )

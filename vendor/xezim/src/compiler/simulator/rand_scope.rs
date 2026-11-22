@@ -14,11 +14,14 @@ use crate::ast::decl::DistWeight;
 
 /// §18.6: only the active rand state of reachable child objects belongs to
 /// a solve transaction. Unrelated objects and non-rand callback state do not.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) struct RandChildSnapshot {
     handle: usize,
     properties: Vec<(String, Option<Value>)>,
     collections: Vec<(String, Vec<(String, Value)>)>,
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
 
 pub(super) struct RandChildTransaction {
     pub(super) owner: usize,
@@ -79,6 +82,11 @@ impl Simulator {
         match (target, enable) {
             (Some(name), true) => {
                 disabled.remove(name);
+                // Enabling a whole array enables each of its elements too.
+                if !name.contains('[') {
+                    let elem = format!("{name}[");
+                    disabled.retain(|k| !k.starts_with(&elem));
+                }
             }
             (Some(name), false) => {
                 disabled.insert(name.to_string());
@@ -89,6 +97,424 @@ impl Simulator {
             }
         }
     }
+    /// §18.8, §18.9: `obj.sub.x.rand_mode(0)` and
+    /// `obj.sub.c.constraint_mode(0)` name the random variable or constraint
+    /// `x` / `c` of the object `obj.sub`, not a member `sub.x` of `obj`, so
+    /// the randomize() of `obj.sub` (on its own or as a sub-object) sees the
+    /// mode. Descend from `h` through the leading parts of the dotted
+    /// `target` that are class-handle properties holding an object.
+    pub(super) fn rand_mode_owner(&self, mut h: usize, target: &str) -> (usize, String) {
+        let mut parts: Vec<&str> = target.split('.').collect();
+        while parts.len() > 1 {
+            let p = parts[0];
+            if p.contains('[') || self.prop_class_type(h, p).is_none() {
+                break;
+            }
+            let Some(next) = self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(p))
+                .and_then(|v| v.to_u64())
+                .map(|v| v as usize)
+                .filter(|&v| v != 0 && self.heap.get(v).is_some_and(|o| o.is_some()))
+            else {
+                break;
+            };
+            h = next;
+            parts.remove(0);
+        }
+        (h, parts.join("."))
+    }
+
+    /// §18.8: the object and element key (`arr[2]`, `m[1][0]`) a
+    /// `rand_mode` receiver names when it selects an element of an unpacked
+    /// rand array: `obj.arr[i]`, or `arr[i]` inside the class.
+    pub(super) fn rand_mode_element_target(
+        &mut self,
+        recv: &Expression,
+    ) -> Option<(usize, String)> {
+        let mut idx = Vec::new();
+        let mut base = recv;
+        while let ExprKind::Index { expr, index } = &base.kind {
+            idx.push(self.eval_expr(index).to_i64()?);
+            base = expr;
+        }
+        if idx.is_empty() {
+            return None;
+        }
+        let (handle, name) = match &base.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_expr(expr).to_u64()? as usize, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 => (
+                self.this_stack.last().copied().flatten()?,
+                h.path[0].name.name.clone(),
+            ),
+            // `obj.arr` flattened into one hierarchical name.
+            ExprKind::Ident(h) if h.path.last().is_some_and(|s| s.selects.is_empty()) => {
+                let mut owner = h.clone();
+                let prop = owner.path.pop()?.name.name;
+                owner.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                owner.cached_resolved_name = crate::ast::cache::NameCache::new();
+                let owner = Expression::new(ExprKind::Ident(owner), base.span);
+                (self.eval_expr(&owner).to_u64()? as usize, prop)
+            }
+            _ => return None,
+        };
+        if handle == 0 || !self.object_declares_property(handle, &name) {
+            return None;
+        }
+        let mut key = name;
+        for i in idx.iter().rev() {
+            key.push_str(&format!("[{i}]"));
+        }
+        Some((handle, key))
+    }
+
+    /// §18.8: an element whose rand_mode is off is a state variable for this
+    /// call, so it keeps its value and the other constraints see that value:
+    /// one `elem == value` constraint per disabled element that exists now.
+    pub(super) fn rand_mode_element_pins(&mut self, handle: usize) -> Vec<ConstraintItem> {
+        let keys: Vec<String> = match self.rand_mode_disabled.get(&handle) {
+            Some(d) => d.iter().filter(|k| k.contains('[')).cloned().collect(),
+            None => return Vec::new(),
+        };
+        let mut pins = Vec::new();
+        for key in keys {
+            if !self.signals.contains_key(&format!("{handle}#{key}")) {
+                continue;
+            }
+            let (name, rest) = key.split_at(key.find('[').unwrap());
+            let mut elem = super::vpi_model::ident_expr(name);
+            for i in rest.trim_matches(|c| c == '[' || c == ']').split("][") {
+                let index = Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
+                    }),
+                    crate::ast::Span::dummy(),
+                );
+                elem = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(elem),
+                        index: Box::new(index),
+                    },
+                    crate::ast::Span::dummy(),
+                );
+            }
+            self.this_stack.push(Some(handle));
+            let v = self.eval_expr(&elem);
+            self.this_stack.pop();
+            if v.has_xz() {
+                continue;
+            }
+            let value = Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: Some(v.width),
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Binary,
+                    value: v.to_bin_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                crate::ast::Span::dummy(),
+            );
+            pins.push(ConstraintItem::Expr(Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(elem),
+                    right: Box::new(value),
+                },
+                crate::ast::Span::dummy(),
+            )));
+        }
+        pins
+    }
+
+    /// §18.5.9: whether constraint item `item` of object `obj` reads, through
+    /// handle members, a member of one of the first `upto` objects of the
+    /// running call's chain (`rand_solve_chain`): the enclosing objects a
+    /// handle of the sub-object points back at (`item.addr`).
+    pub(super) fn rand_item_reads_enclosing(
+        &self,
+        obj: usize,
+        item: &ConstraintItem,
+        upto: usize,
+    ) -> bool {
+        let upto = upto.min(self.rand_solve_chain.len());
+        let targets: Vec<usize> = self.rand_solve_chain[..upto]
+            .iter()
+            .copied()
+            .filter(|&h| h != obj)
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let leaf = |e: &Expression| self.csp_path_reaches_any(obj, e, &targets);
+        Self::csp_item_match(item, &leaf, &|_| false)
+    }
+
+    /// §18.5.9: judge a sub-object's back-reference item (see
+    /// `rand_item_reads_enclosing`) on the current values. Unlike the
+    /// general checker, which leaves a `foreach` and the collection queries
+    /// to the solver arms that enforce them, nothing else enforces such an
+    /// item, so every form is evaluated: a `foreach` over a state collection
+    /// of the sub-object element by element. A loop over a shape that
+    /// cannot be enumerated passes, as in `check_member_foreach`.
+    pub(super) fn check_back_reference_item(&mut self, sub: usize, item: &ConstraintItem) -> bool {
+        self.this_stack.push(Some(sub));
+        let ok = self.check_back_reference_item_impl(sub, item);
+        self.this_stack.pop();
+        ok
+    }
+
+    fn advance_indices(idx: &mut [i64], dims: &[(i64, i64)]) -> bool {
+        for k in (0..dims.len()).rev() {
+            idx[k] += 1;
+            if idx[k] <= dims[k].1 {
+                return true;
+            }
+            idx[k] = dims[k].0;
+        }
+        false
+    }
+
+    fn unpacked_array_dims(&self, h: usize, prop: &str) -> Option<Vec<(i64, i64)>> {
+        if let Some((dims, _)) = self.fixed_foreach_dims(h, prop) {
+            return Some(dims);
+        }
+        if let Some((dims, _)) = self.dynamic_prop_foreach_dims(h, prop) {
+            return Some(dims);
+        }
+        let mut cn = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(name) = cn {
+            let cd = self.module.classes.get(&name)?;
+            if cd.queue_properties.contains_key(prop) {
+                let n = self.get_queue_size(&format!("{}#{}", h, prop)) as i64;
+                return Some(vec![(0, n - 1)]);
+            }
+            if cd.properties.contains_key(prop) {
+                return None;
+            }
+            cn = cd.extends.clone();
+        }
+        None
+    }
+
+    /// §18.5.8.1: associative state arrays iterate their existing keys,
+    /// including string keys, rather than a numeric range of positions.
+    pub(super) fn unroll_assoc_constraint_foreach(
+        &self,
+        handle: usize,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
+        let [Some(var)] = vars else { return None; };
+        let (owner, name) = if Self::foreach_plain_member(array) {
+            (handle, Self::foreach_base_name(array)?)
+        } else {
+            self.csp_resolve_member_owner(handle, array)?
+        };
+        let mut class = self.heap.get(owner)?.as_ref()?.class_name.as_str();
+        loop {
+            let cd = self.module.classes.get(class)?;
+            if cd.assoc_properties.contains_key(&name) {
+                break;
+            }
+            if cd.properties.contains_key(&name) {
+                return None;
+            }
+            class = cd.extends.as_deref()?;
+        }
+        let scoped = format!("{owner}#{name}");
+        let string_keys = self.is_string_keyed_array(&scoped);
+        let mut items = Vec::new();
+        for key in self.assoc_key_strs(&scoped) {
+            let literal = if string_keys {
+                Expression::new(ExprKind::StringLiteral(decode_name_key(&key).to_string()), var.span)
+            } else if let Ok(value) = key.parse::<i64>() {
+                Self::literal_of(&Self::signed_loop_val(value), var.span)
+            } else {
+                Self::literal_of(&Value::from_u64(key.parse::<u64>().ok()?, 64), var.span)
+            };
+            let mut item = body.clone();
+            Self::subst_ident_item(&mut item, &var.name, &literal);
+            items.push(item);
+        }
+        Some(items)
+    }
+
+    fn check_back_reference_item_impl(&mut self, sub: usize, item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Block(items) => items
+                .iter()
+                .all(|it| self.check_back_reference_item_impl(sub, it)),
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                !self.eval_expr(condition).is_true()
+                    || self.check_back_reference_item_impl(sub, constraint)
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    self.check_back_reference_item_impl(sub, then_item)
+                } else {
+                    else_item
+                        .as_ref()
+                        .is_none_or(|e| self.check_back_reference_item_impl(sub, e))
+                }
+            }
+            ConstraintItem::Foreach {
+                array,
+                vars,
+                item: body,
+                ..
+            } => {
+                if let Some(items) = self.unroll_assoc_constraint_foreach(sub, array, vars, body) {
+                    return items.iter().all(|it| self.check_back_reference_item_impl(sub, it));
+                }
+                let resolve_dims = |target_h: usize, arr: &Expression, name: &str| {
+                    self.state_foreach_dims(target_h, arr, name, vars.len())
+                        .or_else(|| self.fixed_foreach_dims(target_h, name).map(|d| d.0))
+                        .or_else(|| {
+                            (vars.len() == 1)
+                                .then(|| {
+                                    self.dynamic_prop_foreach_dims(target_h, name)
+                                        .map(|d| d.0)
+                                })
+                                .flatten()
+                        })
+                };
+                let dims = if Self::foreach_plain_member(array) {
+                    Self::foreach_base_name(array)
+                        .and_then(|name| resolve_dims(sub, array, &name))
+                } else {
+                    self.csp_resolve_member_owner(sub, array)
+                        .and_then(|(target_h, leaf)| {
+                            let plain = super::vpi_model::ident_expr(&leaf);
+                            resolve_dims(target_h, &plain, &leaf)
+                        })
+                };
+                let Some(dims) = dims else {
+                    return true;
+                };
+                if dims.len() != vars.len() || dims.iter().any(|&(lo, hi)| hi < lo) {
+                    return true;
+                }
+                let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+                let outer = self.local_stack.last().cloned().unwrap_or_default();
+                loop {
+                    let mut frame = outer.clone();
+                    for (k, v) in vars.iter().enumerate() {
+                        if let Some(v) = v {
+                            frame.insert(v.name.clone(), Self::signed_loop_val(idx[k]));
+                        }
+                    }
+                    self.push_local_frame(frame);
+                    let ok = self.check_back_reference_item_impl(sub, body);
+                    self.pop_local_frame();
+                    if !ok {
+                        return false;
+                    }
+                    if !Self::advance_indices(&mut idx, &dims) {
+                        return true;
+                    }
+                }
+            }
+            ConstraintItem::Unique { exprs, span } => {
+                let mut elems: Vec<Expression> = Vec::new();
+                for e in exprs {
+                    let dims = if let Some(name) = Self::plain_ident_name(e) {
+                        self.unpacked_array_dims(sub, &name)
+                    } else if !Self::foreach_plain_member(e) {
+                        self.csp_resolve_member_owner(sub, e)
+                            .and_then(|(th, leaf)| self.unpacked_array_dims(th, &leaf))
+                    } else {
+                        None
+                    };
+                    if let Some(dims) = dims {
+                        if dims.iter().any(|&(lo, hi)| hi < lo) {
+                            continue;
+                        }
+                        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+                        loop {
+                            let mut ex = e.clone();
+                            for &i in &idx {
+                                ex = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(ex),
+                                        index: Box::new(Self::literal_of(
+                                            &Self::signed_loop_val(i),
+                                            e.span,
+                                        )),
+                                    },
+                                    e.span,
+                                );
+                            }
+                            elems.push(ex);
+                            if !Self::advance_indices(&mut idx, &dims) {
+                                break;
+                            }
+                        }
+                    } else {
+                        elems.push(e.clone());
+                    }
+                }
+                if elems.len() <= 1 {
+                    return true;
+                }
+                let vals: Vec<Value> = elems.iter().map(|e| self.eval_expr(e)).collect();
+                if vals.iter().any(|v| v.has_xz()) {
+                    return false;
+                }
+                if let Some(first) = vals.first()
+                    && !first.is_real
+                    && first.width <= 64
+                    && vals.iter().all(|v| {
+                        !v.is_real && v.width == first.width && v.is_signed == first.is_signed
+                    })
+                {
+                    let mut seen = HashSet::default();
+                    return vals
+                        .iter()
+                        .all(|v| v.to_u64().is_some_and(|u| seen.insert(u)));
+                }
+                for i in 0..vals.len() {
+                    for j in (i + 1)..vals.len() {
+                        let eq = Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Eq,
+                                left: Box::new(Self::literal_of(&vals[i], *span)),
+                                right: Box::new(Self::literal_of(&vals[j], *span)),
+                            },
+                            *span,
+                        );
+                        if self.eval_expr(&eq).is_true() {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            other => self.check_constraint_item_impl(other),
+        }
+    }
+
     /// Budget exhaustion can occur in the parent after a child rolled back.
     /// Include active child constraints when identifying the failed solve.
     pub(super) fn failed_child_constraint_names(&mut self, handle: usize) -> Vec<String> {
@@ -101,35 +527,24 @@ impl Simulator {
                 .get(child)
                 .and_then(|o| o.as_ref())
                 .map(|o| o.class_name.clone());
-            let disabled = self
-                .constraint_mode_disabled
-                .get(&child)
-                .cloned()
-                .unwrap_or_default();
-            let mut current = class.clone();
-            let mut seen = HashSet::default();
-            let mut constraints = Vec::new();
-            while let Some(name) = current {
-                let Some(def) = self.module.classes.get(&name) else {
-                    break;
-                };
-                for (key, constraint) in &def.constraints {
-                    if seen.insert(key.clone())
-                        && !disabled.contains("*")
-                        && !disabled.contains(key)
-                        && !(constraint.is_static
-                            && self
-                                .static_constraint_disabled
-                                .contains(&(name.clone(), key.clone())))
-                    {
-                        constraints.push(constraint.clone());
-                    }
-                }
-                current = def.extends.clone();
-            }
+            let constraints = self.active_constraints(child);
             self.class_context_stack.push(class);
+            let chain = self.rand_solve_chain.len();
+            let above = self
+                .rand_solve_chain
+                .iter()
+                .position(|&h| h == handle)
+                .unwrap_or(0);
             for constraint in constraints {
                 if constraint.items.iter().any(|item| {
+                    // An item that reads an enclosing object through a
+                    // handle back to it is judged in every form.
+                    if self.rand_item_reads_enclosing(child, item, chain) {
+                        if above > 0 && self.rand_item_reads_enclosing(child, item, above) {
+                            return false;
+                        }
+                        return !self.check_back_reference_item(child, item);
+                    }
                     !Self::constraint_unmodeled(item) && !self.check_constraint_item(child, item)
                 }) {
                     names.push(constraint.name.name.clone());
@@ -558,6 +973,7 @@ impl Simulator {
             return Bind::Object;
         }
         if self.local_stack.last().is_some_and(|f| f.contains_key(n))
+            || self.dyn_name_lookup_innermost(n).is_some()
             || self.class_chain_declares(cx.caller_class.as_deref(), n)
         {
             return Bind::Caller;
@@ -770,6 +1186,12 @@ impl Simulator {
             ConstraintItem::Foreach {
                 array, vars, item, ..
             } => {
+                if let Some(iters) = self.unroll_caller_foreach(array, vars, item, cx, bound) {
+                    let mut block = ConstraintItem::Block(iters);
+                    self.freeze_item(&mut block, cx, bound);
+                    *it = block;
+                    return;
+                }
                 self.freeze_expr(array, cx, bound);
                 let depth = bound.len();
                 bound.extend(vars.iter().flatten().map(|v| v.name.clone()));
@@ -1015,7 +1437,7 @@ impl Simulator {
                 signed: v.is_signed,
                 base: NumberBase::Binary,
                 value: digits,
-                cached_val: Cell::new(cached),
+                cached_val: crate::ast::cache::LiteralCache::new(cached),
             }),
             span,
         )
@@ -1193,16 +1615,23 @@ impl Simulator {
                 return false;
             }
             let Some(names) = Self::member_chain(e) else {
-                return false;
+                return Self::rebase_selected_chain(e, t, hit);
             };
-            let skip = usize::from(
-                t.recv
-                    .is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == t.prop),
-            );
-            if names.len() < skip + 2 || names[skip] != t.prop {
+            // `prop` is one name, or `struct_prop.member` for a handle
+            // member of an unpacked-struct property (§18.4).
+            let n = t.prop.split('.').count();
+            let at = |from: usize| {
+                names.len() > from + n
+                    && t.prop
+                        .split('.')
+                        .zip(&names[from..])
+                        .all(|(p, name)| p == name.as_str())
+            };
+            let skip = usize::from(t.recv.is_some_and(|r| names[0] == r && at(1)));
+            if !at(skip) {
                 return false;
             }
-            *e = Self::chain_expr(&names[skip + 1..], e.span);
+            *e = Self::chain_expr(&names[skip + n..], e.span);
             *hit = true;
             return true;
         }
@@ -1240,6 +1669,58 @@ impl Simulator {
                 Self::rebase_expr(expr, t, hit)
                     && ranges.iter_mut().all(|r| Self::rebase_expr(r, t, hit))
             }
+            // A method of a member below `prop` (`prop.r.sum()`): the receiver
+            // is rebased and the call kept, so the sub-object's own solve
+            // reads `r.sum()` of its array.
+            ExprKind::Call { func, args } => {
+                let ExprKind::MemberAccess { expr, .. } = &mut func.kind else {
+                    return false;
+                };
+                Self::rebase_expr(expr, t, hit)
+                    && args.iter_mut().all(|a| Self::rebase_expr(a, t, hit))
+            }
+            _ => false,
+        }
+    }
+
+    /// §18.5.9: `prop.g.item[1].key` — a path below `prop` that selects an
+    /// element on the way (an unrolled `foreach` over a member array of the
+    /// sub-object) — rebased like a plain chain, keeping its selects. Only
+    /// constant selects qualify: an index naming a variable of this object
+    /// could not be read in the sub-object's solve.
+    fn rebase_selected_chain(e: &mut Expression, t: &Rebase<'_>, hit: &mut bool) -> bool {
+        fn constant(x: &Expression) -> bool {
+            match &x.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Paren(i) | ExprKind::Unary { operand: i, .. } => constant(i),
+                ExprKind::Binary { left, right, .. } => constant(left) && constant(right),
+                _ => false,
+            }
+        }
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                let skip = usize::from(t.recv.is_some_and(|r| {
+                    h.path.len() >= 3 && h.path[0].name.name == r && h.path[1].name.name == t.prop
+                }));
+                if h.root.is_some()
+                    || h.path.len() < skip + 2
+                    || h.path[skip].name.name != t.prop
+                    || h.path[..=skip].iter().any(|s| !s.selects.is_empty())
+                    || !h.path[skip + 1..]
+                        .iter()
+                        .all(|s| s.selects.iter().all(constant))
+                {
+                    return false;
+                }
+                h.path.drain(..=skip);
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                *hit = true;
+                true
+            }
+            // `prop.g.item[1].key` parsed as a member access over an index:
+            // the index operand is rebased (a constant stays as it is).
+            ExprKind::MemberAccess { expr, .. } => Self::rebase_expr(expr, t, hit),
             _ => false,
         }
     }
@@ -1339,8 +1820,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -1413,6 +1895,181 @@ impl Simulator {
         Some(self.eval_expr(e).is_true())
     }
 
+    /// §7.4.1/§18.5.8.1: the declared dimensions (unpacked, then packed) of
+    /// a `foreach` array operand, known before the solve even when its
+    /// values are random — including a row selected by an enclosing loop
+    /// (`grid[0]`) and a member reached through a struct or a sub-object
+    /// (`g.item`, `a.g.item`). None for a queue, dynamic or associative array.
+    fn fixed_constraint_foreach_dims(&self, array: &Expression) -> Option<Vec<(i64, i64)>> {
+        if let ExprKind::Ident(h) = &array.kind
+            && let Some(last) = h.path.last()
+            && !last.selects.is_empty()
+        {
+            let count = last.selects.len();
+            let mut h = h.clone();
+            h.path.last_mut()?.selects.clear();
+            let base = Expression::new(ExprKind::Ident(h), array.span);
+            let dims = self.fixed_constraint_foreach_dims(&base)?;
+            return Some(dims.get(count..)?.to_vec());
+        }
+        if let ExprKind::Index { expr, .. } = &array.kind {
+            let mut dims = self.fixed_constraint_foreach_dims(expr)?;
+            if dims.is_empty() {
+                return None;
+            }
+            dims.remove(0);
+            return Some(dims);
+        }
+        let shape = self.query_operand_decl_dims(array)?;
+        Some(shape.dims)
+    }
+
+    /// The iterations of `foreach (array[vars]) body` over the fixed shape of
+    /// `array` (see `fixed_constraint_foreach_dims`), each loop variable
+    /// replaced by its index; an omitted variable (`grid[, j]`) iterates
+    /// nothing of its own (§12.7.3).
+    fn unroll_fixed_foreach(
+        &self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
+        let dims = self.fixed_constraint_foreach_dims(array)?;
+        let dims: Vec<(i64, i64)> = dims
+            .get(..vars.len())?
+            .iter()
+            .zip(vars)
+            .map(|(&(l, r), v)| {
+                if v.is_some() {
+                    (l.min(r), l.max(r))
+                } else {
+                    (0, 0)
+                }
+            })
+            .collect();
+        Self::unroll_foreach_dims(&dims, vars, body)
+    }
+
+    /// Whether the solvers already model `foreach (array[vars])` as written:
+    /// a plain class property (`a`, `this.a`) with one loop variable per
+    /// unpacked dimension, or a packed property iterated by its packed
+    /// dimensions.
+    fn foreach_shape_modeled(
+        &self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+    ) -> bool {
+        let plain = match &array.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && (h.path.len() == 1 || (h.path.len() == 2 && h.path[0].name.name == "this"))
+            }
+            ExprKind::MemberAccess { expr, .. } => matches!(expr.kind, ExprKind::This),
+            _ => false,
+        };
+        plain
+            && self.query_operand_decl_dims(array).is_some_and(|shape| {
+                shape.unpacked == 0
+                    || (shape.unpacked == vars.len() && vars.iter().all(Option::is_some))
+            })
+    }
+
+    /// §18.5.8.1: unroll every `foreach` of `item` whose array has a fixed
+    /// shape the solvers do not model as written — an array reached through
+    /// a struct member or a sub-object (`g.item`, `a.g.item`), a row of a
+    /// multi-dimensional array, fewer loop variables than unpacked
+    /// dimensions, an omitted variable — so its body is solved like any
+    /// other constraint instead of being dropped. `all` unrolls every
+    /// fixed-shape loop (for the `randomize(null)` check, which models no
+    /// `foreach`). None when nothing changed.
+    pub(super) fn expand_fixed_foreach(
+        &self,
+        item: &ConstraintItem,
+        all: bool,
+    ) -> Option<ConstraintItem> {
+        let recurse = |x: &ConstraintItem| self.expand_fixed_foreach(x, all);
+        match item {
+            ConstraintItem::Foreach {
+                array,
+                vars,
+                item: body,
+                span,
+            } => {
+                if all || !self.foreach_shape_modeled(array, vars) {
+                    if let Some(items) = self.unroll_fixed_foreach(array, vars, body) {
+                        return Some(ConstraintItem::Block(
+                            items
+                                .into_iter()
+                                .map(|x| recurse(&x).unwrap_or(x))
+                                .collect(),
+                        ));
+                    }
+                }
+                Some(ConstraintItem::Foreach {
+                    array: array.clone(),
+                    vars: vars.clone(),
+                    item: Box::new(recurse(body)?),
+                    span: *span,
+                })
+            }
+            ConstraintItem::Block(items) => {
+                let new: Vec<Option<ConstraintItem>> = items.iter().map(recurse).collect();
+                if new.iter().all(Option::is_none) {
+                    return None;
+                }
+                Some(ConstraintItem::Block(
+                    new.into_iter()
+                        .zip(items)
+                        .map(|(n, o)| n.unwrap_or_else(|| o.clone()))
+                        .collect(),
+                ))
+            }
+            ConstraintItem::Soft(body) => Some(ConstraintItem::Soft(Box::new(recurse(body)?))),
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                span,
+            } => {
+                let then_new = recurse(then_item);
+                let else_new = else_item.as_ref().map(|e| recurse(e));
+                if then_new.is_none() && else_new.as_ref().is_none_or(Option::is_none) {
+                    return None;
+                }
+                Some(ConstraintItem::IfElse {
+                    condition: condition.clone(),
+                    then_item: Box::new(then_new.unwrap_or_else(|| (**then_item).clone())),
+                    else_item: else_item
+                        .as_ref()
+                        .map(|e| Box::new(else_new.flatten().unwrap_or_else(|| (**e).clone()))),
+                    span: *span,
+                })
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                span,
+            } => Some(ConstraintItem::Implication {
+                condition: condition.clone(),
+                constraint: Box::new(recurse(constraint)?),
+                span: *span,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `expand_fixed_foreach` over a list of items, rewriting in place (the
+    /// list's buffer is kept, so a scope keyed on it stays valid). Cheap when
+    /// no item holds a `foreach`.
+    pub(super) fn expand_fixed_foreach_items(&self, items: &mut [ConstraintItem], all: bool) {
+        for it in items {
+            if let Some(n) = self.expand_fixed_foreach(it, all) {
+                *it = n;
+            }
+        }
+    }
+
     /// The iterations of `foreach (array[vars]) item` with every loop
     /// variable replaced by its index literal, when `array` is a state
     /// container (a 1-D/N-D unpacked array, queue or dynamic array, or a
@@ -1441,11 +2098,77 @@ impl Simulator {
         } else {
             return None;
         };
+        Self::unroll_foreach_dims(&dims, vars, item)
+    }
+
+    /// §18.5.8.1/§18.7: `foreach (arr[vars]) item` whose array binds in the
+    /// scope of the randomize() call (`cfg.held` read from a method
+    /// of the calling class). The solve runs with `this` switched to the
+    /// object, where the caller's array no longer resolves, so the loop is
+    /// unrolled here over the array's current shape. None when the array is
+    /// not a caller-scope collection.
+    fn unroll_caller_foreach(
+        &mut self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        item: &ConstraintItem,
+        cx: &CallerScope,
+        bound: &[String],
+    ) -> Option<Vec<ConstraintItem>> {
+        if vars.is_empty() || self.operand_bind(array, cx, bound) != Some(true) {
+            return None;
+        }
+        let dims = match self.foreach_check_operand_name(array) {
+            Some(name) if self.is_associative_array(&name) => return None,
+            Some(name) => self.foreach_check_dims(&name, vars.len()),
+            None => self.query_foreach_dims(array, vars.len())?,
+        };
+        Self::unroll_foreach_dims(&dims, vars, item)
+    }
+
+    /// §20.7: (low, high) of the first `nvars` unpacked dimensions of
+    /// `array`, read with the array query functions. Covers operands the
+    /// name-keyed stores do not (`cfg.grid` for a 2-D member of a handle).
+    fn query_foreach_dims(&mut self, array: &Expression, nvars: usize) -> Option<Vec<(i64, i64)>> {
+        let call = |name: &str, d: Option<usize>| {
+            let mut args = vec![array.clone()];
+            if let Some(d) = d {
+                args.push(Self::literal_of(&Value::from_u64(d as u64, 32), array.span));
+            }
+            Expression::new(
+                ExprKind::SystemCall {
+                    name: name.to_string(),
+                    args,
+                },
+                array.span,
+            )
+        };
+        let nd = self.eval_expr(&call("$unpacked_dimensions", None)).to_u64()? as usize;
+        if nd < nvars {
+            return None;
+        }
+        (1..=nvars)
+            .map(|d| {
+                let l = self.eval_expr(&call("$left", Some(d))).to_i64()?;
+                let r = self.eval_expr(&call("$right", Some(d))).to_i64()?;
+                Some((l.min(r), l.max(r)))
+            })
+            .collect()
+    }
+
+    /// The iterations of `foreach (...[vars]) item` over `dims`, each loop
+    /// variable replaced by its index literal. None above 4096 iterations or
+    /// when the dimensions do not match the loop variables.
+    fn unroll_foreach_dims(
+        dims: &[(i64, i64)],
+        vars: &[Option<crate::ast::Identifier>],
+        item: &ConstraintItem,
+    ) -> Option<Vec<ConstraintItem>> {
         if dims.len() != vars.iter().filter(|v| v.is_some()).count() && dims.len() != vars.len() {
             return None;
         }
         let mut total: u64 = 1;
-        for &(lo, hi) in &dims {
+        for &(lo, hi) in dims {
             if hi < lo {
                 return Some(Vec::new());
             }
@@ -1779,8 +2502,11 @@ impl Simulator {
                 // §18.5.8.1: a `foreach` over a STATE container iterates a
                 // known index set — unroll it, so each iteration's guards
                 // (`if (mask[i])`) are decided like any other state guard.
-                if let Some(unrolled) =
-                    self.unroll_state_foreach(array, vars, item, rand_roots, bound)
+                // So does one over a random array of fixed declared shape
+                // (`s.item` of a struct variable).
+                if let Some(unrolled) = self
+                    .unroll_state_foreach(array, vars, item, rand_roots, bound)
+                    .or_else(|| self.unroll_fixed_foreach(array, vars, item))
                 {
                     let body: Vec<ConstraintItem> = unrolled
                         .iter()
@@ -2071,4 +2797,649 @@ impl Simulator {
             _ => {}
         }
     }
+
+    fn lookup_obj_handle(&self, owner: usize, prop: &str) -> Option<usize> {
+        let h = self
+            .heap
+            .get(owner)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(prop))
+            .and_then(|v| v.to_u64())
+            .unwrap_or(0) as usize;
+        (h != 0 && self.heap.get(h).and_then(|o| o.as_ref()).is_some()).then_some(h)
+    }
+
+    fn class_has_property(&self, handle: usize, prop: &str) -> bool {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if cd.properties.contains_key(prop)
+                || cd.array_properties.contains_key(prop)
+                || cd.array_nd_properties.contains_key(prop)
+                || cd.queue_properties.contains_key(prop)
+                || cd.assoc_properties.contains_key(prop)
+            {
+                return true;
+            }
+            cur = cd.extends.clone();
+        }
+        false
+    }
+
+    fn member_is_coll(&self, owner: usize, prop: &str) -> bool {
+        let coll_name = format!("{}#{}", owner, prop);
+        if self.is_associative_array(&coll_name) {
+            return true;
+        }
+        let mut cn = self
+            .heap
+            .get(owner)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(c) = cn {
+            let Some(cd) = self.module.classes.get(&c) else {
+                break;
+            };
+            if cd.queue_properties.contains_key(prop) || cd.array_properties.contains_key(prop) {
+                return true;
+            }
+            cn = cd.extends.clone();
+        }
+        false
+    }
+
+    /// Walk active rand sub-objects reachable from `handle` via `rand_obj_props`,
+    /// recording `(sub_handle, access_expr)` in DFS/BFS order for non-CSP solving.
+    fn collect_reachable_child_handles(
+        &self,
+        handle: usize,
+        rand_obj_props: &[String],
+    ) -> Vec<(usize, Expression)> {
+        let span = crate::ast::Span::new(0, 0);
+        let mut out: Vec<(usize, Expression)> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::default();
+        seen.insert(handle);
+        let mut queue: Vec<(usize, Option<Expression>, Vec<String>)> = vec![(
+            handle,
+            None,
+            rand_obj_props.to_vec(),
+        )];
+        while let Some((owner, owner_access, props)) = queue.pop() {
+            let owner_disabled = self
+                .rand_mode_disabled
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default();
+            for prop in props {
+                let base = match &owner_access {
+                    None => Self::chain_expr(std::slice::from_ref(&prop), span),
+                    Some(oa) => Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(oa.clone()),
+                            member: crate::ast::Identifier { name: prop.clone(), span },
+                        },
+                        span,
+                    ),
+                };
+                if self.member_is_coll(owner, &prop) {
+                    let coll_name = format!("{}#{}", owner, prop);
+                    if self.is_associative_array(&coll_name) {
+                        for key in self.assoc_key_strs(&coll_name) {
+                            if owner_disabled.contains(&format!("{}[{}]", prop, key)) {
+                                continue;
+                            }
+                            let key_expr = if self.is_string_keyed_array(&coll_name) {
+                                Expression::new(
+                                    ExprKind::StringLiteral(decode_name_key(&key).to_string()),
+                                    span,
+                                )
+                            } else if let Ok(n) = key.parse::<i64>() {
+                                Self::literal_of(&Self::signed_loop_val(n), span)
+                            } else if let Ok(u) = key.parse::<u64>() {
+                                Self::literal_of(&Value::from_u64(u, 64), span)
+                            } else {
+                                continue;
+                            };
+                            let Some(v) =
+                                self.get_signal_value_by_name(&format!("{}[{}]", coll_name, key))
+                            else {
+                                continue;
+                            };
+                            let sub = v.to_u64().unwrap_or(0) as usize;
+                            if sub != 0
+                                && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
+                                && seen.insert(sub)
+                            {
+                                let access = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(base.clone()),
+                                        index: Box::new(key_expr),
+                                    },
+                                    span,
+                                );
+                                let next_props = self.active_child_rand_members(sub);
+                                out.push((sub, access.clone()));
+                                queue.push((sub, Some(access), next_props));
+                            }
+                        }
+                    } else {
+                        let n = self.get_queue_size(&coll_name);
+                        for i in 0..n {
+                            if owner_disabled.contains(&format!("{}[{}]", prop, i)) {
+                                continue;
+                            }
+                            let Some(v) =
+                                self.get_signal_value_by_name(&format!("{}[{}]", coll_name, i))
+                            else {
+                                continue;
+                            };
+                            let sub = v.to_u64().unwrap_or(0) as usize;
+                            if sub != 0
+                                && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
+                                && seen.insert(sub)
+                            {
+                                let access = Expression::new(
+                                    ExprKind::Index {
+                                        expr: Box::new(base.clone()),
+                                        index: Box::new(Self::literal_of(
+                                            &Value::from_u64(i, 32),
+                                            span,
+                                        )),
+                                    },
+                                    span,
+                                );
+                                let next_props = self.active_child_rand_members(sub);
+                                out.push((sub, access.clone()));
+                                queue.push((sub, Some(access), next_props));
+                            }
+                        }
+                    }
+                } else if let Some(sub) = self.lookup_obj_handle(owner, &prop)
+                    && seen.insert(sub)
+                {
+                    let next_props = self.active_child_rand_members(sub);
+                    out.push((sub, base.clone()));
+                    queue.push((sub, Some(base), next_props));
+                }
+            }
+        }
+        out
+    }
+
+    /// Collect and rebase all active constraint items on reachable sub-objects
+    /// that read `handle` through a back-reference handle, so the non-CSP
+    /// solver (`!csp_ok`) solves `handle` against them directly.
+    pub(super) fn collect_enclosing_back_ref_items(
+        &mut self,
+        handle: usize,
+        rand_obj_props: &[String],
+    ) -> Vec<ConstraintItem> {
+        let children = self.collect_reachable_child_handles(handle, rand_obj_props);
+        let chain = self.rand_solve_chain.len();
+        let above = self
+            .rand_solve_chain
+            .iter()
+            .position(|&h| h == handle)
+            .unwrap_or(0);
+        let mut out = Vec::new();
+        for (sub, sub_access) in children {
+            let class = self
+                .heap
+                .get(sub)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.class_name.clone());
+            let constraints = self.active_constraints(sub);
+            self.this_stack.push(Some(sub));
+            self.class_context_stack.push(class);
+            let mut bound = Vec::new();
+            for con in constraints {
+                for item in &con.items {
+                    if !self.rand_item_reads_enclosing(sub, item, chain) {
+                        continue;
+                    }
+                    if above > 0 && self.rand_item_reads_enclosing(sub, item, above) {
+                        continue;
+                    }
+                    let mut unrolled = Vec::new();
+                    if self.csp_unroll_item(sub, None, item, &mut unrolled).is_none() {
+                        unrolled.push(item.clone());
+                    }
+                    for ui in &unrolled {
+                        out.push(self.rewrite_back_ref_item(
+                            sub,
+                            handle,
+                            &sub_access,
+                            ui,
+                            &mut bound,
+                        ));
+                    }
+                }
+            }
+            self.class_context_stack.pop();
+            self.this_stack.pop();
+        }
+        out
+    }
+
+    fn rewrite_back_ref_item(
+        &self,
+        sub: usize,
+        target: usize,
+        sub_access: &Expression,
+        item: &ConstraintItem,
+        bound: &mut Vec<String>,
+    ) -> ConstraintItem {
+        let rw_e = |e: &Expression, b: &[String]| {
+            self.rewrite_back_ref_expr(sub, target, sub_access, e, b)
+        };
+        match item {
+            ConstraintItem::Expr(e) => ConstraintItem::Expr(rw_e(e, bound)),
+            ConstraintItem::Inside {
+                expr,
+                range,
+                is_dist,
+                dist_weights,
+                span,
+            } => ConstraintItem::Inside {
+                expr: rw_e(expr, bound),
+                range: range
+                    .iter()
+                    .map(|r| match r {
+                        ConstraintRange::Value(v) => ConstraintRange::Value(rw_e(v, bound)),
+                        ConstraintRange::Range { lo, hi } => ConstraintRange::Range {
+                            lo: rw_e(lo, bound),
+                            hi: rw_e(hi, bound),
+                        },
+                    })
+                    .collect(),
+                is_dist: *is_dist,
+                dist_weights: dist_weights
+                    .iter()
+                    .map(|ow| {
+                        ow.as_ref().map(|w| match w {
+                            DistWeight::Each(e) => DistWeight::Each(rw_e(e, bound)),
+                            DistWeight::Total(e) => DistWeight::Total(rw_e(e, bound)),
+                        })
+                    })
+                    .collect(),
+                span: *span,
+            },
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                span,
+            } => ConstraintItem::Implication {
+                condition: rw_e(condition, bound),
+                constraint: Box::new(self.rewrite_back_ref_item(
+                    sub,
+                    target,
+                    sub_access,
+                    constraint,
+                    bound,
+                )),
+                span: *span,
+            },
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                span,
+            } => ConstraintItem::IfElse {
+                condition: rw_e(condition, bound),
+                then_item: Box::new(self.rewrite_back_ref_item(
+                    sub,
+                    target,
+                    sub_access,
+                    then_item,
+                    bound,
+                )),
+                else_item: else_item.as_ref().map(|e| {
+                    Box::new(self.rewrite_back_ref_item(sub, target, sub_access, e, bound))
+                }),
+                span: *span,
+            },
+            ConstraintItem::Foreach {
+                array,
+                vars,
+                item: body,
+                span,
+            } => {
+                let new_arr = rw_e(array, bound);
+                let depth = bound.len();
+                bound.extend(vars.iter().flatten().map(|v| v.name.clone()));
+                let new_body = self.rewrite_back_ref_item(sub, target, sub_access, body, bound);
+                bound.truncate(depth);
+                ConstraintItem::Foreach {
+                    array: new_arr,
+                    vars: vars.clone(),
+                    item: Box::new(new_body),
+                    span: *span,
+                }
+            }
+            ConstraintItem::Soft(inner) => ConstraintItem::Soft(Box::new(
+                self.rewrite_back_ref_item(sub, target, sub_access, inner, bound),
+            )),
+            ConstraintItem::Block(items) => ConstraintItem::Block(
+                items
+                    .iter()
+                    .map(|i| self.rewrite_back_ref_item(sub, target, sub_access, i, bound))
+                    .collect(),
+            ),
+            ConstraintItem::Unique { exprs, span } => ConstraintItem::Unique {
+                exprs: exprs.iter().map(|e| rw_e(e, bound)).collect(),
+                span: *span,
+            },
+            ConstraintItem::Solve { .. } => item.clone(),
+        }
+    }
+
+    fn rewrite_back_ref_expr(
+        &self,
+        sub: usize,
+        target: usize,
+        sub_access: &Expression,
+        e: &Expression,
+        bound: &[String],
+    ) -> Expression {
+        match self.rewrite_back_ref_expr_inner(sub, target, sub_access, e, bound) {
+            Some(BackRefTarget::Expr(ex)) => ex,
+            Some(BackRefTarget::TargetThis) => {
+                Self::chain_expr(&["this".to_string()], e.span)
+            }
+            Some(BackRefTarget::SubThis) => sub_access.clone(),
+            None => e.clone(),
+        }
+    }
+
+    fn rewrite_hier_selects(
+        &self,
+        sub: usize,
+        target: usize,
+        sub_access: &Expression,
+        segs: &[crate::ast::expr::HierPathSegment],
+        bound: &[String],
+    ) -> Vec<crate::ast::expr::HierPathSegment> {
+        segs.iter()
+            .map(|seg| crate::ast::expr::HierPathSegment {
+                name: seg.name.clone(),
+                selects: seg
+                    .selects
+                    .iter()
+                    .map(|s| self.rewrite_back_ref_expr(sub, target, sub_access, s, bound))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn wrap_selects(
+        &self,
+        mut base: Expression,
+        selects: Vec<Expression>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        for sel in selects {
+            base = Expression::new(
+                ExprKind::Index {
+                    expr: Box::new(base),
+                    index: Box::new(sel),
+                },
+                span,
+            );
+        }
+        base
+    }
+
+    fn rewrite_back_ref_expr_inner(
+        &self,
+        sub: usize,
+        target: usize,
+        sub_access: &Expression,
+        e: &Expression,
+        bound: &[String],
+    ) -> Option<BackRefTarget> {
+        let rw = |x: &Expression| self.rewrite_back_ref_expr(sub, target, sub_access, x, bound);
+        let out = match &e.kind {
+            ExprKind::Ident(hier) => {
+                if hier.root.is_none() && !hier.path.is_empty() {
+                    if hier.path.len() == 1
+                        && hier.path[0].selects.is_empty()
+                        && bound.contains(&hier.path[0].name.name)
+                    {
+                        return Some(BackRefTarget::Expr(e.clone()));
+                    }
+                    let has_this = hier.path[0].name.name == "this" && hier.path[0].selects.is_empty();
+                    if has_this && hier.path.len() == 1 {
+                        return Some(BackRefTarget::SubThis);
+                    }
+                    let start = usize::from(has_this);
+                    let mut cur_h = sub;
+                    for i in start..hier.path.len() {
+                        let seg = &hier.path[i];
+                        if !seg.selects.is_empty() {
+                            break;
+                        }
+                        let Some(next_h) = self.lookup_obj_handle(cur_h, &seg.name.name) else {
+                            break;
+                        };
+                        if next_h == target {
+                            let rest = self.rewrite_hier_selects(
+                                sub,
+                                target,
+                                sub_access,
+                                &hier.path[i + 1..],
+                                bound,
+                            );
+                            if rest.is_empty() {
+                                return Some(BackRefTarget::TargetThis);
+                            }
+                            if rest.iter().all(|s| s.selects.is_empty()) {
+                                let names: Vec<String> =
+                                    rest.iter().map(|s| s.name.name.clone()).collect();
+                                return Some(BackRefTarget::Expr(Self::chain_expr(&names, e.span)));
+                            }
+                            let mut cur = Self::chain_expr(
+                                std::slice::from_ref(&rest[0].name.name),
+                                e.span,
+                            );
+                            cur = self.wrap_selects(cur, rest[0].selects.clone(), e.span);
+                            for seg in &rest[1..] {
+                                cur = Expression::new(
+                                    ExprKind::MemberAccess {
+                                        expr: Box::new(cur),
+                                        member: seg.name.clone(),
+                                    },
+                                    e.span,
+                                );
+                                cur = self.wrap_selects(cur, seg.selects.clone(), e.span);
+                            }
+                            return Some(BackRefTarget::Expr(cur));
+                        }
+                        cur_h = next_h;
+                    }
+                    let root_name = &hier.path[start].name.name;
+                    if !bound.contains(root_name) && self.class_has_property(sub, root_name) {
+                        let segs = self.rewrite_hier_selects(
+                            sub,
+                            target,
+                            sub_access,
+                            &hier.path[start..],
+                            bound,
+                        );
+                        let mut cur = Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(sub_access.clone()),
+                                member: segs[0].name.clone(),
+                            },
+                            e.span,
+                        );
+                        cur = self.wrap_selects(cur, segs[0].selects.clone(), e.span);
+                        for seg in &segs[1..] {
+                            cur = Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(cur),
+                                    member: seg.name.clone(),
+                                },
+                                e.span,
+                            );
+                            cur = self.wrap_selects(cur, seg.selects.clone(), e.span);
+                        }
+                        return Some(BackRefTarget::Expr(cur));
+                    }
+                }
+                let mut h = hier.clone();
+                h.path = self.rewrite_hier_selects(sub, target, sub_access, &hier.path, bound);
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
+                Expression::new(ExprKind::Ident(h), e.span)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                match self.rewrite_back_ref_expr_inner(sub, target, sub_access, expr, bound) {
+                    Some(BackRefTarget::TargetThis) => {
+                        Self::chain_expr(std::slice::from_ref(&member.name), e.span)
+                    }
+                    Some(BackRefTarget::SubThis) => {
+                        if self.lookup_obj_handle(sub, &member.name) == Some(target) {
+                            return Some(BackRefTarget::TargetThis);
+                        }
+                        if self.class_has_property(sub, &member.name) {
+                            Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(sub_access.clone()),
+                                    member: member.clone(),
+                                },
+                                e.span,
+                            )
+                        } else {
+                            Expression::new(
+                                ExprKind::MemberAccess {
+                                    expr: Box::new(expr.as_ref().clone()),
+                                    member: member.clone(),
+                                },
+                                e.span,
+                            )
+                        }
+                    }
+                    Some(BackRefTarget::Expr(inner)) => Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(inner),
+                            member: member.clone(),
+                        },
+                        e.span,
+                    ),
+                    None => e.clone(),
+                }
+            }
+            ExprKind::Paren(inner) => match self
+                .rewrite_back_ref_expr_inner(sub, target, sub_access, inner, bound)
+            {
+                Some(BackRefTarget::TargetThis) => return Some(BackRefTarget::TargetThis),
+                Some(BackRefTarget::SubThis) => return Some(BackRefTarget::SubThis),
+                Some(BackRefTarget::Expr(ex)) => Expression::new(ExprKind::Paren(Box::new(ex)), e.span),
+                None => e.clone(),
+            },
+            ExprKind::Unary { op, operand } => Expression::new(
+                ExprKind::Unary {
+                    op: *op,
+                    operand: Box::new(rw(operand)),
+                },
+                e.span,
+            ),
+            ExprKind::Binary { op, left, right } => Expression::new(
+                ExprKind::Binary {
+                    op: *op,
+                    left: Box::new(rw(left)),
+                    right: Box::new(rw(right)),
+                },
+                e.span,
+            ),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => Expression::new(
+                ExprKind::Conditional {
+                    condition: Box::new(rw(condition)),
+                    then_expr: Box::new(rw(then_expr)),
+                    else_expr: Box::new(rw(else_expr)),
+                },
+                e.span,
+            ),
+            ExprKind::Concatenation(parts) => {
+                Expression::new(ExprKind::Concatenation(parts.iter().map(rw).collect()), e.span)
+            }
+            ExprKind::Replication { count, exprs } => Expression::new(
+                ExprKind::Replication {
+                    count: Box::new(rw(count)),
+                    exprs: exprs.iter().map(rw).collect(),
+                },
+                e.span,
+            ),
+            ExprKind::Call { func, args } => Expression::new(
+                ExprKind::Call {
+                    func: Box::new(rw(func)),
+                    args: args.iter().map(rw).collect(),
+                },
+                e.span,
+            ),
+            ExprKind::SystemCall { name, args } => Expression::new(
+                ExprKind::SystemCall {
+                    name: name.clone(),
+                    args: args.iter().map(rw).collect(),
+                },
+                e.span,
+            ),
+            ExprKind::Inside { expr, ranges } => Expression::new(
+                ExprKind::Inside {
+                    expr: Box::new(rw(expr)),
+                    ranges: ranges.iter().map(rw).collect(),
+                },
+                e.span,
+            ),
+            ExprKind::Index { expr, index } => Expression::new(
+                ExprKind::Index {
+                    expr: Box::new(rw(expr)),
+                    index: Box::new(rw(index)),
+                },
+                e.span,
+            ),
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => Expression::new(
+                ExprKind::RangeSelect {
+                    expr: Box::new(rw(expr)),
+                    kind: *kind,
+                    left: Box::new(rw(left)),
+                    right: Box::new(rw(right)),
+                },
+                e.span,
+            ),
+            ExprKind::Range(a, b) => {
+                Expression::new(ExprKind::Range(Box::new(rw(a)), Box::new(rw(b))), e.span)
+            }
+            ExprKind::WithClause { expr, filter } => Expression::new(
+                ExprKind::WithClause {
+                    expr: Box::new(rw(expr)),
+                    filter: Box::new(rw(filter)),
+                },
+                e.span,
+            ),
+            _ => return None,
+        };
+        Some(BackRefTarget::Expr(out))
+    }
+}
+
+enum BackRefTarget {
+    TargetThis,
+    SubThis,
+    Expr(Expression),
 }

@@ -294,6 +294,8 @@ impl Simulator {
         let Some(lkey) = self.event_ref_key(lvalue) else {
             return false;
         };
+        // A re-bound event reads the target's `.triggered` stamp from now on.
+        note_event_trigger();
         if matches!(rvalue.kind, ExprKind::Null) {
             self.event_aliases
                 .insert(lkey, Self::EVENT_NULL_KEY.to_string());
@@ -618,6 +620,11 @@ impl Simulator {
         &mut self,
         event: &EventControl,
     ) -> Option<Expression> {
+        // §13.5.2: `@(x)` on a `ref` formal aliased to a property waits for
+        // a change of that property.
+        if let Some(ev) = self.ref_event_on_pinned_prop(event) {
+            return self.class_prop_value_change_cond(&ev);
+        }
         let exprs = if let EventControl::EventExpr(terms) = event
             && terms.len() > 1
         {
@@ -651,30 +658,515 @@ impl Simulator {
         }))
     }
 
+    // A fixed array can contain null handles when an always block first arms.
+    // The declared element class still identifies the property to sample.
+    fn selected_receiver_value_property(&self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, member } = &e.kind else {
+            return false;
+        };
+        if !matches!(expr.kind, ExprKind::Index { .. }) {
+            return false;
+        }
+        self.get_expr_type_name(expr)
+            .and_then(|class| self.class_property_decl_type(&class, &member.name))
+            .is_some_and(|(dt, dims)| dims.is_empty() && !matches!(
+                self.resolve_dt_ref(&dt),
+                DataType::Simple { kind: crate::ast::types::SimpleType::Event, .. }
+            ))
+    }
+
+    fn expr_has_non_event_prop(&mut self, expr: &Expression) -> bool {
+        match &expr.kind {
+            ExprKind::Paren(inner) => self.expr_has_non_event_prop(inner),
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let fname = &h.path[0].name.name;
+                if self.method_local_shadows(fname) {
+                    return false;
+                }
+                self.this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .filter(|&h| !self.class_prop_is_event(h, fname))
+                    .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                    .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_has_non_event_prop(left) || self.expr_has_non_event_prop(right)
+            }
+            ExprKind::Unary { operand, .. } => self.expr_has_non_event_prop(operand),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_has_non_event_prop(condition)
+                    || self.expr_has_non_event_prop(then_expr)
+                    || self.expr_has_non_event_prop(else_expr)
+            }
+            _ => {
+                self.selected_receiver_value_property(expr)
+                    || self.expr_handle_prop_any(expr)
+                        .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f))
+                    || (self.chain_rooted_at_handle(expr)
+                        && !self.chain_may_name_vif(expr)
+                        && self
+                            .expr_instance_prop_field_general(expr)
+                            .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f)))
+            }
+        }
+    }
+
     fn class_prop_value_change_expr(&mut self, event: &EventControl) -> Option<Expression> {
         let expr = Self::event_control_single_expr(event)?;
-        let on_class_prop = if let Some(fname) = self.event_control_field_name(event)
-            && !self.method_local_shadows(&fname)
-        {
-            self.this_stack
-                .last()
-                .copied()
-                .flatten()
-                .filter(|&h| !self.class_prop_is_event(h, &fname))
-                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
-        } else {
-            false
-        } || self
-            .expr_handle_prop_any(&expr)
-            .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f));
-        if !on_class_prop {
+        if !self.expr_has_non_event_prop(&expr) {
             return None;
         }
         Some(expr)
     }
 
+    /// `@(vif)` / `@(vifs[i])` / `@(cfg.vif)`: an event control on a
+    /// virtual-interface VARIABLE, not on a member of the interface. §9.4.2
+    /// makes it a wait for a change of the operand's value, and §25.9 makes
+    /// that value the instance the variable refers to, so the wait resumes
+    /// when the variable is assigned a different instance (or null). Such an
+    /// operand has no signal: a bare property read back a constant, so the
+    /// wait never resumed, and an element (`@(vifs[0])`) armed on nothing and
+    /// returned at once, spinning its loop at one time step. `None` for an
+    /// edge or `iff` term, or any term that is not such a variable.
+    pub(super) fn vif_value_change_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        let EventControl::EventExpr(terms) = event else {
+            return None;
+        };
+        if self.module.interfaces.is_empty()
+            || terms
+                .iter()
+                .any(|t| t.edge.is_some() || t.iff.is_some() || !self.vif_handle_term(&t.expr))
+        {
+            return None;
+        }
+        let mut conds = Vec::with_capacity(terms.len());
+        for t in terms {
+            conds.push(self.value_change_cond(Self::vif_value_expr(t.expr.clone())));
+        }
+        let mut conds = conds.into_iter();
+        let first = conds.next()?;
+        Some(conds.fold(first, |left, right| {
+            let span = left.span;
+            Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }))
+    }
+
+    /// Is `e` a declared virtual-interface variable — a bare name, a
+    /// property reached through handles, or an element of a collection of
+    /// them — rather than a member of the interface it refers to?
+    fn vif_handle_term(&self, e: &Expression) -> bool {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        let mut base = e;
+        while let ExprKind::Index { expr, .. } = &base.kind {
+            base = expr;
+        }
+        let name = match &base.kind {
+            ExprKind::Ident(h) if h.root.is_none() => match h.path.last() {
+                Some(s) => s.name.name.as_str(),
+                None => return false,
+            },
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            _ => return false,
+        };
+        if !self.vif_name_possible(name) && !self.vif_tokens_stored {
+            return false;
+        }
+        self.vif_operand(e).is_some() || self.vif_recv_target(e).is_some()
+    }
+
+    /// `$__xz_vif_value(e)`.
+    fn vif_value_expr(e: Expression) -> Expression {
+        let span = e.span;
+        Expression::new(
+            ExprKind::SystemCall {
+                name: VIF_VALUE_MARKER.to_string(),
+                args: vec![e],
+            },
+            span,
+        )
+    }
+
+    /// The `$__xz_vif_value` of `e` (see [`VIF_VALUE_MARKER`]).
+    pub(super) fn vif_handle_value(&self, e: &Expression) -> u64 {
+        let bound = match self.vif_operand(e) {
+            Some(b) => b,
+            None => self.vif_recv_target(e).map(|(b, _)| b),
+        };
+        bound.map_or(0, |b| Self::iface_handle_token(&b))
+    }
+
+    /// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` where the term is
+    /// a NON-signal operand — a class property, a static, or a procedural
+    /// local. §9.4.2 makes the wait edge-sensitive on the operand's value, but
+    /// such an operand has no signal id to arm, so `event_to_sens` produced a
+    /// sensitivity that resolved to nothing and the wait degenerated to a
+    /// same-time yield: it returned in the current time step (or after the NBA
+    /// region) instead of blocking, so a handshake task waiting on its own
+    /// flag-class-property spun for the whole run. Arm the value instead: a
+    /// snapshot plus an edge-aware condition, parked on the ordinary
+    /// value-change wake path. `None` when the control has no edge, more than
+    /// one term, an `iff`, an `event` operand, or still names a real signal
+    /// (those keep the signal-sensitivity path).
+    pub(super) fn class_prop_edge_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        // §13.5.2: `@(posedge x)` on a formal aliased to a property.
+        if let Some(ev) = self.ref_event_on_pinned_prop(event) {
+            return self.class_prop_edge_cond(&ev);
+        }
+        let EventControl::EventExpr(terms) = event else {
+            return None;
+        };
+        // A plain value change of one operand (`@x`, no edge, no `iff`) keeps
+        // `class_prop_value_change_cond` or the signal path.
+        let plain = terms.iter().all(|t| t.edge.is_none() && t.iff.is_none());
+        if plain && terms.len() == 1 {
+            return None;
+        }
+        // §9.4.2: validate every term of an `or` list before arming any
+        // snapshot. A list of real signals keeps the signal-sensitivity path.
+        let mut props = 0;
+        for t in terms {
+            if self.edge_wait_operand(&t.expr) {
+                props += 1;
+            }
+        }
+        if props == 0 || (plain && props == terms.len()) {
+            return None;
+        }
+        // A list MIXING such operands with signals (`@(posedge clk or posedge
+        // h.rst)`) is one wait on all of them: a signal term is armed by its
+        // value like the rest, which is only sound for a plain variable or
+        // net — not an event, a clocking block or a cell placeholder.
+        if props < terms.len() {
+            for t in terms {
+                if !self.edge_wait_operand(&t.expr) && !self.plain_signal_term(t) {
+                    return None;
+                }
+            }
+        }
+        let mut conds = Vec::with_capacity(terms.len());
+        for t in terms {
+            let code = match t.edge {
+                Some(Edge::Posedge) => 1,
+                Some(Edge::Negedge) => 2,
+                Some(Edge::Edge) => 3,
+                None => 0,
+            };
+            conds.push(self.edge_value_change_cond(t.expr.clone(), code, t.iff.clone()));
+        }
+        let mut conds = conds.into_iter();
+        let first = conds.next()?;
+        Some(conds.fold(first, |left, right| {
+            let span = left.span;
+            Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::LogOr,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            )
+        }))
+    }
+
+    /// Is the event term `t` a plain signal operand whose value the
+    /// condition-waiter machinery can sample?
+    fn plain_signal_term(&self, t: &crate::ast::stmt::EventExpr) -> bool {
+        let ev = EventControl::EventExpr(vec![t.clone()]);
+        if self.is_clocking_event(&ev) {
+            return false;
+        }
+        let sens = self.event_to_sens(&ev);
+        !sens.is_empty()
+            && sens.iter().all(|s| {
+                s.value_of.is_none()
+                    && self.signal_name_to_id.contains_key(s.signal_name.as_str())
+                    && !self.module.events.contains(s.signal_name.as_str())
+            })
+    }
+
+    /// A term usable as an edge-sensitive value-change wait: something with no
+    /// backing signal that the condition-waiter machinery can re-evaluate — a
+    /// property of `this` or of a class handle, a static member, or a local of
+    /// the running method.
+    fn edge_wait_operand(&mut self, e: &Expression) -> bool {
+        // Fast path for the common `@(posedge clk)` of a module process: a
+        // bare signal name outside any class context and not shadowed by a
+        // procedural local keeps the signal path.
+        if let ExprKind::Ident(h) = &e.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.this_stack.last().copied().flatten().is_none()
+            && self
+                .signal_name_to_id
+                .contains_key(h.path[0].name.name.as_str())
+            && !self
+                .local_stack
+                .iter()
+                .any(|f| f.contains_key(h.path[0].name.name.as_str()))
+        {
+            return false;
+        }
+        if self.selected_receiver_value_property(e) {
+            return true;
+        }
+        if let Some((h, f)) = self.expr_handle_prop_any(e) {
+            return !self.class_prop_is_event(h, &f);
+        }
+        // §9.4.2/§11.5.1: an edge on a SELECT of such an operand
+        // (`@(posedge bus[1])`) is detected on the selected value. The
+        // select-free name tiers below never matched it, so it fell to the
+        // signal path, armed on nothing and returned at once.
+        match &e.kind {
+            ExprKind::Paren(inner) => return self.edge_wait_operand(inner),
+            ExprKind::Binary { left, right, .. } => {
+                return self.edge_wait_operand(left) || self.edge_wait_operand(right);
+            }
+            ExprKind::Unary { operand, .. } => return self.edge_wait_operand(operand),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                return self.edge_wait_operand(condition)
+                    || self.edge_wait_operand(then_expr)
+                    || self.edge_wait_operand(else_expr);
+            }
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. } => {
+                return self.edge_select_base(base);
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && !h.path[0].selects.is_empty() =>
+            {
+                return self.class_operand_name(&h.path[0].name.name);
+            }
+            _ => {}
+        }
+        // A property reached through a selected or nested receiver
+        // (`@(posedge subs[1].clk)`, `@(posedge b.sub.clk)`): the receiver is
+        // evaluated now, as §9.4.2 samples the event expression when the wait
+        // executes. Only a chain rooted at a class handle qualifies; one
+        // through a virtual interface keeps the signal path (§25.9).
+        if self.chain_rooted_at_handle(e)
+            && !self.chain_may_name_vif(e)
+            && let Some((h, f)) = self.expr_instance_prop_field_general(e)
+        {
+            return !self.class_prop_is_event(h, &f);
+        }
+        // `h.STATIC` — the receiver is a class handle, but a static property
+        // lives in the class's shared cell, not in the instance's property
+        // map, so the instance branch above misses it.
+        let dotted = match &e.kind {
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some((h.path[0].name.name.clone(), member.name.clone()))
+                }
+                _ => None,
+            },
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+            }
+            _ => None,
+        };
+        if let Some((recv, field)) = dotted
+            && self.eval_ident_handle(&recv).is_some()
+            && self.class_member_names().static_or_param.contains(&field)
+        {
+            return true;
+        }
+        let name = match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                h.path[0].name.name.clone()
+            }
+            _ => return false,
+        };
+        // Only a name with no signal id behind it: a real signal keeps the
+        // edge-triggered waiter (which also honours `iff`, clocking and the
+        // NBA-region handoff that `uvm_wait_for_nba_region` relies on). A
+        // procedural variable lives in `signals` without an id — that is the
+        // shape this fallback is for.
+        if self.signal_name_to_id.contains_key(name.as_str())
+            || self.resolve_sens_name_via_handles(name.as_str()).is_some()
+        {
+            return false;
+        }
+        // A procedural local of the running subroutine or block. The frame
+        // stack is scanned as a whole: a `fork ... join_none` body carries its
+        // own frames, and `method_local_base` only marks METHOD frames.
+        if self
+            .local_stack
+            .iter()
+            .any(|f| f.contains_key(name.as_str()))
+        {
+            return true;
+        }
+        // A bare name of a property of `this`, a static member, or a plain
+        // block-scope variable held in the value store with no signal id.
+        self.this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .is_some_and(|inst| inst.properties.contains_key(name.as_str()))
+            || self.class_member_names().static_or_param.contains(&name)
+            || self.signals.contains_key(name.as_str())
+    }
+
+    /// The operand of a select in an edge wait (`bus` of `bus[1]`, `subs[1].v`
+    /// of `subs[1].v[3:0]`): a class property, static or procedural local —
+    /// never a module signal or memory, whose selects `event_to_sens` arms.
+    fn edge_select_base(&mut self, base: &Expression) -> bool {
+        match &base.kind {
+            ExprKind::Paren(inner) => self.edge_select_base(inner),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                self.edge_select_base(expr)
+            }
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                self.class_operand_name(&h.path[0].name.name)
+            }
+            ExprKind::This => false,
+            _ => self.edge_wait_operand(base),
+        }
+    }
+
+    /// Does the bare `name` denote a procedural local, a property of `this`
+    /// or a static class member, with no signal behind it?
+    fn class_operand_name(&self, name: &str) -> bool {
+        if self.local_stack.iter().any(|f| f.contains_key(name)) {
+            return true;
+        }
+        if self.signal_name_to_id.contains_key(name) {
+            return false;
+        }
+        self.this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .is_some_and(|inst| inst.properties.contains_key(name))
+            || self
+                .class_context_stack
+                .last()
+                .and_then(|c| c.as_deref())
+                .is_some_and(|c| self.static_prop_key(c, name).is_some())
+    }
+
+    /// Is `e` a member chain (`a.b`, `a[i].b`, `this.a[i].b`) whose root is
+    /// `this` or a name holding a class handle, with a select or more than
+    /// one hop below it — the shapes only `expr_instance_prop_field_general`
+    /// resolves?
+    fn chain_rooted_at_handle(&self, e: &Expression) -> bool {
+        // `this`, a handle, or a property / local holding a collection of
+        // handles (`subs` of `subs[1].clk`).
+        let root_ok = |me: &Self, n: &str| {
+            n == "this"
+                || n == "super"
+                || me.class_operand_name(n)
+                || me.eval_ident_handle(n).is_some_and(|h| h != 0)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.len() >= 2
+                    && (h.path.len() > 2 || !h.path[0].selects.is_empty())
+                    && h.path.last().is_some_and(|s| s.selects.is_empty())
+                    && h.path[1..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.len() <= 1)
+                    && root_ok(self, &h.path[0].name.name)
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut cur = expr.as_ref();
+                let mut nested = false;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                            nested = true;
+                            cur = expr;
+                        }
+                        ExprKind::Paren(inner) => cur = inner,
+                        ExprKind::This => return nested,
+                        ExprKind::Ident(h) => {
+                            return (nested || h.path.len() > 1 || !h.path[0].selects.is_empty())
+                                && h.root.is_none()
+                                && root_ok(self, &h.path[0].name.name);
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Arm `expr` and return the condition that becomes true on the `code`
+    /// transition (1 = posedge, 2 = negedge, 3 = any edge, 0 = any change)
+    /// while the optional `iff` guard holds.
+    fn edge_value_change_cond(
+        &mut self,
+        expr: Expression,
+        code: u64,
+        iff: Option<Expression>,
+    ) -> Expression {
+        let val = self.eval_expr(&expr);
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.vc_saved.insert(idx, (self.current_pid, val));
+        let span = expr.span;
+        let num = |v: u64| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
+                }),
+                span,
+            )
+        };
+        Expression::new(
+            ExprKind::SystemCall {
+                name: VC_EDGE_MARKER.to_string(),
+                args: {
+                    let mut a = vec![num(idx), expr, num(code)];
+                    a.extend(iff);
+                    a
+                },
+            },
+            span,
+        )
+    }
+
     pub(super) fn value_change_cond(&mut self, expr: Expression) -> Expression {
+        // §25.9: a virtual-interface variable's value is the instance it
+        // refers to (`@(cfg.vif)`), which its plain read does not carry.
+        let expr = if !self.module.interfaces.is_empty()
+            && !matches!(&expr.kind, ExprKind::SystemCall { name, .. } if name == VIF_VALUE_MARKER)
+            && self.vif_handle_term(&expr)
+        {
+            Self::vif_value_expr(expr)
+        } else {
+            expr
+        };
         let val = self.eval_expr(&expr);
         let idx = self.intra_saved_next;
         self.intra_saved_next += 1;
@@ -690,7 +1182,7 @@ impl Simulator {
                             signed: false,
                             base: NumberBase::Decimal,
                             value: idx.to_string(),
-                            cached_val: Cell::new(None),
+                            cached_val: crate::ast::cache::LiteralCache::new(None),
                         }),
                         span,
                     ),
@@ -714,7 +1206,7 @@ impl Simulator {
             self.vc_release(right);
         }
         if let ExprKind::SystemCall { name, args } = &cond.kind {
-            if name == VC_CHANGED_MARKER {
+            if name == VC_CHANGED_MARKER || name == VC_EDGE_MARKER {
                 if let Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) =
                     args.first().map(|a| &a.kind)
                 {
@@ -781,8 +1273,48 @@ impl Simulator {
         if matches!(e.kind, ExprKind::Null) {
             return Some(Self::EVENT_NULL_KEY.to_string());
         }
-        let k = self.event_ref_key(e)?;
-        Some(self.resolve_event_key(&k))
+        if let Some(k) = self.event_ref_key(e) {
+            return Some(self.resolve_event_key(&k));
+        }
+        self.class_event_operand_key(e)
+    }
+
+    /// §15.5.5: the identity key of a class-property event: the null key once
+    /// the property holds `null` (the assignment still stores the handle),
+    /// else the event object its slot holds, or the slot itself while it has
+    /// never shared one.
+    fn class_event_operand_key(&mut self, e: &Expression) -> Option<String> {
+        let leaf = match &e.kind {
+            ExprKind::Ident(h) => h
+                .path
+                .last()
+                .filter(|s| s.selects.is_empty())?
+                .name
+                .name
+                .as_str(),
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            _ => return None,
+        };
+        let mut root = e;
+        while let ExprKind::MemberAccess { expr, .. } = &root.kind {
+            root = expr;
+        }
+        if !self.class_event_names().contains(leaf)
+            || !(matches!(root.kind, ExprKind::This) || Self::cond_expr_is_effect_free(e, false))
+        {
+            return None;
+        }
+        let k = self
+            .instance_event_slot(e)
+            .filter(|k| self.class_prop_declared_event(k.0, &k.1))?;
+        let v = self.eval_expr(e);
+        if !v.has_xz() && v.to_u64() == Some(0) {
+            return Some(Self::EVENT_NULL_KEY.to_string());
+        }
+        Some(match self.event_obj_ids.get(&k) {
+            Some(id) => format!("\u{2}obj{id}"),
+            None => Self::instance_event_stamp_key(&k),
+        })
     }
 
     /// `.triggered` stamp key for a per-instance class event. Instance events
@@ -972,8 +1504,8 @@ impl Simulator {
             {
                 let mut b = h.clone();
                 b.path.last_mut()?.selects.clear();
-                b.cached_signal_id = std::cell::Cell::new(None);
-                b.cached_resolved_name = std::cell::OnceCell::new();
+                b.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                b.cached_resolved_name = crate::ast::cache::NameCache::new();
                 let base = Expression::new(ExprKind::Ident(b), e.span);
                 (std::borrow::Cow::Owned(base), &h.path.last()?.selects[0])
             }
@@ -1117,6 +1649,33 @@ impl Simulator {
                             return Some(format!("{}[{}]", bname, idx));
                         }
                     }
+                    // An element of a module-scope queue, dynamic or
+                    // associative array, frozen at call time as above.
+                    if !caller_local
+                        && self
+                            .ref_binding_stack
+                            .last()
+                            .is_none_or(|m| !m.contains_key(&bname))
+                        && (self.module.dynamic_arrays.contains(&bname)
+                            || self.module.queue_vars.contains(&bname)
+                            || self.module.associative_arrays.contains_key(&bname))
+                    {
+                        let iv = self.eval_expr(index);
+                        let cell = if self.module.associative_arrays.contains_key(&bname) {
+                            format!("{}[{}]", bname, self.assoc_key_str(&bname, &iv))
+                        } else {
+                            let idx = iv.to_i64().filter(|&i| i >= 0)?;
+                            if idx as u64 >= self.get_queue_size(&bname) {
+                                return None;
+                            }
+                            format!("{}[{}]", bname, idx)
+                        };
+                        if self.signals.contains_key(&cell)
+                            || self.signal_name_to_id.contains_key(cell.as_str())
+                        {
+                            return Some(cell);
+                        }
+                    }
                 }
             }
             return None;
@@ -1144,12 +1703,11 @@ impl Simulator {
         {
             return None; // ref-bound in the caller but not aliasable
         }
-        // Aggregates and strings keep their dedicated formal machinery.
+        // Aggregates keep their dedicated formal machinery.
         if self.module.arrays.contains_key(name)
             || self.module.dynamic_arrays.contains(name)
             || self.module.queue_vars.contains(name)
             || self.module.associative_arrays.contains_key(name)
-            || self.string_signals.contains(name)
         {
             return None;
         }
@@ -1232,29 +1790,179 @@ impl Simulator {
     /// the same slot's remaining active region — mirroring how a blocking
     /// `->e` resumes an `@e` waiter for a module-scope named event.
     pub(super) fn fire_instance_event(&mut self, key: (usize, String)) {
+        // §15.5.5: every slot holding the same event object fires with it.
+        let slots = match self.event_obj_ids.get(&key) {
+            Some(id) => self.event_obj_slots.get(id).cloned().unwrap_or_default(),
+            None => vec![key],
+        };
+        for key in slots {
+            self.fire_instance_event_slot(&key);
+        }
+    }
+
+    fn fire_instance_event_slot(&mut self, key: &(usize, String)) {
         let now = self.time;
         // §15.5.3: `<h>.<ev>.triggered` must read 1 for the rest of this slot.
         // Instance events have no backing signal, so stamp the same table the
         // name-keyed path uses, under a synthetic per-instance key.
-        let stamp = Self::instance_event_stamp_key(&key);
+        let stamp = Self::instance_event_stamp_key(key);
         self.event_triggered_time.insert(stamp, now);
         if !self.cg_instance_event_waiters.is_empty() {
-            if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+            if let Some(w) = self.cg_instance_event_waiters.get(key).cloned() {
                 self.sample_event_covergroups(w);
             }
         }
-        let mut woken = Vec::new();
-        self.instance_event_waiters.retain(|w| {
-            if w.key.contains(&key) {
-                woken.push((w.pid, w.continuation.clone()));
-                false
-            } else {
-                true
-            }
-        });
+        let woken = self.instance_event_waiters.take_key(key);
         for (pid, cont) in woken {
             self.event_queue.schedule(now, pid, cont);
         }
+    }
+
+    /// The class-member event slot `e` names — `ev` in a method of its
+    /// class, a static `ev` / `C::ev`, `h.ev`, `this.ev`, `q[i].ev` — or None.
+    fn instance_event_slot(&mut self, e: &Expression) -> Option<(usize, String)> {
+        if let ExprKind::Ident(h) = &e.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && let Some(k) = self.resolve_this_event_field(&h.path[0].name.name)
+        {
+            return Some(k);
+        }
+        if let Some(k) = self.static_class_event_key(e) {
+            return Some(k);
+        }
+        if let Some(k) = self.expr_handle_event_field(e) {
+            return Some(k);
+        }
+        self.expr_instance_event_field_general(e)
+    }
+
+    /// §15.5.5 `ev = other_ev` / `ev = null` between class-member events:
+    /// the slot takes the other slot's event object (a null event, its own
+    /// fresh one that nothing else holds). The ordinary value assignment
+    /// still follows, so `ev == null` keeps comparing the stored handles.
+    pub(super) fn bind_instance_event_assign(&mut self, lvalue: &Expression, rvalue: &Expression) {
+        let leaf = |e: &Expression| -> Option<String> {
+            match &e.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                ExprKind::MemberAccess { member, .. } => Some(member.name.clone()),
+                _ => None,
+            }
+        };
+        let names = self.class_event_names();
+        if names.is_empty() || !leaf(lvalue).is_some_and(|n| names.contains(&n)) {
+            return;
+        }
+        let is_null = matches!(rvalue.kind, ExprKind::Null);
+        if !is_null && !leaf(rvalue).is_some_and(|n| names.contains(&n)) {
+            return;
+        }
+        let declared_event =
+            |sim: &Self, k: &(usize, String)| sim.class_prop_declared_event(k.0, &k.1);
+        let Some(slot) = self
+            .instance_event_slot(lvalue)
+            .filter(|k| declared_event(self, k))
+        else {
+            return;
+        };
+        let id = if is_null {
+            self.fresh_event_obj_id()
+        } else {
+            let Some(src) = self
+                .instance_event_slot(rvalue)
+                .filter(|k| declared_event(self, k))
+            else {
+                return;
+            };
+            match self.event_obj_ids.get(&src) {
+                Some(&id) => id,
+                None => {
+                    let id = self.fresh_event_obj_id();
+                    self.event_obj_ids.insert(src.clone(), id);
+                    self.event_obj_slots.entry(id).or_default().push(src);
+                    id
+                }
+            }
+        };
+        let old = self.event_obj_ids.insert(slot.clone(), id);
+        let mut heir = None;
+        if let Some(old) = old
+            && let Some(v) = self.event_obj_slots.get_mut(&old)
+        {
+            v.retain(|s| *s != slot);
+            heir = v.first().cloned();
+            if v.is_empty() {
+                self.event_obj_slots.remove(&old);
+            }
+        }
+        // §15.5.5: a process already blocked on the slot stays blocked on
+        // its old event, woken through another slot still holding it, or
+        // never.
+        if old != Some(id) {
+            let to = heir.unwrap_or_else(|| (usize::MAX, String::new()));
+            self.instance_event_waiters.rekey(&slot, &to);
+        }
+        self.event_obj_slots.entry(id).or_default().push(slot);
+        note_event_trigger();
+    }
+
+    /// Every property name some class declares `event`, built on first use: a
+    /// quick filter, not proof that a given object's property is an event.
+    fn class_event_names(&mut self) -> std::rc::Rc<HashSet<String>> {
+        if let Some(n) = &self.class_event_prop_names {
+            return n.clone();
+        }
+        let n: HashSet<String> = self
+            .module
+            .classes
+            .values()
+            .flat_map(|cd| {
+                cd.property_types.iter().filter_map(|(p, dt)| {
+                    matches!(
+                        dt,
+                        DataType::Simple {
+                            kind: crate::ast::types::SimpleType::Event,
+                            ..
+                        }
+                    )
+                    .then(|| p.clone())
+                })
+            })
+            .collect();
+        let n = std::rc::Rc::new(n);
+        self.class_event_prop_names = Some(n.clone());
+        n
+    }
+
+    /// Is `field` of the object `handle` declared `event` (`class_prop_is_event`
+    /// assumes so when no declaration is found)?
+    fn class_prop_declared_event(&self, handle: usize, field: &str) -> bool {
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.as_str());
+        for _ in 0..64 {
+            let Some(cd) = cur.and_then(|c| self.module.classes.get(c)) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    fn fresh_event_obj_id(&mut self) -> u64 {
+        self.next_event_obj_id += 1;
+        self.next_event_obj_id
     }
 
     /// Resolve signal-backed event spellings once. Event signal IDs are stable
@@ -1366,15 +2074,7 @@ impl Simulator {
             let now = self.time;
             // Its `.triggered` stamp, kept apart per activation like the wait.
             self.event_triggered_time.insert(key.1.clone(), now);
-            let mut woken = Vec::new();
-            self.instance_event_waiters.retain(|w| {
-                if w.key.contains(&key) {
-                    woken.push((w.pid, w.continuation.clone()));
-                    false
-                } else {
-                    true
-                }
-            });
+            let woken = self.instance_event_waiters.take_key(&key);
             for (pid, cont) in woken {
                 self.event_queue.schedule(now, pid, cont);
             }

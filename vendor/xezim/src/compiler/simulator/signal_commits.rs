@@ -531,7 +531,7 @@ impl Simulator {
         }
         self.signal_commit_plan.resize(self.signal_table.len(), 0);
         for id in 0..self.signal_commit_plan.len() {
-            if self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0) {
+            if self.waiter_signal_hooked(id) {
                 self.signal_commit_plan[id] |= 1;
             }
             if self.armed_input_set(id) {
@@ -542,6 +542,13 @@ impl Simulator {
 
     #[inline(always)]
     pub(super) fn note_edge_write(&mut self, id: usize) {
+        // Parked-waiter index — see the write_sig! twin. The in-place write
+        // paths end here without the old value, so every write is noted.
+        if id < self.event_waiters.watch.len()
+            && self.event_waiters.watch[id] & event_waiters::WATCH_ANY != 0
+        {
+            self.event_waiters.note_write(id);
+        }
         // §9.2 re-trigger recording (always on) — see the write_sig! twin.
         if self.in_edge_block || self.in_edge_cont {
             if let Some(&p) = self.sig_to_edge_pos.get(id) {
@@ -1446,7 +1453,57 @@ impl Simulator {
             let mut arm_extra_b: Vec<u32> = Vec::new();
             let mut arm_only_b = false;
             let mut arm_seen: HashSet<usize> = HashSet::default();
+            let mut arm_seen_elems: HashSet<usize> = HashSet::default();
             let armed = self.armed_edge;
+            // Index registers holding one constant for the whole block: a
+            // `q[3] <= d` or `x = m[7]` touches that element alone, so only
+            // it arms the block. Arming every element of the array made N
+            // blocks that each write one element of a shared array (a
+            // generate loop of flops) mark N blocks per element write,
+            // N^2 per clock. A register written once, by `LoadConst`, holds
+            // that constant on every path; an opaque instruction may write
+            // registers this scan does not see, so such a block keeps the
+            // whole-array arming.
+            let const_idx: HashMap<super::bytecode::RegId, i64> = {
+                use super::bytecode::BytecodeCompiler as Bc;
+                let mut m: HashMap<super::bytecode::RegId, (u32, Option<i64>)> = HashMap::default();
+                let mut opaque_any = false;
+                for insn in &cb.instructions {
+                    if Bc::is_opaque_insn(insn) {
+                        opaque_any = true;
+                        break;
+                    }
+                    let k = match insn {
+                        Insn::LoadConst(_, v) if !v.is_real && !v.has_xz() => v.to_i64(),
+                        _ => None,
+                    };
+                    if let Some(r) = Bc::dest_reg(insn).or_else(|| Bc::in_place_reg(insn)) {
+                        let e = m.entry(r).or_insert((0, None));
+                        e.0 += 1;
+                        e.1 = k;
+                    }
+                }
+                if opaque_any {
+                    HashMap::default()
+                } else {
+                    m.into_iter()
+                        .filter_map(|(r, (n, k))| (n == 1).then_some((r, k?)))
+                        .collect()
+                }
+            };
+            let arm_elems = |arr: &super::bytecode::ArrayOperand,
+                             idx: &super::bytecode::RegId,
+                             out: &mut Vec<u32>,
+                             seen: &mut HashSet<usize>,
+                             seen_elems: &mut HashSet<usize>|
+             -> bool {
+                if let Some(&k) = const_idx.get(idx)
+                    && Self::arm_array_elem(arr, k, armed, out, seen_elems)
+                {
+                    return true;
+                }
+                Self::arm_array_elems(arr, armed, out, seen)
+            };
             // A block that escapes to the AST interpreter (`StmtFallback`, e.g.
             // its only effect is `$display`/`$monitor`) has side effects and
             // reads the bytecode can't see. Gating it on "no tracked data-input
@@ -1456,9 +1513,10 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     // A counted block must run on every edge.
-                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..) => {
-                        opaque = true
-                    }
+                    Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
+                    | Insn::LoadDynElem(..)
+                    | Insn::CovHit(..) => opaque = true,
                     // Constant bit/part selects record only the SLICE they
                     // read (see `edge_block_reads_meta`); everything else is
                     // a full-signal read.
@@ -1514,8 +1572,14 @@ impl Simulator {
                             metas.push((0, w));
                         }
                     }
-                    Insn::LoadArrayElem(_, arr, _) => {
-                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                    Insn::LoadArrayElem(_, arr, idx) => {
+                        if arm_elems(
+                            arr,
+                            idx,
+                            &mut arm_extra_b,
+                            &mut arm_seen,
+                            &mut arm_seen_elems,
+                        ) {
                             arm_only_b = true;
                         } else {
                             dynamic = true;
@@ -1544,11 +1608,17 @@ impl Simulator {
                     }
                     // Array-element NBA/blocking writes (memory) use a dynamic
                     // index; conservatively make such blocks non-gateable.
-                    Insn::NbaAssignArray(arr, ..)
-                    | Insn::NbaAssignArrayRange(arr, ..)
-                    | Insn::BlockingAssignArray(arr, ..)
-                    | Insn::BlockingAssignArrayRange(arr, ..) => {
-                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                    Insn::NbaAssignArray(arr, idx, ..)
+                    | Insn::NbaAssignArrayRange(arr, idx, ..)
+                    | Insn::BlockingAssignArray(arr, idx, ..)
+                    | Insn::BlockingAssignArrayRange(arr, idx, ..) => {
+                        if arm_elems(
+                            arr,
+                            idx,
+                            &mut arm_extra_b,
+                            &mut arm_seen,
+                            &mut arm_seen_elems,
+                        ) {
                             arm_only_b = true;
                         } else {
                             dynamic = true;
@@ -1754,6 +1824,33 @@ impl Simulator {
         }
     }
 
+    /// Register one element of a dense unpacked array, selected by the
+    /// constant index `k`, as an arm-only input of the block. False when the
+    /// index is outside the array or the array is not dense (the caller then
+    /// arms the whole array, as before).
+    pub(super) fn arm_array_elem(
+        arr: &super::bytecode::ArrayOperand,
+        k: i64,
+        armed: bool,
+        out: &mut Vec<u32>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        if !armed {
+            return false;
+        }
+        match arr {
+            super::bytecode::ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } if *lo <= k && k <= *hi && !is_packed_id(*first_id) => {
+                let id = *first_id + (k - *lo) as usize;
+                if seen.insert(id) {
+                    out.push(id as u32);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
     pub(super) fn build_armed_edge_state(&mut self, arm_extra: &[Vec<u32>]) {
         self.armed_input_bitmap.clear();
         self.armed_input_ranges.clear();
@@ -1964,8 +2061,13 @@ impl Simulator {
             .module
             .input_port_actuals
             .iter()
-            .filter(|(inst, _)| scopes.contains(inst.as_str()))
-            .cloned()
+            .filter(|port| scopes.contains(Self::port_formal_inst(port.formal())))
+            .map(|port| {
+                (
+                    Self::port_formal_inst(port.formal()).to_string(),
+                    port.actual().clone(),
+                )
+            })
             .collect();
         let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
         for (inst, actual) in &actuals {
@@ -2015,6 +2117,210 @@ impl Simulator {
         if self.dirty_any {
             self.settle_combinatorial();
         }
+    }
+
+    /// The instance an `input_port_actuals` formal path belongs to.
+    pub(super) fn port_formal_inst(formal: &str) -> &str {
+        formal.rsplit_once('.').map_or("", |(inst, _)| inst)
+    }
+
+    /// §23.3.3, §10.3.3: how a term written with `name`, resolved to `id`,
+    /// starts at time 0 (see `SensitivityId::alias_t0`): 0 unless the name
+    /// is a port formal or an identity net (`assign y = x`) collapsed onto
+    /// its source's id, 1 for such a 4-state alias (from x), 2 for a 2-state
+    /// one (from 0). A formal's state comes from the elaborator (its own net
+    /// is gone); an identity net shares its source's, the collapse requires
+    /// that. `name` is spelled as the key that resolved it.
+    pub(super) fn alias_t0_kind(&self, name: &str, id: usize) -> u8 {
+        if self.collapsed_port_children.is_empty() || !self.collapsed_port_children.contains(name) {
+            return 0;
+        }
+        let two_state = match self.port_formal_two_state.get(name) {
+            Some(&ts) => ts,
+            None => self.signal_two_state.get(id).copied().unwrap_or(false),
+        };
+        if two_state { 2 } else { 1 }
+    }
+
+    /// The value an alias of kind `kind` (see `alias_t0_kind`) holds before
+    /// its time-0 update, for a `w`-bit signal (raw v, x).
+    fn alias_t0_prev(kind: u8, w: u32) -> (u64, u64) {
+        if kind == 2 {
+            (0, 0)
+        } else {
+            (0, if w == 64 { u64::MAX } else { (1u64 << w) - 1 })
+        }
+    }
+
+    /// §23.3.3, §10.3.3, §9.4.2: note the time-0 update of each input port
+    /// whose reads were renamed to a whole actual signal, and of each name
+    /// collapsed onto another signal's id, and wake the edge blocks that
+    /// watch one, for `deliver_time0_port_edges`. The port or alias takes
+    /// the source's value at time 0, from x for a 4-state one and from 0
+    /// for a 2-state one, so the `0` of `logic clk = 0` is a negedge at a
+    /// child's `@(negedge clk)` or at `@(negedge w)` after `assign w = clk`
+    /// although `clk` itself never changed: an initializer is no event
+    /// (§6.8). A source the settle changed already delivers its own edge
+    /// to every reader.
+    pub(super) fn record_time0_port_edges(&mut self) {
+        let top = format!("{}.", self.module.name);
+        // A source whose value the settle left alone, 1..=64 bits wide, as
+        // (id, that value).
+        let settled = |sim: &Self, id: usize| -> Option<(u64, u64)> {
+            let w = sim.signal_widths.get(id).copied().unwrap_or(0);
+            if w == 0 || w > 64 {
+                return None;
+            }
+            let cur = sim.term_raw_bits(id);
+            ((sim.prev_val.get(id), sim.prev_xz.get(id)) == (Some(&cur.0), Some(&cur.1)))
+                .then_some(cur)
+        };
+        let mut ports = Vec::new();
+        for port in &self.module.input_port_actuals {
+            let (formal, actual, two_state) = (port.formal(), port.actual(), port.two_state());
+            let ExprKind::Ident(h) = &actual.kind else {
+                continue;
+            };
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                continue;
+            }
+            let mut reads: HashSet<String> = HashSet::default();
+            Self::collect_expr_reads(actual, &self.module, &mut reads);
+            let [read] = reads.iter().collect::<Vec<_>>()[..] else {
+                continue;
+            };
+            let Some(id) = self.resolve_read_name(read, &top) else {
+                continue;
+            };
+            let Some(cur) = settled(self, id) else {
+                continue;
+            };
+            let inst = Self::port_formal_inst(formal);
+            let inst = inst.strip_prefix(top.as_str()).unwrap_or(inst);
+            let prev = Self::alias_t0_prev(if two_state { 2 } else { 1 }, self.signal_widths[id]);
+            if prev != cur {
+                ports.push((inst.to_string(), id, prev, cur));
+            }
+        }
+        let mut aliases: Vec<(usize, (u64, u64))> = Vec::new();
+        for name in &self.collapsed_port_children {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            if aliases.iter().any(|&(i, _)| i == id) {
+                continue;
+            }
+            if let Some(cur) = settled(self, id) {
+                aliases.push((id, cur));
+            }
+        }
+        if ports.is_empty() && aliases.is_empty() {
+            return;
+        }
+        // The edge blocks the updates wake, found now against the settled
+        // values: a process that writes the source at time 0 moves them
+        // before `deliver_time0_port_edges` runs.
+        let blocks = Arc::clone(&self.edge_blocks);
+        let mut pending = Vec::new();
+        for (bi, b) in blocks.iter().enumerate() {
+            let scope = b.scope.strip_prefix(top.as_str()).unwrap_or(&b.scope);
+            if b.resolved_sensitivities.iter().any(|s| {
+                self.alias_t0_term_prev(s, scope, &ports, &aliases)
+                    .is_some_and(|(pv, px)| self.term_fires(s, pv, px, None))
+            }) {
+                pending.push(bi);
+            }
+        }
+        if std::env::var("XEZIM_DEBUG").is_ok() {
+            eprintln!(
+                "[T0-ALIAS] ports={:?} aliases={:?} pending={:?}",
+                ports, aliases, pending
+            );
+        }
+        self.time0_port_edges = ports;
+        self.time0_alias_edges = aliases;
+        self.edge_t0_pending = pending;
+    }
+
+    /// The value term `s`, in instance `scope`, held before the time-0
+    /// update `record_time0_port_edges` noted for its signal: through the
+    /// alias name the term was written with, or through the renamed input
+    /// port of its own instance. `None` when the term takes no update: one
+    /// on a source nothing renamed, or guarded by `iff` or a value
+    /// expression (the reference simulator delivers neither).
+    fn alias_t0_term_prev(
+        &self,
+        s: &SensitivityId,
+        scope: &str,
+        ports: &[(String, usize, (u64, u64), (u64, u64))],
+        aliases: &[(usize, (u64, u64))],
+    ) -> Option<(u64, u64)> {
+        if s.iff.is_some() || s.value_of.is_some() {
+            return None;
+        }
+        if s.alias_t0 != 0 && aliases.iter().any(|&(id, _)| id == s.signal_id) {
+            let w = self.signal_widths.get(s.signal_id).copied().unwrap_or(0);
+            return Some(Self::alias_t0_prev(s.alias_t0, w));
+        }
+        ports
+            .iter()
+            .find(|(inst, id, ..)| *id == s.signal_id && inst == scope)
+            .map(|&(_, _, prev, _)| prev)
+    }
+
+    /// §23.3.3, §10.3.3, §9.4.2: deliver the time-0 updates
+    /// `record_time0_port_edges` noted, once every process has started and
+    /// parked. The edge blocks the updates woke that have not run since
+    /// run now; the waiters of always procedures that watch an updated
+    /// port or alias see the edge from the value before the update, as
+    /// long as the source still holds its settled value. The source's own
+    /// readers keep their baseline, and, as in the reference simulator, a
+    /// term with an `iff` guard and an initial procedure's waiter take no
+    /// update.
+    pub(super) fn deliver_time0_port_edges(&mut self) {
+        let fire = std::mem::take(&mut self.edge_t0_pending);
+        let ports = std::mem::take(&mut self.time0_port_edges);
+        let aliases = std::mem::take(&mut self.time0_alias_edges);
+        let top = format!("{}.", self.module.name);
+        let mut rearm: Vec<(u64, usize, (u64, u64))> = Vec::new();
+        for (wi, w) in self.event_waiters.iter_seq() {
+            if w.is_clocking || self.process_origin.get(&w.pid).map(|o| o.1) != Some("always block")
+            {
+                continue;
+            }
+            let scope = self
+                .process_scope_hint
+                .get(&w.pid)
+                .map(|s| s.strip_prefix(top.as_str()).unwrap_or(s))
+                .unwrap_or("");
+            for (k, s) in w.resolved_sensitivities.iter().enumerate() {
+                let Some(prev) = self.alias_t0_term_prev(s, scope, &ports, &aliases) else {
+                    continue;
+                };
+                let cur = aliases
+                    .iter()
+                    .find(|&&(id, _)| id == s.signal_id)
+                    .map(|&(_, c)| c)
+                    .or_else(|| {
+                        ports
+                            .iter()
+                            .find(|(_, id, ..)| *id == s.signal_id)
+                            .map(|&(_, _, _, c)| c)
+                    });
+                if cur == Some(self.term_raw_bits(s.signal_id)) {
+                    rearm.push((wi, k, prev));
+                }
+            }
+        }
+        if fire.is_empty() && rearm.is_empty() {
+            return;
+        }
+        for (wi, k, prev) in rearm {
+            self.event_waiters.set_captured_prev(wi, k, prev);
+        }
+        self.edge_forced_fire = fire;
+        self.check_edges();
+        self.edge_forced_fire.clear();
     }
 
     /// Lift a force on cell `id` so a replacing force's own write lands.
@@ -2498,7 +2804,12 @@ impl Simulator {
         hint: Option<&str>,
     ) -> bool {
         let saved_ts = self.timescale_scope_override.take();
-        self.timescale_scope_override = hint.map(|h| h.to_string());
+        // §20.3.1, §20.3.3: comb dispatch explicitly selects top with "".
+        // The native name hint omits top; retain that opt-in time scope.
+        // Other callers keep the existing nullable-hint behavior.
+        self.timescale_scope_override = hint
+            .map(|h| h.to_string())
+            .or_else(|| saved_ts.as_ref().filter(|scope| scope.is_empty()).cloned());
         // `%m` wants the instance-relative scope the interpreter's edge path
         // records; a root block's hint is the top module's name.
         let m_scope = hint.map(|h| self.instance_relative_scope(h));

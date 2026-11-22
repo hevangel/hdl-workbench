@@ -5,9 +5,34 @@ use super::*;
 use crate::{log_eprintln as eprintln, log_println as println};
 
 impl Simulator {
+    /// Install a register file of the evaluation's own for the bytecode of
+    /// the combinational logic a settle evaluates, and return the caller's.
+    /// A compiled method or process loop that waits in an interpreted call
+    /// keeps `this`, its formals, locals and held operands in `vm_regs`; the
+    /// logic a write in that call triggers is a separate evaluation (§4.5,
+    /// §9.2.2.2, §10.3) and must not change what the subroutine owns (§13.4,
+    /// §13.5, §8.11). A pointer swap and a pool pop in steady state.
+    #[inline]
+    pub(super) fn enter_private_regs(&mut self) -> Vec<Value> {
+        let own = self.vm_regs_pool.pop().unwrap_or_default();
+        std::mem::replace(&mut self.vm_regs, own)
+    }
+
+    /// Put the caller's register file back (see `enter_private_regs`).
+    #[inline]
+    pub(super) fn leave_private_regs(&mut self, caller: Vec<Value>) {
+        let own = std::mem::replace(&mut self.vm_regs, caller);
+        self.vm_regs_pool.push(own);
+    }
+
     pub(super) fn settle_combinatorial(&mut self) {
         if self.finished {
             return;
+        }
+        // §9.2.2.2: an entry held for the time-0 start batch does not stay
+        // held past time zero, whichever loop moved the time on.
+        if !self.comb_time0_held.is_empty() && self.time != 0 {
+            self.release_time0_held();
         }
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
@@ -86,10 +111,48 @@ impl Simulator {
         self.mark_release_sources_dirty(id);
     }
 
+    /// The indices of the comb entries that write signal `id`, in table
+    /// order (§10.6.2). A release re-drives the net from them; looking them
+    /// up in `comb_writer_index` replaces a scan of every entry, which a
+    /// testbench releasing a signal each clock repeated every cycle. Empty
+    /// while a settle pass has the table taken out, as the scan was.
+    pub(super) fn comb_writers_of(&mut self, id: usize) -> Vec<usize> {
+        let n = self.comb_entries.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if self
+            .comb_writer_index
+            .as_ref()
+            .is_none_or(|(len, _)| *len != n)
+        {
+            let mut index: HashMap<usize, Vec<u32>> = HashMap::default();
+            for (eidx, entry) in self.comb_entries.iter().enumerate() {
+                for &w in &entry.cold.write_signal_ids {
+                    let writers = index.entry(w).or_default();
+                    // An entry that lists a signal twice is one writer.
+                    if writers.last() != Some(&(eidx as u32)) {
+                        writers.push(eidx as u32);
+                    }
+                }
+            }
+            self.comb_writer_index = Some((n, index));
+        }
+        self.comb_writer_index
+            .as_ref()
+            .and_then(|(_, index)| index.get(&id))
+            .map(|writers| writers.iter().map(|&e| e as usize).collect())
+            .unwrap_or_default()
+    }
+
     pub(super) fn mark_release_sources_dirty(&mut self, id: usize) {
         let mut sources: Vec<usize> = Vec::new();
-        for entry in self.comb_entries.iter() {
-            if entry.cold.write_signal_ids.contains(&id) {
+        let mut constant_drivers: Vec<CombEntry> = Vec::new();
+        for eidx in self.comb_writers_of(id) {
+            let entry = &self.comb_entries[eidx];
+            if entry.cold.read_signal_ids.is_empty() {
+                constant_drivers.push(entry.clone());
+            } else {
                 sources.extend(entry.cold.read_signal_ids.iter().copied());
             }
         }
@@ -100,6 +163,25 @@ impl Simulator {
                 self.dirty_any = true;
             }
         }
+        // §10.6.2: a driver that reads no signal (`wire w = 4'h5;`,
+        // `assign w = 4'h6;`) is never re-run by a dirty mark, so the
+        // released net kept the forced value. Re-run it here; its value does
+        // not depend on evaluation order.
+        for entry in &constant_drivers {
+            self.eval_released_comb_entry(entry);
+        }
+    }
+
+    /// §10.6.2 / §21.2.1.7: evaluating a net's driver uses its declaration
+    /// scope, then returns to the scope of the procedure doing the release.
+    pub(super) fn eval_released_comb_entry(&mut self, entry: &CombEntry) {
+        let scope = std::mem::take(&mut self.m_block_scope);
+        let scope_id = self.m_block_scope_id;
+        let active = self.m_block_active;
+        self.eval_comb_entry_full(entry);
+        self.m_block_scope = scope;
+        self.m_block_scope_id = scope_id;
+        self.m_block_active = active;
     }
 
     /// Level-BSP combinational settle (XEZIM_BSP_SETTLE=1). Reaches the SAME
@@ -211,6 +293,7 @@ impl Simulator {
         let mut next_seed = std::mem::take(&mut self.bsp_next_seed);
         next_seed.clear();
         let mut view = std::mem::take(&mut self.signal_table);
+        let caller_regs = self.enter_private_regs();
         let mut vm_regs = std::mem::take(&mut self.vm_regs);
         let mut dirtied: Vec<u32> = Vec::new();
         let mut par_scratch: Vec<usize> = Vec::new();
@@ -286,6 +369,7 @@ impl Simulator {
                         let view_len = view.len();
                         let widths: &[u32] = &self.signal_widths;
                         let signed: &[bool] = &self.signal_signed;
+                        let shortreal_signals = &self.shortreal_signals;
                         let two_state: &[bool] = &self.signal_two_state;
                         let gate_driven: &[bool] = &self.signal_gate_driven;
                         let n2id = &self.signal_name_to_id;
@@ -330,6 +414,7 @@ impl Simulator {
                                             &entries[eidx].item,
                                             widths,
                                             signed,
+                                            shortreal_signals,
                                             two_state,
                                             gate_driven,
                                             n2id,
@@ -484,6 +569,9 @@ impl Simulator {
                             let hi = self.comb_dep_offsets[id + 1] as usize;
                             for k in lo..hi {
                                 let dep = self.comb_dep_entries[k] as usize;
+                                if dep == eidx && self.comb_self_exempt[eidx] {
+                                    continue;
+                                }
                                 if !self.settle_triggered[dep] {
                                     self.settle_triggered[dep] = true;
                                     let dl = self.comb_level[dep] as usize;
@@ -508,6 +596,7 @@ impl Simulator {
 
         self.signal_table = view;
         self.vm_regs = vm_regs;
+        self.leave_private_regs(caller_regs);
         // Restore reusable buffers (retain capacity for the next call).
         seed_list.clear();
         self.settle_triggered_list = seed_list;
@@ -594,6 +683,13 @@ impl Simulator {
         }
     }
 
+    /// The elaborator has already scaled each delay expression to global ticks.
+    pub(super) fn eval_driver_delays(&mut self, exprs: &[Option<Expression>; 3]) -> [Option<u64>; 3] {
+        exprs.each_ref().map(|expr| {
+            expr.as_ref().map(|e| apply_delay_mode(self.eval_delay_ticks(e)))
+        })
+    }
+
     /// AST comb-entry eval (`CombItem::ContAssign` / `AlwaysBlock`). These need
     /// the full `&mut self` interpreter (`eval_expr_ctx` / `exec_statement`), so
     /// they can't go through `eval_comb_entry_isolated`. Factored out of the
@@ -607,16 +703,18 @@ impl Simulator {
                 lhs,
                 rhs,
                 delay: explicit_delay,
+                delay_target,
+                delay_exprs,
             } => {
                 if let Some(c) = entry.cold.cov {
                     self.cov_count(c);
                 }
+                let delay_target = delay_target.as_deref().copied();
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = crate::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 let mut lhs_id = self.get_lhs_signal_id(lhs);
                 if scope_hint.is_none() {
                     // The bare-lhs resolve above can itself need the hint
@@ -662,21 +760,24 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 }
                 let w = self.infer_lhs_width(lhs);
-                // §7.4.2/§10.9: `assign x = '{...}` (or `assign x[i] = '{...}`
-                // on an array of packed vectors) converts each item to the
-                // ELEMENT type. The generic eval concatenates items at their
-                // own widths, which scrambles any item that is not exactly
-                // element-sized.
-                //
-                let val = if let ExprKind::AssignmentPattern(items) = &rhs.kind {
-                    self.packed_pattern_for_lhs(lhs, items)
-                        .or_else(|| self.eval_packed_struct_pattern(lhs, items))
-                        .unwrap_or_else(|| self.eval_expr_ctx(rhs, w))
-                        .resize(w)
-                } else {
-                    self.eval_expr_ctx(rhs, w).resize(w)
+                // §10.8, §10.9: a pattern takes the net's declared type.
+                let saved_ts = self.timescale_scope_override.replace(
+                    entry
+                        .cold
+                        .rhs_time_scope
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
+                let val = match self.eval_pattern_for_lvalue(lhs, rhs) {
+                    Some(v) => v.resize(w),
+                    None => self.eval_expr_ctx(rhs, w).resize(w),
                 };
-                let delay = if *explicit_delay > 0 {
+                let runtime = delay_exprs.as_deref().map(|exprs| self.eval_driver_delays(exprs));
+                self.timescale_scope_override = saved_ts;
+                let delay = if let Some([Some(rise), _, _]) = runtime {
+                    rise
+                } else if *explicit_delay > 0 {
                     *explicit_delay
                 } else {
                     lhs_id
@@ -707,11 +808,18 @@ impl Simulator {
                     }
                     self.packed_array_copy_values.insert(ids, val.clone());
                 }
-                if delay > 0 {
+                if runtime.is_some() || delay > 0
+                    || delay_target.is_some_and(|t| t.select_delays.is_some())
+                    || lhs_id.is_some_and(|id| {
+                        self.gate_fall_delay_by_id.contains_key(&id)
+                            || self.gate_off_delay_by_id.contains_key(&id)
+                    })
+                {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
                             if !self.delayed_update_pending_is(id, &val) {
-                                self.schedule_delayed_with_delay(id, val, delay);
+                                self.schedule_delayed_transition(id, val, delay, delay_target,
+                                    runtime.map(|[_, fall, off]| (fall, off)));
                             }
                         } else {
                             self.cancel_delayed(id);
@@ -722,16 +830,34 @@ impl Simulator {
                         // this used to DROP the write silently. Composes
                         // against the PENDING delayed value (issue #143).
                         let sel_val = val.resize(sel_w);
+                        // §10.3.3 / §28.16: the select's own transition
+                        // delay, from the selected bits' current value.
+                        let delay = match delay_target {
+                            Some(DelayTarget {
+                                vector,
+                                select_delays: Some((fall, off)),
+                                ..
+                            }) => {
+                                let (fall, off) = runtime.map_or((fall, off), |[_, f, o]| (f, o));
+                                let hi = (lo + sel_w - 1) as usize;
+                                let old = self.signal_table[base_id].range_select(hi, lo as usize);
+                                Self::transition_delay(
+                                    &sel_val,
+                                    &old,
+                                    delay,
+                                    fall,
+                                    off,
+                                    vector || sel_w > 1,
+                                )
+                            }
+                            _ => delay,
+                        };
                         self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
                     }
                 } else if let Some(id) = lhs_id {
                     let width = self.signal_widths[id];
                     let mut resized = if self.signal_real[id] {
-                        if val.is_real {
-                            val.clone()
-                        } else {
-                            Value::from_f64(val.to_f64())
-                        }
+                        self.fit_value_to_signal(id, &val)
                     } else if val.is_real {
                         Self::real_to_int(val.to_f64(), width)
                     } else {
@@ -754,17 +880,18 @@ impl Simulator {
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = crate::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
-                if let Some(hint) = &scope_hint {
-                    *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-                }
+                // §23.6: top-scope work must clear the caller's instance hint.
+                *self.name_resolve_hint.borrow_mut() = scope_hint.clone();
                 self.settle_prev_values.clear();
                 for &id in &entry.cold.write_signal_ids {
                     self.settle_prev_values
                         .push((id, self.signal_table[id].clone()));
                 }
-                // $time/%t in the body scales to the BLOCK's module timescale.
+                // §20.3.1, §20.3.3: time calls use the block's module.
+                // An absent name hint still needs an explicit top override;
+                // None would inherit the last scheduled process's timescale.
                 let saved_ts = self.timescale_scope_override.take();
-                self.timescale_scope_override = scope_hint.clone();
+                self.timescale_scope_override = Some(scope_hint.clone().unwrap_or_default());
                 self.exec_statement(stmt);
                 self.timescale_scope_override = saved_ts;
                 *self.name_resolve_hint.borrow_mut() = saved_hint;
@@ -798,6 +925,10 @@ impl Simulator {
             }
             CombItem::CompiledContAssign { compiled, .. }
             | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                // Inside a settle the file is already the settle's own; a
+                // `release`, a force refresh or a time-0 replay outside one
+                // can run while a compiled caller waits (§13.4).
+                let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                 if self.vm_regs.len() < compiled.num_regs as usize {
                     self.vm_regs
                         .resize(compiled.num_regs as usize, Value::zero(1));
@@ -808,7 +939,28 @@ impl Simulator {
                         compiled.instructions.len(),
                     )
                 };
+                // §20.3.1, §20.3.3: statement fallbacks in top blocks need the top unit.
+                let saved_ts = if compiled.has_fallback
+                    && matches!(entry.item, CombItem::CompiledContAssign { .. })
+                {
+                    Some(self.timescale_scope_override.replace(
+                        entry.cold.rhs_time_scope.as_deref().unwrap_or_default().to_owned(),
+                    ))
+                } else if compiled.has_fallback
+                    && entry.cold.scope_hint.is_none()
+                    && matches!(entry.item, CombItem::CompiledAlwaysBlock { .. })
+                {
+                    Some(self.timescale_scope_override.replace(String::new()))
+                } else {
+                    None
+                };
                 self.exec_insns(insns);
+                if let Some(saved_ts) = saved_ts {
+                    self.timescale_scope_override = saved_ts;
+                }
+                if let Some(caller_regs) = caller_regs {
+                    self.leave_private_regs(caller_regs);
+                }
             }
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
@@ -893,7 +1045,8 @@ impl Simulator {
         self.quiet_bits.resize(n.div_ceil(64), 0);
         for id in 0..n {
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            // An edge signal, or one a parked waiter is indexed under.
+            let edge = self.waiter_signal_hooked(id);
             if !armed && !edge {
                 self.quiet_bits[id >> 6] |= 1u64 << (id & 63);
             }
@@ -1238,7 +1391,7 @@ impl Simulator {
             self.gate_lane[eidx] = self.gate_ops.len() as u32;
             self.gate_ops.push(*op);
             let armed = self.armed_input_set(id);
-            let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
+            let edge = self.waiter_signal_hooked(id);
             let wide = self.signal_widths.get(id).copied().unwrap_or(65) > 64;
             self.gate_obs
                 .push((armed as u8) | ((edge as u8) << 1) | ((wide as u8) << 2));
@@ -1278,6 +1431,54 @@ impl Simulator {
         }
     }
 
+    /// #35 / #1149: list the reads of a cont-assign entry that a deferring
+    /// (post-proc-write) settle skipped, for the next full settle to
+    /// re-dirty. Each id is listed once: the drain re-dirties an id only if
+    /// it is not dirty yet, so a second copy changes nothing, and an entry
+    /// that re-triggers on every settle (one with an unresolved read) is
+    /// skipped again on every blocking write of the process. `marker` lists
+    /// the out-of-range `u32::MAX` entry, which only keeps the list
+    /// non-empty; an id out of range of `dirty_signals` (the drain skips it)
+    /// is listed as that marker too.
+    fn defer_proc_reads(&mut self, ids: &[usize], mut marker: bool) {
+        let n = self.dirty_signals.len();
+        if self.deferred_proc_seen.len() < n.div_ceil(64) {
+            self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        }
+        for &id in ids {
+            if id >= n {
+                marker = true;
+                continue;
+            }
+            let (w, b) = (id >> 6, 1u64 << (id & 63));
+            if self.deferred_proc_seen[w] & b == 0 {
+                self.deferred_proc_seen[w] |= b;
+                self.deferred_proc_entries.push(id as u32);
+            }
+        }
+        if marker && !self.deferred_proc_unres {
+            self.deferred_proc_unres = true;
+            self.deferred_proc_entries.push(u32::MAX);
+        }
+    }
+
+    /// #1149: the listed-once bits of `deferred_proc_entries`, rebuilt from
+    /// the list (a restored checkpoint holds only the list).
+    pub(super) fn rebuild_deferred_proc_seen(&mut self) {
+        let n = self.dirty_signals.len();
+        self.deferred_proc_seen.clear();
+        self.deferred_proc_seen.resize(n.div_ceil(64), 0);
+        self.deferred_proc_unres = false;
+        for &sid in &self.deferred_proc_entries {
+            let sid = sid as usize;
+            if sid < n {
+                self.deferred_proc_seen[sid >> 6] |= 1u64 << (sid & 63);
+            } else {
+                self.deferred_proc_unres = true;
+            }
+        }
+    }
+
     pub(super) fn settle_combinatorial_inner(&mut self) {
         if !self.ts_sleep.is_empty() {
             self.ts_wake_sleepers();
@@ -1309,6 +1510,9 @@ impl Simulator {
         }
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
+        }
+        if self.comb_self_exempt.len() != self.comb_entries.len() {
+            self.build_comb_self_exempt();
         }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
@@ -1382,14 +1586,23 @@ impl Simulator {
             && (self.time != 0 || self.t0_starts_remaining == 0)
             && !self.deferred_proc_entries.is_empty()
         {
-            let deferred = std::mem::take(&mut self.deferred_proc_entries);
-            for sid in deferred {
+            let mut deferred = std::mem::take(&mut self.deferred_proc_entries);
+            for &sid in &deferred {
                 let sid = sid as usize;
-                if sid < self.dirty_signals.len() && !self.dirty_signals[sid] {
-                    self.dirty_signals[sid] = true;
-                    self.dirty_list.push(sid);
+                if sid < self.dirty_signals.len() {
+                    if let Some(w) = self.deferred_proc_seen.get_mut(sid >> 6) {
+                        *w &= !(1u64 << (sid & 63));
+                    }
+                    if !self.dirty_signals[sid] {
+                        self.dirty_signals[sid] = true;
+                        self.dirty_list.push(sid);
+                    }
                 }
             }
+            self.deferred_proc_unres = false;
+            // The list keeps its allocation for the next deferral.
+            deferred.clear();
+            self.deferred_proc_entries = deferred;
             self.dirty_any = true;
         }
         // First time-0 settle pass: don't fire `always @(list)` blocks that
@@ -1511,6 +1724,7 @@ impl Simulator {
             self.settling = false;
             return;
         }
+        let caller_regs = self.enter_private_regs();
 
         // Chaotic-iteration loop: drain a sorted worklist of triggered
         // entries each pass. New triggers added during a pass (via worklist
@@ -1699,6 +1913,20 @@ impl Simulator {
                             continue;
                         }
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        // An `always @*` that reads a packed element it also
+                        // writes after packed-region exclusion, the one
+                        // kind the arm above lets through. Precomputed; only
+                        // a self-dependency gets this far, and only an entry
+                        // added since the table was built misses it.
+                        if __dep == $eidx
+                            && self
+                                .comb_self_exempt
+                                .get(__dep)
+                                .copied()
+                                .unwrap_or_else(|| entries[__dep].reads_own_writes())
+                        {
                             continue;
                         }
                         if lane_on {
@@ -1971,22 +2199,15 @@ impl Simulator {
                             | CombItem::FusedAndFanout { .. }
                     ) || self.gate_entry_is_assign_origin(&entries[eidx]))
                 {
-                    self.deferred_proc_entries.extend(
-                        entries[eidx]
-                            .cold
-                            .read_signal_ids
-                            .iter()
-                            .map(|&id| id as u32),
-                    );
                     // An entry with no resolvable read (one reading only
                     // memory cells without element names) has no id to
                     // re-dirty: an out-of-range marker still makes the next
                     // full settle run, which seeds every unresolved entry.
-                    if entries[eidx].has_unresolved_reads
-                        && entries[eidx].cold.read_signal_ids.is_empty()
-                    {
-                        self.deferred_proc_entries.push(u32::MAX);
-                    }
+                    let reads = &entries[eidx].cold.read_signal_ids;
+                    self.defer_proc_reads(
+                        reads,
+                        entries[eidx].has_unresolved_reads && reads.is_empty(),
+                    );
                     continue;
                 }
                 evaluated_any = true;
@@ -2360,10 +2581,15 @@ impl Simulator {
                                         let prev_ts = self.timescale_scope_override.take();
                                         let sc = entries[eidx].cold.scope_hint.clone();
                                         self.set_m_block_scope(sc.as_deref());
-                                        if sc.is_some() {
-                                            *self.name_resolve_hint.borrow_mut() = sc.clone();
-                                        }
-                                        self.timescale_scope_override = sc;
+                                        *self.name_resolve_hint.borrow_mut() = sc.clone();
+                                        self.timescale_scope_override = Some(
+                                            entries[eidx]
+                                                .cold
+                                                .rhs_time_scope
+                                                .as_deref()
+                                                .unwrap_or_default()
+                                                .to_owned(),
+                                        );
                                         Some((prev_hint, prev_ts))
                                     } else {
                                         None
@@ -2405,9 +2631,15 @@ impl Simulator {
                             }
                         }
                         CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                            // P5: X-free evaluations run on u64 words (a lowered
-                            // block has no fallbacks, so none of the scope /
-                            // timescale bookkeeping below applies to it).
+                            // §20.3.1, §20.3.3: native statements can also fall
+                            // back to the interpreter. Only top needs an override
+                            // before native dispatch; the VM and two-state hooks
+                            // install theirs when reached. Non-native builds do
+                            // no time-scope work on the plan's hot path.
+                            #[cfg(feature = "jit")]
+                            let saved_ts = (compiled.has_fallback
+                                && entries[eidx].cold.scope_hint.is_none())
+                            .then(|| self.timescale_scope_override.replace(String::new()));
                             if self.dispatch_comb_plan(eidx, compiled) {
                                 n_ab += 1;
                                 if self.proc_depth > 0 {
@@ -2449,11 +2681,6 @@ impl Simulator {
                                             compiled.instructions.len(),
                                         )
                                     };
-                                    // $time/%t in a fallback stmt scales to the BLOCK's
-                                    // module timescale (mirrors the edge-block dispatch).
-                                    let saved_ts = self.timescale_scope_override.take();
-                                    self.timescale_scope_override =
-                                        entries[eidx].cold.scope_hint.clone();
                                     // …and `%m` in that fallback names the BLOCK's instance.
                                     self.set_m_block_scope(
                                         entries[eidx].cold.scope_hint.as_deref(),
@@ -2464,25 +2691,42 @@ impl Simulator {
                                     // resolved the bare array name, found nothing, and
                                     // dropped every write. Pure-bytecode blocks pre-resolve
                                     // their ids, so this costs them one bool test.
+                                    // has_fallback counts statement fallbacks only. Comb blocks
+                                    // have no expression fallbacks (only edge blocks enable
+                                    // them), so without statement fallbacks this block never
+                                    // re-enters the interpreter here.
                                     let saved_hint = if compiled.has_fallback {
                                         let prev = self.name_resolve_hint.borrow().clone();
-                                        if let Some(sc) = entries[eidx].cold.scope_hint.as_ref() {
-                                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                                        }
+                                        *self.name_resolve_hint.borrow_mut() = entries[eidx].cold.scope_hint.clone();
                                         Some(prev)
                                     } else {
                                         None
                                     };
+                                    let saved_vm_ts = compiled.has_fallback.then(|| {
+                                        self.timescale_scope_override.replace(
+                                            entries[eidx]
+                                                .cold
+                                                .scope_hint
+                                                .clone()
+                                                .unwrap_or_default(),
+                                        )
+                                    });
                                     self.exec_insns(insns);
+                                    if let Some(prev) = saved_vm_ts {
+                                        self.timescale_scope_override = prev;
+                                    }
                                     if let Some(prev) = saved_hint {
                                         *self.name_resolve_hint.borrow_mut() = prev;
                                     }
-                                    self.timescale_scope_override = saved_ts;
                                     n_ab += 1;
                                     if self.proc_depth > 0 {
                                         self.note_comb_ran_in_process(eidx, &entries[eidx]);
                                     }
                                 }
+                            }
+                            #[cfg(feature = "jit")]
+                            if let Some(saved_ts) = saved_ts {
+                                self.timescale_scope_override = saved_ts;
                             }
                         }
                         // The three fused arms are the settle loop's highest-volume
@@ -2802,6 +3046,7 @@ impl Simulator {
         if total_iters > self.max_settle_iters {
             self.max_settle_iters = total_iters;
         }
+        self.leave_private_regs(caller_regs);
         self.settling = false;
     }
 

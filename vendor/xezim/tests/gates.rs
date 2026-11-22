@@ -29,6 +29,19 @@ mod drive_strength_pull;
 mod dump_formats_agree;
 #[path = "gates/dump_merged_sv.rs"]
 mod dump_merged_sv;
+#[path = "gates/dump_qualified_parameters.rs"]
+mod dump_qualified_parameters;
+#[path = "gates/dumpflush.rs"]
+mod dumpflush;
+#[path = "gates/enum_continuous_delay.rs"]
+mod enum_continuous_delay;
+
+#[path = "gates/dumpvars_generate_scope.rs"]
+mod dumpvars_generate_scope;
+#[path = "gates/dumpvars_repeated_calls.rs"]
+mod dumpvars_repeated_calls;
+#[path = "gates/dumpvars_cross_top_scope.rs"]
+mod dumpvars_cross_top_scope;
 #[path = "gates/fn_return_member_inlines.rs"]
 mod fn_return_member_inlines;
 #[path = "gates/fst_roundtrip.rs"]
@@ -43,14 +56,20 @@ mod interrupt_fst_tail;
 mod multi_driver_contention;
 #[path = "gates/nameless_udp_instance.rs"]
 mod nameless_udp_instance;
+#[path = "gates/net_array_cell_drivers.rs"]
+mod net_array_cell_drivers;
 #[path = "gates/net_declaration_delay.rs"]
 mod net_declaration_delay;
+#[path = "gates/zero_rise_gate_net_delay.rs"]
+mod zero_rise_gate_net_delay;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
 #[path = "gates/packed_member_nba_compiles.rs"]
 mod packed_member_nba_compiles;
 #[path = "gates/packed_member_nesting_compiles.rs"]
 mod packed_member_nesting_compiles;
+#[path = "gates/review_instance_strengths_and_selects.rs"]
+mod review_instance_strengths_and_selects;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
 #[path = "gates/specify_path_delays.rs"]
@@ -61,6 +80,8 @@ mod streaming_op_compiles;
 mod submodule_gate_net_delays;
 #[path = "gates/timing_checks_kinds.rs"]
 mod timing_checks_kinds;
+#[path = "gates/timing_check_condition_x.rs"]
+mod timing_check_condition_x;
 #[path = "gates/timing_checks_notifier.rs"]
 mod timing_checks_notifier;
 #[path = "gates/tran_and_implicit_nets.rs"]
@@ -79,7 +100,35 @@ mod vcd_lrm_compliance;
 mod wave_flag_gates_dumping;
 #[path = "gates/zero_delay_path_edge_ordering.rs"]
 mod zero_delay_path_edge_ordering;
+#[path = "gates/wave_suppress.rs"]
+mod wave_suppress;
 #[path = "gates/udp_unnamed_after_delay_579.rs"]
 mod udp_unnamed_after_delay_579;
 #[path = "gates/udp_delay_forms.rs"]
 mod udp_delay_forms;
+#[path = "gates/udp_instance_delay_units.rs"]
+mod udp_instance_delay_units;
+
+#[path = "gates/udp_adjacent_symbols_841.rs"]
+mod udp_adjacent_symbols_841;
+#[path = "gates/udp_output_reg_body_868.rs"]
+mod udp_output_reg_body_868;
+
+#[path = "gates/driver_transition_delays.rs"]
+mod driver_transition_delays;
+
+#[path = "gates/shared_net_driver_stages.rs"]
+mod shared_net_driver_stages;
+#[path = "gates/vector_continuous_delay.rs"]
+mod vector_continuous_delay;
+#[path = "gates/review_select_continuous_delay.rs"]
+mod review_select_continuous_delay;
+
+#[path = "gates/ascending_udp_port_1201.rs"]
+mod ascending_udp_port_1201;
+#[path = "gates/delayed_slice_ownership_1215.rs"]
+mod delayed_slice_ownership_1215;
+#[path = "gates/parameter_wave_scope_1213.rs"]
+mod parameter_wave_scope_1213;
+#[path = "gates/package_param_array_wave_scope_1213.rs"]
+mod package_param_array_wave_scope_1213;

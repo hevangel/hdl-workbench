@@ -6,6 +6,3357 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+### 0.11.7 — lower elaboration memory, faster event waits and queues, DPI C sources and memory files, array and real-number correctness (November 2026)
+
+Large designs elaborate in much less memory: compilation-unit declarations,
+prepared module bodies, declared types, constraint blocks and scope paths are
+shared or released instead of copied per instance, and the parser holds
+8-byte tokens (#721, core #190). A process parked on an event control over
+signals is examined only when one of them is written, and queue operations at
+the front no longer cost time in proportion to the queue's length. C and C++
+DPI sources can be named among the design files, `$readmem*` and `$writemem*`
+handle associative and multidimensional arrays, and `--wave-suppress`
+excludes signals from the dumps. Most of the correctness work, on unpacked
+arrays and assignment patterns, `real` and `shortreal` values, simulation time
+above 2^53 ticks, port connections and IEEE 1800-2023 conformance, comes from
+contributor reports and patches.
+
+**Correctness**
+
+* `.*` connects a port to an implicit net that a port connection of another
+  instance in the same scope declares, whether that instance comes before or
+  after it; a `.*` name that no connection declares is still an error, and
+  under `` `default_nettype none `` no connection declares one (§23.3.2.4,
+  §6.10, #1405, contributed by akashlevy).
+
+* An element of an unpacked array answers `vpi_handle(vpiLeftRange, h)` and
+  `vpiRightRange` with the range of its own packed type (`[31:0]` for
+  `top.ids[0]` of `logic [31:0] ids [4]`), and the record `vpi_chk_error`
+  fills has an empty `file` string instead of NULL, so cocotb no longer
+  crashes when it writes a Python list to an unpacked-array port (§38.11,
+  §38.3, #1406, contributed by akashlevy).
+
+* A task that calls itself, or tasks that call each other, in one time step
+  without waiting is reported as a zero-delay loop, with the process and its
+  source, and ends the run with a failing status; it overflowed the native
+  stack. The check stops the run at `XEZIM_STALL_LIMIT` nested calls (default
+  100,000) or when the native stack is down to its reserve, and the report
+  names the setting to raise for a deep finite recursion, `XEZIM_STACK_MB` or
+  `XEZIM_STALL_LIMIT`, where `0` turns the nesting count off (§4.4, §9.2,
+  #1408, contributed by akashlevy).
+
+* `$readmemh` and `$readmemb` load, and `$writememh` and `$writememb` write,
+  an associative array with an integral index type: each file address is a
+  key, start and finish addresses apply in either direction, keys up to 128
+  bits keep their values, keys already present and not loaded are kept, and a
+  dump writes the existing elements in index order. A string-indexed array is
+  still rejected (§21.4, §21.5, #1409, contributed by akashlevy).
+
+* `$readmem*` and `$writemem*` load and write a multidimensional unpacked
+  array, or the subarray a partial index leaves (`ram[1]`), in row-major
+  order: the rightmost dimension varies fastest and each dimension runs from
+  its low index to its high one. Start, finish and `@` addresses count
+  elements in that order (§21.4.3, §21.5, #1410, contributed by akashlevy).
+
+* A DPI import that no `--dpi-lib` library defines binds to a function the
+  process already has loaded, such as `getenv` or `abs` of the C library;
+  calling a name found nowhere is still a fatal error (§35.5.1, #1411,
+  contributed by akashlevy).
+
+* The input actual of a module- or package-scope task or function whose formal
+  is sized by a parameter (`input logic [W-1:0] v`) is evaluated at the
+  formal's width, and the operands of `&&`, `||`, `->` and `<->` stay
+  self-determined under a context width: `(a << 1) || 1'b0` for `logic [7:0]
+  a = 8'h80` is 0, not 1 (§13.5, §11.6.1, #1412, contributed by akashlevy).
+
+* A parenless enumeration method (`p.name`, `p.last`) of a class property, a
+  property reached through a handle or `this`, an array element or a structure
+  member reads the receiver's declared enumeration; it read a member or signal
+  of that name (§6.19.5, #1422, contributed by auty1395).
+
+* A part-select bounded by `$clog2` in compiled code reads the bits it
+  selects: `$clog2` of a literal, a parameter or an unrolled loop index folds
+  in the compiler, and a bound that still does not fold is read as a label of
+  the declared range, so `a[$clog2(N)-1:3]` on `input [11:2] a` no longer
+  reads x in its upper bits (§20.8.1, §11.5.1, #1429, contributed by
+  akashlevy).
+
+* An `always @(*)` block wakes on the nonblocking update of a variable it
+  reads, also one it writes: in `always @(*) begin dot <= b; prod <= a * dot;
+  end`, `prod` follows the update of `dot`. A variable the block writes only
+  by blocking assignments still does not wake it, and `always_comb` is
+  unchanged (§9.4.2.2, §4.4, #1430, contributed by akashlevy).
+
+* A deferred immediate assertion (`assert #0`, `assert final`) counts its
+  outcome when its report matures, not when it is queued: a report a flush
+  point discards is no attempt, the copies of a generate loop keep their own
+  reports, and the assertion summary and `XEZIM_COV_DB` are written after the
+  last time slot's reports mature and the `final` blocks run (§16.4.2, §16.4,
+  #1431, contributed by akashlevy).
+
+* Evaluate a continuous assignment delay that names a variable (`assign #(d)
+  w = a;`, `wire #(di) w = a;`, `#(rise, fall)`, `buf #(di)`, a submodule
+  `assign #(dv + PD)`) in the declaring scope each time the right-hand side
+  changes, with transition selection and inertial filtering; it was folded to
+  0 (§10.3.3, #1289, reported by ds54e).
+
+* Parse a real cast as a coverpoint expression (`coverpoint real'(x)`) in
+  SV-2023 mode, where it was read as the coverpoint type modifier (§6.24.1,
+  §19.5, #1473, reported by ds54e).
+
+* Keep a `shortreal` input port's own storage when it is connected to a bare
+  `real` variable (and a `real` port's for a `shortreal` actual), so the
+  connection rounds to binary32 (§6.12, §23.3.3.8, #1463, reported by ds54e).
+
+* Round an exact `%t` display tie to the even value in decimal also above 2^53
+  ticks, where it fell back to a real (§20.4.3, §21.2.1, #1329, reported by
+  ds54e).
+
+* Give an ANSI port of the top module the packed shape of its type: `o[1]` of
+  `output logic [5:0][7:0] o` reads element 1, not bit 1, a member of a
+  packed-structure port reads its bits, not x, and a part-select of such a
+  port connected to an instance is sized in elements (§7.4.1, §7.2,
+  §23.2.2.2).
+
+* Link precompiled DPI objects with the C++ runtime when one is available, and
+  include macros defined in the primary files when preprocessing library files
+  for the design cache (§35, §22.5.1).
+
+* Accept an escaped typedef name in a subroutine port declaration, count
+  packed elements in a port connection through a variable-start indexed
+  part-select (`w[1][pos +: 2]`), and accept constant part-selects in
+  package-parameter generate indices (§5.6.1, §11.5.1, §27.5, core #262, #264,
+  #273).
+
+* Evaluate a delayed unpacked row selector once, bind class-property and
+  queue-element reference arguments to live storage, and preserve signed
+  packed lanes through collection formals and virtual interfaces (#1320,
+  #1321, #1312).
+
+* Size an equality, relational, logical, reduction or `inside` result as 1 bit
+  in interpreted code, so it no longer widens the operator around it: `if
+  ((~a) | (m == 5'd12))` over a 1-bit `a` reads `~a` as 0, not as `5'b11110`,
+  in an `if` or `?:` condition, a loop condition, a `case` item, `wait`, an
+  `iff` guard, an assertion and a `$display` argument (§11.6.1, #1369,
+  contributed by akashlevy).
+
+* Evaluate the operand of a size cast by a field of a struct parameter
+  (`pt.DEPTH'(x)`, `(pt.DEPTH)'(x)`) at the field's value, in compiled and
+  interpreted code and in an instance's body with that instance's value; it
+  passed the operand through at its own width, or took the width of a
+  same-named parameter (§6.24.1, #1370, contributed by akashlevy).
+
+* Place a part-select through an index into a packed-array port of an
+  instantiated module (`f[0][31:1]` on `output logic [0:0][31:1] f`) by the
+  port's declared dimensions, as on a variable: offset and ascending elements
+  and slices of a 3-D port's middle dimension wrote nothing or landed a bit
+  low (§7.4.1, §11.5.1, #1371, contributed by akashlevy).
+
+* Select whole elements of the next dimension in a part-select after an index
+  into a multi-dimensional packed array in compiled code: `assign a[0][5:0] =
+  b` on `logic [3:0][5:0][7:0] a` writes 48 bits, not 6, for constant, indexed
+  and variable bases, reads, nonblocking writes and the right-hand side's
+  context width. A run-time base that runs past the dimension writes only its
+  elements inside it and reads x for the others, in compiled and interpreted
+  code, and the interpreter selects whole elements in a slice of a packed
+  struct member (`s.m[1][2:1]`) too (§7.4.3, §11.5.1, #1372, contributed by
+  akashlevy).
+
+* Wait on a packed struct member's own bits in an event control (`@(posedge
+  a.clk)`, `@(a.valid)`), so a clock forwarded to a child's clock port through
+  a struct member fires on its own edges and samples pre-edge data (§9.4.2,
+  §7.2.1, #1373, contributed by akashlevy).
+
+* Accept a cycle delay with no left operand whose operand opens with a
+  clocking event, as in `b ##1 @(posedge clk2) ##1 ##1 @(posedge clk)
+  $fell(b)`; this was a parse error (§16.13.1, A.2.10, aionhw/xezim-core#260,
+  contributed by akashlevy).
+
+* Accept a cycle delay operand that opens with a concatenation, an unbased,
+  real or string literal, an escaped name or `first_match(...)`, and a
+  clocking event inside a sequence written `@ identifier` (`a ##1 @e b`); each
+  of these was a parse error (§16.13.1, §9.4.2, A.2.10,
+  aionhw/xezim-core#260).
+
+* Take `s_t [N-1:0]` as the type in a function or task body port declaration
+  `input s_t [N-1:0] in;`, so the port is `in` and the body's next declaration
+  is no longer reported as following a statement (§13.4, A.2.2.1,
+  aionhw/xezim-core#262, contributed by akashlevy). Take a user-defined type
+  before an escaped port name too, `input s_t \in ;`, in subroutine bodies and
+  in a module's port declarations (§5.6.1, §23.2.2.1, aionhw/xezim-core#262,
+  reported by akashlevy).
+
+* Create no implicit net for an enum label of the instantiating module in a
+  port actual (`.din(st == STREAM)`), also under `` `default_nettype none ``,
+  and keep an imported or `$unit` label in a port actual as its own name, so
+  it reads its value at any depth (§6.19, §6.10, §26.3, aionhw/xezim-core#263,
+  contributed by akashlevy).
+
+* Size a port connection through an index and a range of the next dimension by
+  its elements, `.o(a[2][4:2])` on `logic [3:0][5:0][7:0] a` as 24 bits. This
+  removes the bogus width warning, substitutes a matching input and pads no
+  inout (§7.4.3, §23.3.3, aionhw/xezim-core#264, contributed by akashlevy).
+  Elements of two- and three-dimensional unpacked arrays are sized the same
+  way (§7.4.3, aionhw/xezim-core#264, reported by akashlevy).
+
+* Simulate a module named `gated_clk_cell` from its body unless the body is a
+  plain clock pass-through, so a real clock gate gates and its internals can
+  be reached by hierarchical name. A cell whose clock net has a delay,
+  strength or resolving net type is also simulated from its body (§23.3.2,
+  §6.7.1, aionhw/xezim-core#265, contributed by akashlevy), and so is a
+  pass-through whose clock port is a `bit`, a vector or signed (§6.11.2,
+  §23.3.3, aionhw/xezim-core#265, reported by akashlevy).
+
+* Connect an unpacked port to a slice with parameter bounds element by element
+  inside an instance, `.p(arr[0:N-1])` and `.o(res[N:2*N-1])`; port element
+  `t` read bit `t` of the first element, and an output slice drove nothing
+  (§7.4.6, §23.3.3, aionhw/xezim-core#266, contributed by akashlevy).
+
+* Keep the typedefs of a module below the top in a struct it passes to a child
+  through a type parameter, so `a[i].id` on a packed array of the struct reads
+  the member at its declared width and offset, also through a second type
+  parameter, an interface, a generate block and a child typedef of the same
+  name (§6.20.3, §23.10, aionhw/xezim-core#272, contributed by akashlevy).
+
+* Take a member of an element of a package parameter named with its package
+  (`p::Info[k].variant`) as a constant in a generate condition without an
+  import (§27.5, §11.2.1, §26.3, aionhw/xezim-core#273, contributed by
+  akashlevy).
+
+* Declare a block-local variable of a type parameter with packed dimensions
+  (`T [1:0] tmp;`) as a packed array of the bound type, including an `int`
+  binding, a block typedef built on the parameter, a struct written in the
+  declaration and a `for` loop variable; a block typedef of the parameter's
+  name hides it (§6.20.3, §7.4.1, §6.18, §12.7.1, aionhw/xezim-core#274,
+  contributed by akashlevy).
+
+* Select a generate branch below the top by an element of an unpacked
+  struct-array `localparam` of the module or of an imported package array
+  parameter, reading a same-named array from the package each module imports
+  (§27.5, §6.20.2, §26.3, aionhw/xezim-core#275, contributed by akashlevy).
+
+* Resolve a parameterized class's typedef of a type parameter's member
+  (`typedef T::hw_t hw_t;`) in the specialization that names it
+  (`E#(cfg_t)::hw_t`, `E#(cfgw#(8))::hw_t`), and a typedef of a type parameter
+  used as a class scope (`typedef C::hw_t h_t;`) (§8.25.1, §6.20.3, §6.18,
+  aionhw/xezim-core#276, contributed by akashlevy).
+
+* Start a 2-state packed struct with a packed array of 2-state structs or
+  enums as a member at 0 (§7.2.1, §6.8, aionhw/xezim-core#277, contributed by
+  akashlevy).
+
+* Size a statement-local variable whose dimension calls a system function on
+  an instance parameter (`[$clog2(P)-1:0]`, `[$signed(P)-1:0]`,
+  `[int'(P)-1:0]`, `[$bits(P)-1:0]`) per instance, with `$signed` read at the
+  operand's own width (§20.8.1, §20.6.2, §11.7, §6.20.2,
+  aionhw/xezim-core#278, contributed by akashlevy).
+
+* Keep a macro that a `-v`/`-y` library file defines for the library files
+  read after it, and read a library file whose bytes are not UTF-8 instead of
+  dropping it (§22.5.1, §3.12.1, aionhw/xezim-core#279, contributed by
+  akashlevy).
+
+* Write an unpacked, dynamic or multidimensional array with
+  `$writememh`/`$writememb` one word per line with no `@` address, also over a
+  range that does not start at the lowest address, and keep `@<address>
+  <word>` for an associative array (§21.5.3, #1444, reported by akashlevy).
+
+* Write the elements a dynamic array's size counts with
+  `$writememh`/`$writememb`, not the 64 storage slots set aside for it; an
+  empty one writes an empty file (§21.5, §7.5).
+
+* Read a literal input actual as the result of assigning it to the formal: the
+  formal's width and sign, a real rounded to an integral formal, a string or
+  time literal in the connecting scope's unit, and X and Z dropped for a
+  2-state formal; a Z bit on a `tri0` or `tri1` input is pulled (§23.3.3.8,
+  §10.7, §6.11.2, §6.6.5, #1324, contributed by ds54e).
+
+* Drop X and Z of any actual on a 2-state input or output formal: a net, a
+  variable, a parameter, a package constant or an expression, and a
+  gate-shaped continuous assignment to a `bit` scalar drops them too (§6.11.2,
+  §23.3.3.2, #1324, reported by ds54e). Pull or hold the Z bits of any actual
+  on a `tri0`, `tri1` or `trireg` input (§6.6.5, §6.6.4, #1324, reported by
+  ds54e). Truncate a wider package constant and round a real net, variable or
+  constant on an integral input (§10.7, §26.3, §6.12.1, #1324, reported by
+  ds54e).
+
+* Keep every tick of the simulation time above 2^53 in `$time` and `$stime`
+  reads and in `%t` of an integral value (§20.3.1, §20.3.2, §20.4.3, #1329,
+  contributed by ds54e).
+
+* Keep every tick above 2^53 in integral delays, the severity `Time:` line and
+  `%t` of `$realtime` (§9.4.1, §20.10, §20.3.3, #1329, reported by ds54e).
+  Display `%t` of a time read in a package, class or compilation-unit
+  subroutine from that scope's unit, and keep the low 32 bits of `$stime`
+  there (§3.14.2.3, §20.3.2, #1329, reported by ds54e).
+
+* Read `$time`, `$stime`, `$realtime` and time literals on the right of a
+  continuous assignment in the declaring module's unit, not in the unit of the
+  process that changed its operands (§3.14.2.3, §20.3, §5.8, #1329, reported
+  by ds54e).
+
+* Read a selected row of a fixed array (`src[1]`, `cube[i][0]`) as its
+  elements, in declared order, in an unpacked array concatenation, in
+  blocking, nonblocking, intra-assignment-delay and event-control assignments
+  and in array arguments. An invalid row gives the element type's default in
+  every element, and a blocking store to a descending fixed array starts at
+  its left bound (§10.10, §7.4.5, §7.6, §9.4.5, #1322, contributed by ds54e).
+
+* Spread a slice of a fixed array or of one of its rows (`src[1][0:1]`, `a[i
+  +: 2]`, `w[3 -: 2]`) into an unpacked array concatenation in the order the
+  range selects, instead of reading `[b +: w]` / `[b -: w]` as a constant
+  range (§7.4.5, §10.10, #1322, reported by ds54e).
+
+* Spread the array items of a concatenation returned from a function (`return
+  {src[1], 9};`), initializing a class queue property (`int q[$] = {w, 5};`)
+  or initializing a fixed array declaration (`int d[3] = {src[1],
+  src[0][1]};`); a descending or offset target fills from its left bound
+  (§13.4.1, §8.7, §6.8, §10.10, #1322, reported by ds54e).
+
+* Drive each element of a one-dimensional fixed array from a continuous
+  assignment of an unpacked array concatenation (`assign d = {w, s, 5};`,
+  `assign d = {src[1], src[0][1]};`), which drove nothing (§10.3, §10.10,
+  #1322, reported by ds54e).
+
+* Fill a row (`m[1] = {…}`), a fixed-array member of a structure array element
+  or object (`sa[1].up = {…}`, `h.fa = {…}`) or a descending array formal from
+  its left bound with an unpacked array concatenation (§10.10, §7.6, §13.5,
+  #1322, reported by ds54e). Initialize `new[n]({…})` from the concatenation's
+  elements instead of broadcasting it as one value (§7.5.1), and spread a
+  conditional of array operands, a cast to an unpacked array type and a
+  structure member array used as items (§11.4.11, §6.24.1).
+
+* Round a real cast to or stored into a 64-bit integral type in compiled code:
+  `longint'(r)`, `xlen_t'(r)`, `wire [63:0] w = r;`, `assign w = r;`,
+  `always_comb l = r;`, a 64-bit packed structure member, `time` and `longint`
+  variables, function formals, returns and local initializers, and a real
+  input port actual read the real's IEEE 754 bits; other widths and the
+  interpreter already rounded (§6.12.1, §6.24.1, §10.7, §23.3.3.2, #1319,
+  reported by ds54e).
+
+* Match a `case` statement whose case expression or item is real numerically:
+  `case (r) 1:` matches `r = 1.0` and `case (i) 2.0:` matches `i = 2`, in
+  interpreted and compiled code; they were compared bit for bit and never
+  matched (§12.5, §11.8.2).
+
+* Store a value written into a variable by name in the variable's type: a real
+  pattern item for a 64-bit integral element (`time arr[2] = '{9200s, 1.5}`,
+  `'{t: 9200s, l: 3000000000.0}`) is rounded instead of wrapped at 32 bits,
+  and an integral value written into a real cell converts to real (§6.12.1,
+  §10.9).
+
+* Store an unbased unsized literal into a real, shortreal or realtime target
+  at its one bit: `r <= '1`, `r <= #1 '1`, `assign r = '1`,
+  `rq.push_back('1)`, `ra[k] = '1`, a compiled `r = '1` and a `'1` input port
+  actual store 1.0; they stored 2**64-1, -1 or NaN (§5.7.1, §6.12.1).
+
+* Read a signed member (`int`, `byte`, `shortint`, `longint`) of an unpacked
+  structure declared in an `initial` or `always` block as signed, also after a
+  real is rounded into it; `s.i = -1.5` read 4294967294 (§6.11.3, §7.2).
+
+* Start each element of a module-scope fixed array of unpacked structures with
+  the members' declared defaults (`struct { real a = 1.5; } arr[2]` reads
+  1.5); the elements read 0 (§7.2.2).
+
+* Keep a `real` member of a module-scope unpacked untagged union as a real in
+  interpreted code: `u.r = 1.5` reads 1.5 and the other members see its bits;
+  it read back as a 64-bit integer (§7.3).
+
+* Write a whole-array assignment to a fixed array member of an unpacked
+  structure declared in an `initial` or `always` block to every element
+  (`s.m = '{default: 2.5}`), and give a member declared with an array typedef
+  (`typedef real A[2]; struct { A m; }`) its elements in procedural-block and
+  subroutine locals; the elements kept their old values, read x or read 0
+  (§7.2, §7.4, §10.9.1).
+
+* Read the right-hand side of an intra-assignment delay or event control
+  (`dst = #4 src[1];`, `q <= #4 src[1];`, `r = @(go) src[1];`) that is a whole
+  multidimensional array, a subarray or slice of one, an array of unpacked
+  structures or a row of a class property or task local element by element
+  when the statement runs, and store those elements when it matures; it stored
+  zeros. The same copies without a timing control, a subarray selected by two
+  or more indices (`e = s3[1][0];`), a row into a queue or dynamic array
+  (`qq = src[1];`) and a nonblocking row copy into a one-dimensional array (`q
+  <= src[1];`), copy the elements too; they stored zeros or nothing (§9.4.5,
+  §7.6, §10.4.2, #1320, reported by ds54e).
+
+* Store an assignment pattern item that is an array of unpacked structures
+  (`ts = '{sa, sa};`) member by member, and an item that is a slice (`'{wc,
+  big[1:2]}`, `'{big[2+:2], wc}`) as the slice's elements, with or without an
+  intra-assignment delay; the structure array stored zeros and the slice
+  repeated its first element (§10.9.1, §7.6).
+
+* Store a pattern item that is a whole unpacked structure (`tb = '{s1,
+  sb[0]};`) member by member, also when the pattern reads its own target
+  (`sa = '{sa[1], sa[0]};`, a class property `ks = '{ks[1], ks[0]};`), has an
+  intra-assignment delay or is nonblocking; each member received the whole
+  structure, which stored zeros (§10.9.2, §7.2, §10.4.1).
+
+* Return the structure assigned by name to a function's return variable (`f =
+  t;` with `t` a whole unpacked structure local, formal, static local or
+  design variable), as `return t;` does; the call returned zeros (§13.4.1,
+  §7.2).
+
+* Call a replicated item of a blocking assignment pattern (`fb = '{2{f()}};`)
+  once and store its value in every copy; it was called once per element
+  (§11.4.12.1, §10.9.1).
+
+* Evaluate the right-hand side of a `fork ... join_none` child that is an
+  intra-assignment delay (`fork x = #2 w; join_none`) when the child starts,
+  after the parent blocks, like every other child; it was evaluated when the
+  parent forked (§9.3.2, §9.4.5).
+
+* Accept a `real` item of an unpacked array concatenation (`rd = {rw, 5.25};`,
+  `rq = {rq, 2.5};`); a real operand is an error only in a packed
+  concatenation (§10.10, §11.4.12).
+
+* Assign a structure pattern to a fixed-array member of a class struct
+  property element by element: a nested pattern, a type key of the element
+  type and `default:` now reach every element, which kept its old value
+  (§10.9.1, §10.9.2).
+
+* Initialize a multidimensional fixed-size class property from an assignment
+  pattern over every dimension (`int a2[2][2] = '{default: '{0: 1, default:
+  2}};`) instead of leaving zeros (§10.9.1, §8.7).
+
+* Print a value parameter of a structure type with `%p` member by member
+  (`localparam s_t P = '{3, 4};` prints `'{x:3, y:4}`) instead of as one
+  number (§21.2.1.7, §6.20.2).
+
+* Print the elements of a static string queue of a class with `%p` as quoted
+  strings, not as numbers (§21.2.1.7, §8.9).
+
+* Name the packed dimensions written on a typedef name in `$typename` (`lane_t
+  [0:1] a` gives `reg signed[16:0][0:1]`) (§20.6.1, §7.4.1).
+
+* Name the declared specialization of a class property in `$typename` (`drv_c
+  #(W) p;` in a `holder_c #(16)` object gives `class drv_c #(16)`), not the
+  holding object's class or the default specialization (§20.6.1, §8.25).
+
+* Expand a macro chain inside a `` `" ... `" `` region to the end: with ``
+  `define INST `TOP.u0 `` and `` `define STR(p) `"p`" ``, `` `STR(`INST.x) ``
+  gave "`TOP.u0.x" instead of "top.u0.x", because the pass that expanded the
+  first level wrote the delimiters as quotes and the next pass read the rest
+  as a string literal. Escaped quotes, pastes and string literals inside the
+  region and an `` `include `` name built this way are handled; a plain string
+  literal still expands nothing (§22.5.1, #1338, reported by git-hevangel).
+
+* Leave the white space after the formal list of a macro with arguments out of
+  a string built by a `` `" ... `" `` region: `` `STR(`F(top)) `` with ``
+  `define F(a) a.u0 `` is "top.u0", not " top.u0" (§22.5.1, #1338).
+
+* Give each copy of a generate block and each module instance its own clocking
+  block: a block of a generate loop samples its own copy's expression and the
+  signals the copy declares, and `@(cb)` and `cb.v` in an instance name the
+  instance's block, not a same-named block of the parent (which read x when it
+  had no such clockvar); every copy registered one block under the bare name
+  and the last copy answered all of them. Such a block is also reached from
+  outside through the copy's index (`@(gen[2].cb)`, `gen[1].cb.a`,
+  `u[0].cb.a`) (§14.3, §23.9, §27.4, §27.6).
+
+* Size `[N]` in a scope that imports a package declaring a parameter N as a
+  fixed dimension of size N, also when another package, which the scope does
+  not import, declares a type named N; `logic [27:0] a [N]` was an associative
+  array keyed by that type (`$high(a)` read 27) (§26.3, §7.4.2).
+
+* Drive only the last value of two synchronous select drives of the same bits
+  of a clocking output that mature in the same time step: `cb.e[0] <= 1;
+  cb.e[0] <= 0;` no longer changes `e[0]` twice and wakes `@(e)` with the
+  value unchanged (§14.16.2).
+
+* Check `p.s` through an instance or a generate block that has a package's
+  name as a hierarchical name: the design no longer fails with "'s' is not
+  declared in package 'p'" (§23.6, §23.9, §26.3).
+
+* Preserve unpacked array dimensions supplied by struct member typedefs in
+  function returns, assignment patterns, whole-struct copies and user-defined
+  nettype resolution (#1460).
+
+* Run the resolution function of an undriven user-defined net at time zero
+  with an empty driver array (§6.7.3, #1462).
+
+* Report the resolved type and dimensions of value parameters in procedural
+  `$typename` calls (#1461).
+
+* Round `shortreal` storage and casts to IEEE binary32 precision (#1463).
+
+* Store whole fixed-size rows assigned through class handles in queue,
+  dynamic-array and fixed-array properties (#1467).
+
+* Read unpacked queue rows from their element storage in class methods
+  (§7.4.5, #1468).
+
+* Evaluate each operand once when assigning an unpacked concatenation to a
+  queue (§10.10, #1470).
+
+* Select queue rows through their class handle when a module declares an array
+  with the same property name (§8.4, #1469).
+
+* Match explicit real coverpoint bins by numeric value and omit automatic bins
+  for real points (§19.5, #1465).
+
+* Wake an event control on a member of a selected packed-structure element
+  (`@(sa[1].a)`) only when that member changes (§9.4.2, #1472).
+
+* Assign function-returned arrays to unpacked slices and rows in declaration
+  order (#1471).
+
+* Preserve nested unpacked structure members and fixed-array elements in
+  user-defined nettype driver patterns (§6.6.7, #1464).
+
+* Preserve event-triggered display statements when resuming a checkpoint with
+  the JIT enabled (#1466).
+
+* Check type names in selected generate branches, retain instance-specific
+  sensitivity widths, and preserve cross-top waveform selections (#1374,
+  #1375, #1378).
+
+* Read four-state digits in integer scan conversions, store unpacked
+  concatenations in fixed queue rows, and resolve rooted queue-element members
+  (#1377, #1379, #1380).
+
+* Evaluate continuous-assignment time queries in their declaring instance,
+  retain VPI deposits until a driver changes, and sample input-net defaults on
+  clock edges (#1381, #1382, #1356).
+
+* Evaluate integral operands at their declared width before a real comparison
+  and apply the real default to an ambiguous conditional result (#1344,
+  #1345).
+
+* Bind whole interface-array ports by position, fold header array parameters
+  in the declaring instance, honor inferred pull net types, and size fill
+  literals through comparisons (#1402, #1404, #1400, #1399).
+
+* Drive nested unpacked leaves at their declared widths, copy fixed rows in
+  declaration order, resolve drivers per wire-array element and delay whole
+  unpacked structures (#1403, #1398, #1395, #1393).
+
+* Resolve named fork activations in their declaring scope, describe types in
+  declared dimension order, and apply packed assignment-pattern defaults
+  recursively (#1396, #1348, #1343).
+
+* Use the declared clocking edge for bare clocking block waits and default
+  clocking cycle delays (§14.10–11, #1332, contributed by auty1395).
+
+* A trailing whitespace directive in `$fscanf` sets EOF when it reads to the
+  end of the file (§21.3.4.3, #1376).
+
+* Queue element writes append at the current size and warn when an invalid
+  index is ignored (§7.10.1, #1353).
+
+* Preserve every unknown and high-impedance digit in minimum-width binary,
+  octal and hexadecimal output (§21.2.1.2–3, #1347).
+
+* Resolve class method return widths in declaration scope when callers shadow
+  a typedef (§6.18, §23.9, #1366).
+
+* Concurrent assertions run their pass action on vacuous success by default.
+  Assertion control tasks can disable it (§20.11, #1339).
+
+* Resolve an unadorned parameterized class name in a typedef type argument to
+  its default specialization (§8.25, #1357).
+
+* Use all case items to determine signedness for `case`, `casez`, and `casex`
+  comparisons (§12.5, #1355).
+
+* Schedule delayed nonblocking updates even when the target already holds the
+  captured value (§4.9.4, #1354).
+
+* Compare strings by unsigned character values so `compare()` agrees with the
+  relational operators (§6.16.6, #1361).
+
+* Reject duplicate package definitions (§3.13, §26.2).
+
+* Reject differing duplicate typedef definitions and warn on identical
+  cross-file typedefs (§3.13, §6.18).
+
+* Warn on redefined interfaces, programs and primitives (§3.13, §25.3).
+
+* Store an assignment pattern item that is an unpacked array (a variable, a
+  row or a function result) element by element into the sub-array it matches,
+  positionally, by key or through `default:`, instead of zeros (#1233).
+
+* Capture each item of an assignment pattern with an intra-assignment delay or
+  event control in the type of the element or member it is matched to, as
+  without the timing control, instead of at its own width (#1247).
+
+* Preserve virtual-interface specialization identity, typedef net signing and
+  packed members, and captured array values in deferred assignments (core
+  #231, #1212, #1217).
+
+* Resolve unqualified names inside class methods in active routine frames,
+  `this` properties, and class statics before caller frames and module signals
+  (§23.9, §8.11).
+
+* Resolve class-member fixed, dynamic, queue, 2-D, and descending arrays in
+  DPI open-array actuals and write-backs without cross-talk or bogus dynamic
+  sizing (§35.5.6.1, Annex H.12).
+
+* Treat backslashes literally in `$display`/`$sformatf`-family format strings
+  so lexer-decoded escapes are not un-escaped twice (§5.9.1, §21.2.1.1,
+  §21.3.3).
+
+* Treat a `0` field width in `$fscanf` and `$sscanf` as unbounded and honor
+  `%*` assignment suppression (§21.3.4.3).
+
+* Track function-call operands in explicit event controls, preserve
+  neighboring bits when delayed slice drivers mature, and omit imported
+  parameter aliases from waveform scopes (#1205, #1213, #1215).
+
+* Preserve top-level combinational time units, resolve memory task
+  destinations by scope, and size and write dynamic-array rows (#1202, #1206,
+  #1207).
+
+* Diagnose undeclared type names and duplicate class definitions (#1186, core
+  #229).
+
+* Keep package arrays separate from same-named module arrays, preserve class
+  ownership in packed-struct array accesses, and construct the declared class
+  in anonymous struct-array fields (#1147, #1132).
+
+* Preserve input-port indices around UDP instances, schedule fixed-array and
+  record assignment-pattern leaves in the NBA region, and combine root and
+  descendant waveform scopes with independent depth limits (#1201, #1199,
+  #1195).
+
+* Generated structure members retain independent storage, associative-array
+  keys, strings, events and packed struct/enum dimensions (§7.2, §7.4.1,
+  §23.6). Generated collection calls keep separate receiver-cache entries.
+  Top-scope combinational work clears an invoking instance's scope.
+
+* Assignment indexes with side effects are captured before aggregate probes; a
+  part-select RHS no longer evaluates `array[index++]` twice (§11.4.1, #1182).
+  Hierarchical reads preserve their target despite a same-named local,
+  including packed-select observers (#1183). Associative-array input copies
+  retain their packed element fields without aliasing the caller (§13.5.1).
+  Enum body dimensions preserve typedef base widths (§6.19).
+
+* Constant evaluation preserves parameter overrides across function calls,
+  typed patterns and array sizing. Compiled artifacts and method caches are
+  refreshed for changed elaboration and scope resolution.
+
+* Nested randomization callbacks run once on final values and do not run after
+  a failed enclosing solve. Back-reference constraints iterate associative
+  state keys (§18.5, §18.6.2). Outer structure replication preserves every
+  array member's pattern and element conversion (§10.9.2).
+
+* The cocotb runner (`contrib/cocotb/xezim_runner.py`) loads with cocotb 2.1,
+  which renamed `_as_sv_literal` and removed `cocotb_tools.config.lib_name`,
+  and passes `defines` the way cocotb 2.1's own runners do, as written; with
+  cocotb 2.0 a string define is still written as a string literal (#1180).
+
+* A constraint of an element of a rand queue or array of handles that reads
+  the randomized object's rand variables through a handle back to it
+  (`item.addr` in a policy class of constraint layering, the policies held in
+  `rand policy_base policy[$]`) is solved together with that object, at any
+  depth of policy lists. Each element was solved alone against the value the
+  variable held before the call, so `randomize()` failed with its budget
+  exhausted, and with the item under a `foreach` over state it returned 1 with
+  values that broke the constraint. Such an item is now left to the enclosing
+  solve, which solves it jointly and checks it on the final values; the
+  element's `post_randomize` runs once the call has succeeded. In the joint
+  solve, an `inside` range read from a sub-object that is an array element
+  (`[0 : ranges.size() - 1]`) is evaluated on that element instead of reading
+  as 0 (§18.5.9, §18.6.2, #1184).
+
+* A blocking assignment with an intra-assignment delay or event control stores
+  an assignment pattern for an unpacked array, unpacked struct or queue
+  target, and evaluates an expression at the target's width: `wa = #1 '{3,
+  4};` stored nothing and `y = #1 a + b` lost its carry. A pattern for a
+  packed target is evaluated once, so a function called in it runs once, and a
+  conditional of unpacked patterns selects its operand when the statement runs
+  (§9.4.5, §10.9, §11.6.1, §11.4.11, #1162, contributed by chuanseng-ng).
+
+* The abort properties `accept_on`, `reject_on`, `sync_accept_on` and
+  `sync_reject_on` parse and run; they failed to parse. An asynchronous
+  condition is checked with sampled values in every time step, and the attempt
+  it settles is reported at the next tick. Nested aborts take effect in
+  lexical order, so an inner abort that ended the evaluation first decides it;
+  an accepted attempt is a vacuous success; and at an attempt's first tick an
+  abort follows Annex F, so `reject_on (rst) req |=> ack` does not fail the
+  attempts that start during a reset with `req` low (§16.12.14, §16.14.8,
+  F.5.3.1, #1155, core #223, contributed by chuanseng-ng).
+
+* `p implies q`, `nexttime [n]`, `s_nexttime [n]`, the ranged `always`,
+  `s_always`, `eventually` and `s_eventually`, and the property `case` parse
+  and run; they failed to parse. `implies` starts both operands at the same
+  tick and is vacuous when `p` fails, so it runs no pass action then. A ranged
+  form the lowering cannot express, such as a ranged `always` of a sequence,
+  is reported (§16.12.8, §16.12.10, §16.12.11, §16.12.13, §16.12.16, §16.14.8,
+  core #220, contributed by chuanseng-ng).
+
+* A task, function or method local, or a class property, whose element type is
+  an unpacked-array typedef and which has unpacked dimensions of its own
+  (`typedef int q_t[$]; q_t l[$];`, also `p::q_t pq[$];`) has the declarator's
+  dimensions and then the typedef's; each row held one scalar (§7.4.5, §6.18,
+  §26.3, #1140, core #216, contributed by chuanseng-ng).
+
+* A covergroup bin's `with` filter reads the covergroup's class parameters and
+  constructor arguments, and a filter that compares `item` only with constants
+  keeps every value of a wide range: `bins others[32] = {[0:32'hffff_ffff]}
+  with (...)` was sized from its first 2^20 values, and a filter naming a
+  class parameter admitted every value (§19.5.1.1, #1135, contributed by
+  auty1395).
+
+* A rand variable in `(x & M) == C`, where `M` or `C` reads other rand
+  variables, is drawn with the masked bits already equal to `C`'s once those
+  variables are fixed, so randomize() finds the solution that exists; it
+  failed or ran without end while it guessed the bits. Seeded results of
+  constraint sets with such an equality change (§18.3, §18.6.1, #1133,
+  contributed by auty1395).
+
+* Default cells of `real` and `shortreal` unpacked arrays start as real 0.0,
+  so arithmetic on an untouched cell is real: `1/(a[0]+2)` is 0.5, not 0
+  (§6.8, §11.3.1, #1153, contributed by ds54e). So do the elements of class
+  property arrays, of dynamic arrays sized by `new[]` and a read of a
+  nonexistent associative-array entry (§6.8, §7.5.1, §7.8.6, #1153).
+
+* A delayed continuous assignment to a net or variable whose type is an enum
+  with a packed vector base (`enum logic [0:0]`, signed, wide, typedef and
+  package enums) uses the vector delay rule: a change to x waits for the rise
+  delay, as for `wire [0:0]`. A scalar base keeps the scalar rule (§10.3.3,
+  §6.19, #1151, core #222, contributed by ds54e).
+
+* A replicated structure pattern `'{2{x}}` sets every member in procedural,
+  nonblocking and `always_comb` assignments, resolved nettype drivers, class
+  properties, function arguments and constant structures, each item in its
+  member's assignment context; a parameter, localparam or constant-expression
+  count works like a literal one (§10.9.2, #1144, core #219, contributed by
+  ds54e).
+
+* A continuous assignment of a structure pattern keeps the element of an array
+  member at a negative index, for index keys, `default:`, ordered and
+  replicated items (§7.4.2, §10.9.1, #1141, core #218, contributed by ds54e).
+  Compiled blocks (continuous assignments, `always_comb`, `always @*`,
+  `always_ff`) read and write an unpacked array at a negative index, and a
+  negative genvar value keeps its value after a design-cache or artifact load
+  (§7.4.2, §27.4, #1141).
+
+* An event control on an expression of non-signal class properties, `@(a ||
+  b)` or `@(negedge (v[0] & a))`, waits for a change of the value or edge of
+  the whole expression instead of waking every time step (§9.4.2, #1157,
+  contributed by Thomasb81).
+
+* `first`/`next` on an associative array keyed by a type parameter bound to
+  `string` write the whole string key into the `ref` formal (§7.9.4, §8.25,
+  #1157, contributed by Thomasb81).
+
+* A compiled class method stores a dynamic or fixed array element with the
+  element's declared signedness: `byte ba[]; ba[i] = -i;` reads back -1, not
+  255 (§7.5, §10.7, #1157, contributed by Thomasb81).
+
+* A block-local declared in an immediate assertion's pass or fail statement of
+  a file-scope class method elaborates (§16.3, §9.3.1, #1157, core #225,
+  contributed by Thomasb81), and a member access through it is checked for
+  visibility like one in an `if` block (§8.18, #1157).
+
+* A compiled method compares a string-collection element read through a class
+  handle (`a.q[i] != p[i]`) as a string (§6.16, §7.10, #1157, contributed by
+  Thomasb81).
+
+* An assignment-pattern key is evaluated as the self-determined expression it
+  is, with its literals' widths and signs: `'{(2'sb11 & 4): v, default: 0}`
+  sets element 4 (it set element 0), in an unpacked pattern, a structure
+  member's pattern, a parameter array and a packed target (§10.9.1, §5.7.1,
+  §11.8.2, #1164, contributed by ds54e). A parameter operand of a key has its
+  declared type too, so `'{(F + 4'd1): v}` over a 4-bit `F` of 15 sets element
+  0, not 16 (§10.9.1, §11.6.1, §6.20.2, #1164).
+
+* Constant expressions keep the types the typed constant evaluator lost:
+  `$clog2`, `$bits`, the array queries and the bit counts are signed
+  `integer`/`int` results; a condition with a known 1 bit takes the first arm;
+  `$isunknown`, `$countones` and `$countbits` count every bit, x and z
+  included; a typed parameter (also in a class or a generate block) and a
+  package variable take their declared signedness and two-state value; an
+  `inside` operand and a function call give an untyped parameter their own
+  width; a real exponent makes `**` real; a constant wider than 64 bits
+  converts to real with its high bits; a constant array query over a typed
+  parameter answers from its declared shape, in a child module too; a constant
+  function's `case` compares its items at their common width; and an override
+  of a body `parameter unsigned` is unsigned (§20.6.2, §20.7, §20.8.1, §20.9,
+  §11.4.11, §6.20.2, §6.11.2, §6.11.3, §11.4.13, §11.4.5, §6.12.2, §12.5,
+  #1143).
+
+* An unsigned operand makes an expression unsigned in compiled code whatever
+  its kind: a package or module parameter, a function result, an interface
+  variable, a hierarchical reference, an unpacked-structure or union member
+  and a typedef cast now zero-extend the signed operand next to them, as a
+  plain variable did (§11.8.1, #1158).
+
+* A signed member of a packed structure is read signed in continuous
+  assignments and `always` blocks, so it sign-extends into a wider target; and
+  inside a concatenation an arithmetic or bitwise operator extends its
+  narrower operand by its own sign before operating, alike with and without
+  `XEZIM_JIT=1` (§7.2.1, §11.6.1, §11.8.2, #1159).
+
+* An element of a packed array of a named signed type (`lane_t [0:8] q; q[1]`,
+  also a structure member declared that way) is signed, in procedural and
+  compiled code; a function returning a signed typedef returns a signed value;
+  and a compiled streaming concatenation of a part-select of such an array
+  (`{<< 11 {q[0:4]}}`) sizes each element at its element width, so the slices
+  reverse (§7.4.1, §13.4.1, §11.4.14, #1107).
+
+* A negative package constant in a package typedef's range keeps its value
+  when the type is used as `pkg::T` without an import, also when another
+  module declares a parameter of the same name, and a typed constant there has
+  its declared type's value (§26.3, §6.18, §6.20.2, #1148).
+
+* A dynamic-array `new[n]` (or `new[n](src)`) that sizes one row of an array
+  of dynamic arrays, or a dynamic member of a struct, inside a class method
+  (`d[i] = new[n]`, `this.d[i] = new[n]`, `s.q = new[n]`) no longer runs the
+  constructor of the enclosing class again on the same object, with the size
+  as its argument; a size expression that is a call runs once. A UVM component
+  that sized rows in `build_phase` was renamed and the build failed (§7.5.1,
+  §8.7, #1167, reported by git-hevangel).
+
+* A `ref` formal reads and writes its actual while the subroutine runs, for
+  every kind of actual: a property of an object (`t(h.p)`, `t(o.in.p)`, a bare
+  property in a method), a member of a struct, an element of a queue, dynamic
+  or associative array, a hierarchical or package name, and a `string`. The
+  formal kept the value the actual had at the call, so a task parked on a
+  delay or `wait` never saw a later write by another process, and its own
+  writes reached the actual only when it returned. A method of an aliased
+  handle formal (`mb.num()`), a built-in method of an aliased string
+  (`s.len()`), a member of an aliased packed struct (`s.a`), and `@(x)` or
+  `wait (x == v)` on a formal aliased to a property follow the actual too
+  (§13.5.2, #1160, reported by Ganesh-TNL).
+
+* A non-virtual method called through a null handle runs, bound to the
+  declared class of the receiver with a null `this`, wherever the receiver
+  comes from: a formal, a local, a property, an element of a collection of
+  handles, a struct member, a hierarchical name, a function's return value. It
+  returned a silent 0 (or aborted the run at the top level) without running. A
+  virtual method through a null handle is still reported, and aborts the run
+  at the top level (§8.4, §8.20, #1139, reported by Ganesh-TNL).
+
+* A specialization of a parameterized class written in a module with the
+  module's parameters (`C#(W)::f()`, `C#(W*2)::N`, `C#(.P(W))`) names that
+  instance's specialization: every instance of the module ran the static
+  methods of one specialization, chosen by instantiation order, and read its
+  static members (§8.25, §23.10, #1129, #1130, reported by Ganesh-TNL).
+
+* `mailbox`, `semaphore` and `process` are classes of package `std` in every
+  scope: a module-scope typedef of one, an inline `mailbox` formal of a module
+  or interface subroutine and `#(mailbox)` as a type parameter are accepted; a
+  handle of one starts null; and `new()` constructs a mailbox or semaphore
+  declared through a typedef (also of a typedef or a package's), reached
+  through a chain of handles (`o.in.mb = new()`) or named through its class
+  (`C::sm = new()`). `put()` then `num()` read 0 on such a handle (§6.18,
+  §8.4, §15.3, §15.4, #1161, reported by Ganesh-TNL).
+
+* `randomize()` draws a value that only a few solutions allow: the joint
+  solver weighed a condition variable's values by the solutions each leaves,
+  and also counted the narrowing of a variable that is a function of others
+  (`tot == w * (n + 1)`), so with `solve ... before` a value that narrows `n`
+  was never drawn (§18.5.10, #1166, reported by philipaxer).
+
+* A continuous assignment that calls a function of `$time`, `$random` or
+  static state takes a new value only when an operand changes: before, it was
+  evaluated again on unrelated activity, so `assign y = f(x)` with `return
+  $time + x;` followed the clock instead of keeping the time of the last
+  change of `x`. A function's formal, local or loop variable named like a
+  module parameter indexes an array as itself: `always_comb c = pick(sel)`
+  with `return mem[idx];` and `parameter int idx` depended on `mem[idx]` of
+  the parameter's value only, and read x (§10.3.2, §9.2.2.2.1, §13.4, #1126,
+  reported by ds54e).
+
+* The list of continuous-assignment reads that a procedural write defers holds
+  each signal once. A long initial block at time 0 keeps the list from being
+  consumed until its start batch ends, and every blocking write after the
+  first deferral deferred the same entries again, so the list grew by their
+  reads on every write, without bound: a UVM `run_test` that builds a large
+  register model at time 0 kept growing its resident memory. The propagation
+  order and timing are unchanged (§10.3, §4.4, #1149, reported by
+  git-hevangel).
+
+* An `always_comb`, `always @*`, `always_latch` or continuous assignment that
+  reads an element of an unpacked array that is a member of an element of an
+  array of instances or interfaces (`lane[0].payload[2]`, also through a child
+  instance, a generate block or an interface) is evaluated again when the
+  element changes, and an event control naming the element waits on it. The
+  read was resolved to the instance array's own proxy signal, which no write
+  changes, so the process kept its time-0 value (§9.2.2.2, §10.3.2, §23.6,
+  #1108, reported by Ganesh-TNL).
+
+* A continuous assignment or `always_comb` that passes a whole unpacked struct
+  array to a function is evaluated again on a member write when the actual is
+  bound by name (`f(.a(a))`), spelled through `$root` or the module's own name
+  (`top.a`), or names a generate block of a child module. A name in a child
+  module that starts with one of its own generate blocks (`h.a`, `h.x`) names
+  the child's block: it read a same-named block of the top module (§10.3.2,
+  §13.5.4, §23.9, §27.5, #1110, reported by ds54e).
+
+* An assignment pattern returned directly from a function or method whose
+  return type is an unpacked struct is distributed member by member, as the
+  same pattern assigned to a struct variable is: `return '{ "one", "two" };`
+  for a struct of two strings came back with the first member empty and both
+  strings in the last (§10.9, §13.4.1, #1170, contributed by shabbarvejlani).
+  The same holds for a return type named by a class type parameter, for a
+  pattern returned as a queue or dynamic array of unpacked structs, for struct
+  members that are queues or dynamic arrays, and for a pattern assigned to the
+  function name inside a method; a string member selected directly from the
+  call (`f().a`) is the string, not its padded transport slot (§8.25, §6.16).
+
+* The enumeration methods `first`, `last`, `next`, `prev`, `num` and `name`
+  take the enumeration from the receiver's declared type, whatever expression
+  the receiver is: a variable declared through a typedef alias or an array
+  typedef, an array element, a struct or union member at any depth, a property
+  reached through class handles or `this`, a function result or a member of
+  one, and the result of another enumeration method. `name()` of a value that
+  is not a member, or that has x or z bits, is the empty string; it named a
+  member of another enumeration that held the value. A variable declared in a
+  `for` header has its type in its own initializer and no longer takes the
+  type of a same-named variable of the caller, the members of an enumeration
+  declared in a procedural block are constants of that block, and an
+  associative array or queue of enumeration elements keeps its own `num()`
+  (§6.19.5, §6.19, §7.9, #1132, reported by Ganesh-TNL).
+
+* A `ref` formal that is an unpacked struct or an untagged unpacked union
+  reads and writes its actual while the subroutine runs, member by member, for
+  a property of an object and a module variable; it copied the actual at the
+  call and wrote it back at the return. An untagged union formal has a member
+  layout, so `u.iv` no longer reads 0 for any direction. A `ref` handle formal
+  bound to an element of an array or queue (`t(x, s[3])` with `task t(ref int
+  x, st_c st)`, where `st` inherits `ref`) reaches the object. A member of an
+  element of an array of interface instances (`u_ifa[1].iv`) is aliased. An
+  associative-array entry that does not exist is allocated, with the array's
+  default, when it is the actual of a `ref` argument (§13.5.2, §7.8.7, §7.3,
+  #1160).
+
+* Two activations of a task parked at once, or two tasks with a formal of the
+  same name, each keep the select layout of their own packed struct or packed
+  array formal. The layout is kept by the formal's name, and the first return
+  removed the one the other activation still needed, so `s.a` read 0 (§13.5.2,
+  §13.3.1, #1160, reported by Ganesh-TNL).
+
+* An unpacked array that is a member of an element of an array of instances
+  (`lane[0].payload`) is an array in every use: a nonblocking write to an
+  element stores the whole element (it stored one bit), a whole-array read,
+  assignment and subroutine actual carry every element, `foreach` and `$size`
+  see its dimension, and an element of a multidimensional member
+  (`lane[0].nest[1][j]`) is read, written and, in an `always_comb`, depended
+  on (§23.3.2, §7.4, §10.4.2, §12.7.3, #1108, reported by Ganesh-TNL).
+
+* A `mailbox` or `semaphore` member of an unpacked struct is constructed by
+  `new()`, with its bound or key count, wherever the struct is: a module,
+  interface, program or generate scope, a block, task or function local, a
+  class property (static, inherited, in an array, queue or associative array),
+  a formal. A handle of a built-in class that is a struct member, an array
+  element or a member of a local struct starts null, not x; so does a user
+  class handle member of a local struct. A property whose declaration
+  initializer is `new()` and whose type is a typedef of a built-in class is
+  constructed (§7.2, §8.4, §15.3, §15.4, §6.18, #1161).
+
+* An unpacked struct declared in a generate block is stored member by member.
+  It was one vector, so a 4-state or handle member kept x through every write
+  (§7.2, §27, #1161, reported by Ganesh-TNL).
+
+* A non-virtual method called through a null handle runs also when it is named
+  like a built-in array, string or enumeration method (`size`, `num`,
+  `delete`), when the call is a static property initializer, and when the
+  receiver is the iterator of an array method's `with` clause; these three
+  returned 0 and ran nothing (§8.4, §8.20, #1139, reported by Ganesh-TNL).
+
+* A static function of a class, or of a specialization named with a module
+  parameter (`localparam int L = C#(PW)::id();`), called in a parameter
+  initializer is folded as a constant function, per module instance. The
+  parameter read 0 (§13.8, §13.4.3, §8.25, #1130, reported by Ganesh-TNL).
+
+* An element of a packed array of a named signed type is signed when the array
+  is a class property (`h.m_amb[1]`) or an input port of a child module, as it
+  is for a module variable (§7.4.1, #1107, reported by Ganesh-TNL).
+
+* A compilation-unit variable or net is one object for the whole compilation
+  unit. Every module instance that named it had a private copy, so a write
+  from one module, or through a unit function, task or class, was not seen by
+  another module, `always @(unit_var)` in another module never woke, and a
+  unit net driven from two modules was two nets. The hierarchy root now
+  declares the unit's storage once (the top module; with several top modules
+  the scope above them) and every module, interface, program, generate block,
+  library module, unit subroutine and unit class names that storage. A
+  module's own declaration of the name still shadows it, there and in the top
+  module, and `$unit::name` names the unit's object from any scope, including
+  from a unit subroutine or a unit class method called in a module that
+  shadows the name. `$dumpvars` shows a unit variable once, in the top
+  module's scope, and no longer in each instance. 8,000 instances reading four
+  unit declarations elaborate 24,006 signals instead of 56,006 and peak at 124
+  MiB instead of 171 MiB (§3.12.1, #721, reported by amal-khailtash).
+
+* The compiled artifact of a design is the same on every run. A struct typedef
+  with several members whose ranges read parameters made the names kept for
+  the port-width diagnostic come out in a different order each time (§7.2,
+  #721).
+
+* A replication pattern (`'{2{7}}`) written to a one-dimensional unpacked
+  array, a queue or a dynamic array by a nonblocking assignment or an
+  intra-assignment delay stores every element, each item read once in the
+  element type, instead of only the first (§10.9.1, §10.4.2, §9.4.5, #1263,
+  contributed by chuanseng-ng).
+
+* Synchronous drives of one clocking output that mature in the same time step
+  apply in the order they were issued, select and whole drives alike, so a
+  whole drive after a select drive wins (§14.16.2, #1267, contributed by
+  auty1395). The order also holds, and the output changes once, for a `#0`
+  output skew, for a select drive after a whole drive and for `##N` drives; a
+  `#0` select drive issued between clocking events commits with the other
+  drives instead of at once (§14.16.2, #1267).
+
+* A select of a package parameter (`p::C[k]`) in a continuous assignment that
+  writes another scope (a generate block's net, a child's port, a hierarchical
+  target) reads the parameter in a module that imports nothing, instead of X
+  (§26.3, §23.6, aionhw/xezim-core#246, contributed by auty1395).
+
+* Under `--relax-cross-hier-item`, `binsof()` in a cross's bin selects can
+  name a hierarchical cross item (`binsof(u.sig)`, `binsof(u.s.sig)`);
+  `cp.bin` keeps its standard meaning when `cp` is a cross item (§19.6.1,
+  aionhw/xezim-core#243, contributed by auty1395).
+
+* Each member of an element of a multi-dimensional unpacked array of unpacked
+  structures has a signal of its own, so a continuous assignment or
+  `always_comb` reading `a[0][0].v` wakes when it changes, and such arrays are
+  copied, compared and passed by value member by member, in modules, generate
+  blocks, instances and interfaces (§7.4.2, §7.2, §10.3.2, §13.5.1, #1240,
+  reported by ds54e).
+
+* A clocking input bound to an expression (`input sum = a + 1;`, `input i =
+  {op, ra, rb[3:1]};`) samples the expression over its operands' samples, at
+  every input skew and at the expression's width, instead of X or a same-named
+  variable (§14.5, §14.13, #1241, reported by ds54e).
+
+* An element of an array of covergroups, `cg[i] = new(args)` (a class
+  property, a local or a handle's member), is constructed as the covergroup.
+  It was taken for a call of the enclosing class's constructor: a constructor
+  recursed until the stack overflowed, a method re-ran the constructor and
+  left the element null. Building an instance of a covergroup type declared
+  outside a class no longer drops the object's other instances of that type,
+  and the constructor's actuals bind by name (§19.3, §19.4, §8.7, §13.5.4,
+  #1251, reported by git-hevangel).
+
+* A local, formal or class property typed by a virtual-interface typedef
+  reached through a class scope (`cfg_t::vif_t v = cfg.get_vif(i);`,
+  `pkg::C::vif_t`, a base class's typedef) is a virtual interface: its
+  initializer binds the instance and it starts null. It was evaluated as a
+  plain value and a call through it ran nothing. A compiled class method no
+  longer starts a virtual-interface local at x (§6.18, §8.23, §25.9, #1252,
+  reported by git-hevangel).
+
+* A class typedef written with named parameter assignments (`typedef drv_c
+  #(.W(W)) drv_t;`) and read through the enclosing class's specialization
+  keeps the parameter names, and an argument that is an expression of the
+  enclosing parameters (`#(W, W/4)`) is folded; `type_id::create()` and static
+  calls through the typedef used the default specialization (§8.25,
+  §23.10.2.2, #1254, reported by git-hevangel).
+
+* The input actual of an imported subroutine, of a task and of a covergroup
+  constructor is evaluated at its formal's width, in the interpreter and in
+  compiled class methods: `f(a | (b << 1))` over one-bit operands and `f(x +
+  y)` over 8-bit operands into an `int` formal lost the shifted bit and the
+  carry. A formal written with neither a type nor a direction (`input int a,
+  b`) takes the previous formal's type; an import passed it to C as an svLogic
+  (§13.5, §11.6.1, §11.8.1, §35.5.6, #1256, reported by git-hevangel).
+
+* Class-property events compare by the event object they hold: `s.tick ==
+  m.tick` and `s.tick == null` read x; after `s.tick = m.tick` they compare
+  equal (§15.5.5, #1265, contributed by auty1395).
+
+* A compiled class method, compiled module function or compiled process loop
+  that waits in an interpreted call keeps `this`, its formals, locals, loop
+  counters and held operands: the combinational logic a write in that call
+  triggers (an `always_comb` the two-state plan declines, a continuous
+  assignment a `release` re-drives) is evaluated on a register file of its
+  own. Before, a loop bounded by a member ran zero times after the call,
+  locals read stray values, and some designs looped forever (§4.5, §9.2.2.2,
+  §13.4, §8.11, #1250, reported by git-hevangel).
+
+* A static method called from a compiled method through a typedef of a class,
+  a class-scoped typedef or a class type parameter (`typedef db#(T) cfg_t;
+  cfg_t::get(x)`, `uvm_config_object::get`) writes its `output`, `inout` and
+  `ref` actuals back; the caller's variable kept its old value (§6.18, §8.23,
+  §8.25.1, §13.5.2, #1255, reported by git-hevangel).
+
+* A whole-collection read or write of a class member that is a queue, dynamic,
+  fixed-size or associative array of `string` works in a compiled method (`q =
+  {q, other}`, `q = other`, `obj.q = {obj.q, "x"}`); the member kept its old
+  value, so riscv-dv's generated program had no `main:` section (§6.16, §7.10,
+  §10.10, #1269, reported by auty1395).
+
+* A compiled method's call that passes an actual for an unpacked-array formal
+  of a method, static method, task, free function or constructor binds the
+  whole collection: `show({"nop"})` against `string s[$]` bound three one-byte
+  strings and a returned queue arrived empty (§7.10, §10.10, §13.5.1, #1257,
+  reported by auty1395; #1258, contributed by auty1395).
+
+* A static associative array, queue or dynamic array reached through an object
+  handle, `this`, `super` or an inherited static handle (`h.aa`,
+  `sc.shared.seen.last(k)`) or as `Cls::aa` names the class's one store:
+  element writes, traversal methods, by-value, `ref`, `inout` and `output`
+  actuals, patterns and concatenations through a handle reached nothing, and a
+  compiled method read `this.fa[i]` as 0 (§8.9, §8.15, §8.23, §7.8, §13.5.1,
+  #1253, reported by git-hevangel).
+
+* A conditioned timing check is enabled when its `==` or `!=` condition reads
+  x or z and disabled when a `!==` condition does, and a multi-bit condition
+  is taken through its LSB; these were inverted (§31.7, #1246, reported by
+  Ganesh-TNL).
+
+* The sizes of dynamic arrays are solved jointly with the `rand` sub-object
+  fields they depend on, a negative or oversized exact `.size()` target is
+  rejected at once, and a randomize budget that runs out names the failed
+  `.size()` constraint (§18.4, §18.5.8.1, §18.5.9, #1259, contributed by
+  shabbarvejlani).
+
+* `rand_mode` and `constraint_mode` of a member named through a sub-object
+  handle (`p.h.len.rand_mode(0)`) apply to that sub-object, so its
+  `randomize()` and that of the enclosing object hold the member; the mode was
+  recorded on the enclosing object and never applied (§18.8, §18.9, #1259).
+
+* A compiled method that calls another compiled method directly passes an
+  argument to a formal typed by a class typedef sized by a class parameter
+  (`typedef logic [AW-1:0] addr_t;`) at the receiver's width; it was truncated
+  to 1 bit from the 1,001st call on, so `m.exists(a)` missed keys it held
+  (§8.25, §13.5.1, #1271, contributed by auty1395).
+
+* A class typedef of a class-parameter typedef (`typedef addr_t addr2_t;`)
+  sizes formals, locals and returns by the receiver's specialization instead
+  of as 1 bit, and `obj.m = new`, `this.m = new` and `this.arr[i] = new`
+  construct the specialization the member is declared with instead of the
+  default one (§6.18, §8.8, §8.25, #1271, reported by auty1395).
+
+* A compiled method's whole-value assignment to a static or instance
+  collection member, or to a member that redeclares a base-class member,
+  writes that member when a module variable has the same name; it wrote the
+  module variable (§8.9, §23.9, #1287, contributed by auty1395).
+
+* A fill literal (`'0`, `'1`, `'x`, `'z`) whose other operand is a `real`,
+  `shortreal` or `realtime` is converted at its self-determined one bit:
+  `one == '1` is 1 for `one = 1.0` and `2.0 + '1` is 3.0. It was widened to 64
+  bits first, so `'1` read as 2^64 - 1 in comparisons, arithmetic, parameters
+  and class methods (§5.7.1, §11.8.2, #1278, contributed by ds54e).
+
+* `inside` compares a real operand or a real set member numerically: `r inside
+  {u}` for `r = 4294967295.0` and `u = 32'hffffffff`, `1 inside {1.0}`, a
+  negative integer and the items of an interpreted `case (r) inside` compared
+  bit encodings (§11.4.13, §11.4.5, §12.5.4, #1281, contributed by ds54e). A
+  `case inside` in compiled code matches its items as the `inside` operator
+  does: a wildcard item such as `4'b10??` never matched in an `always_comb`
+  (§12.5.4, #1281).
+
+* A variable, literal or struct connected to an input port of a user-defined
+  nettype drives the port's net, which the nettype's resolution function
+  resolves; the port read the actual directly, a regression in 0.11.6 for a
+  `real` variable (§23.3.3, §6.6.7, #1280, reported by ds54e).
+
+* A stream operand with `with [ array_range ]` packs and unpacks only the
+  selected elements and leaves the rest of the array unmodified. The range is
+  evaluated when its array is streamed, so it can read a length unpacked
+  earlier in the same statement; an unpack grows a dynamic array or queue to
+  the range (§11.4.14.4, #1197, contributed by Thomasb81).
+
+* An edge-sensitive block whose input changes in the final combinational
+  settle of an edge cascade runs in the same time step: chained nettype relays
+  and their integral counterparts lagged one update behind (§9.4.2, #1239,
+  contributed by Thomasb81).
+
+* Each continuous driver of a user-defined nettype net keeps its own delay in
+  front of the resolution function, and the net's declaration initializer is
+  one of its drivers, constant or not, at top level or in an instance
+  (§10.3.3, §6.6.7, §10.3.1, #1204, contributed by Thomasb81).
+
+* Four or more continuous assignments with one read set no longer loop for
+  ever in the time-0 settle when they inline a function whose `if` or `case`
+  compiles to a fused compare-and-branch or a jump table, and a continuous
+  assignment in an instance that reads a cell of a memory too large to name
+  its elements re-evaluates when the memory is written (§9.2.2.1, §10.3.2,
+  #1284, reported by Ganesh-TNL).
+
+* A blocking assignment of a pattern whose items read the target (`a = '{a[1],
+  a[0]}`) reads every item before it writes the target, for arrays, queues,
+  structs, class properties, associative arrays and function locals (§10.4.1,
+  §10.9.1, §10.9.2, #1274, reported by chuanseng-ng; test contributed by
+  chuanseng-ng).
+
+* A compiled class method or subroutine of a package reads its own package's
+  parameters, variables and imported names ahead of a same-named declaration
+  of the calling module, and a package function reached only from another
+  package's code runs in its own package (§26.3, #1285, contributed by
+  auty1395).
+
+* The formals, return types and locals of a package's subroutines and class
+  methods are sized by the package's parameters, whoever calls them, and
+  `logic a [N]` in an instance of a module that imports `N` from the only
+  package declaring it is a fixed-size array (§26.3, §7.4.2,
+  aionhw/xezim-core#253, aionhw/xezim-core#254, contributed by auty1395).
+
+* A class nested in a parameterized class and named through a specialization
+  (`alpha #(.W(4))::req`) keeps its own constructor, methods, statics and base
+  class when another class nests a class of the same name; a class property
+  typed by the class's own typedef is sized by the class's `localparam`s; and
+  a named property or sequence that two packages declare runs the body of the
+  package in scope, with `import pkg::prop;` importing it (§6.18, §8.23,
+  §8.25, §16.8, §26.3, #1273, reported by Ganesh-TNL).
+
+* An unsized signed decimal number of more than 32 bits has its full value and
+  width, sign bit included, in parameters, constant expressions, `$bits` and
+  run-time expressions alike, and the 32-bit wrap warning is gone:
+  `2000000000000` read -199023255552 at run time and -1454759936 in a
+  parameter; `3000000000` is now 33 bits (§5.7.1, #1120, reported by ds54e).
+
+* A part-select with negative or ascending bounds of a multidimensional packed
+  array is written to the selected elements, in blocking, nonblocking and
+  continuous assignments, class properties and associative-array elements, and
+  a nonblocking element-range write to a multidimensional packed array writes
+  the whole range (`q[2:1] <= v` on `logic [3:0][7:0] q` wrote 2 bits)
+  (§7.4.1, §11.5.1, #1193, reported by Ganesh-TNL).
+
+* A `foreach` constraint over an array of fixed shape reached through a struct
+  member, a sub-object or a row of a multidimensional array, or with omitted
+  loop variables, is solved instead of dropped; a member of a packed struct or
+  union member of an unpacked-struct class property is addressed as a slice of
+  it; rand array and union members of an unpacked-struct property are drawn at
+  their real shape; and constraints on a sub-object's selected members reach
+  its solve (§7.2.1, §18.4, §18.5.8.1, §18.5.9, #1192, reported by
+  Ganesh-TNL).
+
+* The elements of a package array parameter are left out of the waveform scope
+  of a module that does not declare them (§21.7.2.3, §26.3, #1213, reported by
+  ds54e).
+
+* A function or task reads its own plain formal or local when its caller has a
+  virtual-interface formal of the same name, and a callee's read of a module
+  or package variable of that name reads that variable: `v.put(x)` with
+  `function void put(int v); data = v; endfunction`, called from a method
+  whose virtual-interface formal is `v`, stored a handle token in `data`,
+  through an interface function or task, a modport import, a module function
+  or task, a class method, a fork and a recursive call (§13.5.1, §25.9, #1297,
+  reported by git-hevangel).
+
+* A real-valued initializer of a 64-bit integral variable converts to it:
+  `time t = 9200s;`, `longint l = 3000000000.0;` and `bit [63:0] b =
+  5000000000.0;` kept the double, so a shift read its IEEE 754 bits and `%0d`
+  printed its low 32 bits; the same for a typed parameter of a package
+  (§6.12.1, §5.8, #1299, reported by git-hevangel).
+
+* A time literal converts to the unit and precision of its scope by exact
+  powers of ten, in a value, a delay and a clocking skew: `9200s` under
+  `1ns/1fs` was 9199999999999.998 ns, so `t == 9200s` was false for `t =
+  9200000000000` and `#9200s` resumed 2048 fs early; `#9200s` in a 1 ps scope
+  of a 1 fs design resumed 9.2 us late, and a bare delay under `1us/1fs` was
+  scaled by 999999999.9999999 (§5.8, §3.14.1, #1299, reported by
+  git-hevangel).
+
+* A bit-, part- or indexed part-select of a task, function or method local,
+  formal or return variable declared with an ascending range or a low bound
+  other than 0 names the bits its range labels, as the same select of a module
+  variable does: `reg [0:7] n; n[0] = 1'b1;` sets bit 7 and `reg [8:1] n;
+  n[1] = 1'b1;` sets bit 0. Writes landed on the raw bit position of the
+  value; so did reads of a class method's formal, reads in a function inlined
+  into a compiled continuous assign or process, and selects of a compiled
+  block's own such local, and a local beside a design variable of its name
+  wrote that variable (§7.4.1, §11.5.1, §13.5, #1298, reported by
+  git-hevangel).
+
+* A function local hides a design variable of its name when an expression's
+  width is found: with a module `reg [15:0] n`, a function's `reg [7:0] n`
+  made `{n + 8'h01}` 16 bits wide (§11.6.1, #1295, reported by git-hevangel).
+
+* A call in a compiled class method whose `output`, `inout` or `ref` actual is
+  a class member (a member scalar, a queue or array element) runs its callee
+  once. The call was emitted compiled and then run again by the interpreter
+  fallback, so counters, queue pushes and random draws happened twice; this
+  also held under `void'()`, for task enables and for static, `super.` and
+  other-handle calls (§13.5.2, #1293, contributed by auty1395).
+
+* A VPI deposit on a net whose package resolver reads its own return variable
+  holds until a driver changes, and a module variable named like the resolver
+  no longer restores the driver value. A deposit on a wire driven by a call
+  through a scope (`assign w = p::f(d)`, `$unit::f(d)`) holds as well: the
+  callee name is not an operand of the assignment (§13.4.1, §26.3, §38.34,
+  #1300, contributed by ds54e).
+
+* An assignment pattern with an intra-assignment delay or event control stores
+  the elements of an item that is an unpacked array (`wb = #1 '{wc, r}`,
+  `'{default: wc}`, rows of a multidimensional array, a class property
+  target), read when the statement runs; it stored zeros (§9.4.5, §10.9.1,
+  §10.10, #1291, contributed by chuanseng-ng).
+
+* Type keys in array assignment patterns apply at every dimension, after index
+  keys and before `default:`, for variables, continuous assignments,
+  resolved-nettype drivers, parameters, packed targets and slices, class
+  properties and array formals; a key naming a typedef, a package or class
+  type or a type parameter is a type key. `assign n = '{a:'{integer:x,
+  default:99}}` on a nettype structure member gave 99. A type key of an outer
+  level takes precedence over a `default:` row pattern, as the standard's
+  recursive descent gives (§10.9.1, §10.9.2, #1290, contributed by Thomasb81).
+
+* Wake an event control whose expression calls a function with a whole
+  unpacked structure, a fixed array of structures or one of its elements when
+  a member write changes the result, with the edge and `iff` terms judged once
+  per waiter (§9.4.2, §9.4.2.3, #1317, contributed by ds54e).
+
+* Match every string with an empty UVM regex on a BSD libc host, as on glibc,
+  so `uvm_config_db::set(null, "", ...)` under UVM 1.1d and 1.2 is found on
+  macOS (#1306, contributed by auty1395).
+
+* Resolve aliased nets of a user-defined nettype as one net with all their
+  drivers, through `alias` lists, chained `alias` statements, `inout` ports,
+  nettype arrays and generate blocks, and count the single driver of an
+  unresolved nettype over the aliased names (§10.11, §6.6.7, #1302,
+  contributed by Thomasb81).
+
+* Match `real` and `realtime` type keys of an assignment pattern as one type
+  (§6.12, §10.9.1, #1290, contributed by ds54e).
+
+* Resolve assignment pattern type keys that name a typedef of a parameterized
+  class scope, of a generate block or of a package imported at that point of
+  the module, and keep a member name of the structure from also acting as a
+  type key (§10.9.1, §10.9.2, §8.25.1, §26.3, #1290, contributed by
+  Thomasb81).
+
+* Return a whole unpacked-struct element of an array argument, a local array
+  or a design array from a function (`return d[0];`, `f = d[i];`), with the
+  index evaluated once, instead of zeros; a nettype resolver that returns one
+  of its drivers now resolves (§13.4.1, §13.5.1, §11.4.1, #1310, reported by
+  ds54e).
+
+* A typedef'd `real` member of an unpacked struct (`typedef real t_real;
+  struct { t_real m[2]; }`) keeps real values: the member cells of a function
+  local, a nettype resolver's result and a class struct property were created
+  as integers and rounded every write (§6.18, §7.2, #1304, contributed by
+  ds54e).
+
+* A typedef that names `real`, `shortreal` or `realtime` declares real objects
+  everywhere a type is classified: block, function and task variables, class
+  properties (also of an alias the class declares, or of a type parameter
+  bound to `real`), function return variables, task and method formals, typed
+  parameters and localparams, and casts to the alias (`r_t'(i) / 2` is a real
+  division). Before, `typedef real r_t; r_t v; v = 3.14;` stored 3. A
+  class-method formal declared `real` now also converts an integral actual
+  (§6.18, §6.12.1, §8.25, #1313, reported by Dragon-Git; #1304, reported by
+  ds54e).
+
+* A constant element select of a packed array of packed structures or unions
+  reads the element its index labels: the left bound of the range is the most
+  significant element, so `S[0]` of `localparam s_t [0:2] S` is the first one
+  (it read the last). Ranges that do not start at 0 (`s_t [1:3]`, `[3:1]`), a
+  second packed dimension (`M[0][1]`), dimensions carried by a typedef and the
+  package form `p::ENC[fmt].field` in a package function are right too
+  (§7.4.1, xezim-core #248, reported by auty1395).
+
+* The delays of a UDP instance count the time unit of the module that holds
+  the instance: `udp #(4) u(q, a);` under `` `timescale 1ns/1ps `` waits 4 ns
+  instead of 4 ps. Real and time-literal values, `#(rise, fall)` pairs, and
+  expressions over package, class and instance parameters are scaled as a
+  whole (§3.14.2, §28.16, §29.8, #1308, reported by ds54e).
+
+* An element of a packed array of a named signed type is signed in every
+  declaration context, so a widening cast, assignment or arithmetic use of
+  `lanes[1]` sign-extends: non-ANSI ports (`input lane_t [0:1] p;`), ports
+  whose packed dimensions come from a typedef, subroutine and class-method
+  formals and locals, block variables, and packed-array members reached
+  through nested structures, packed arrays of structures, class properties and
+  instance names. Before, -1887 read as 129185 (§7.4.1, §11.8.1, #1312,
+  reported by Ganesh-TNL).
+
+* An `always_comb` procedure or a continuous assignment whose evaluation is
+  observable beyond its outputs now waits for the time-0 processes: it is left
+  out of the settle that runs before they start and is evaluated once when
+  every `initial` and `always` procedure has started. This covers a body or
+  right-hand side that calls an output, control, file or random system task or
+  function, contains an immediate assertion, calls a class method or a DPI
+  import that is not `pure`, reads a property through a class handle, steps a
+  variable it never plainly assigns (`n++`), or calls a function or task that
+  does any of these or writes a variable outside its own frame. Before, such
+  an entry was also evaluated on the declaration-time state: an assertion
+  failed on the type defaults, a method ran on a null handle, `always_comb c =
+  h.v;` ended the run with a null dereference, and counters counted an
+  evaluation too many. Entries that only compute their outputs still settle
+  before the processes start (§9.2.2.2, §4.9.1, §10.3, #1314, reported by
+  Ganesh-TNL).
+
+* A variable that a called function writes is no longer part of its caller's
+  sensitivity. A continuous assignment or `always_comb` whose function counts
+  its calls in a module variable it also reads re-ran on its own write until
+  the settle limit (§9.2.2.2.1, §10.3, #1314, reported by Ganesh-TNL).
+
+* A formal argument of a named sequence or property takes its default actual
+  argument when an instance leaves it out: `p()`, `p(a)`, `p` without an
+  argument list. The defaults were dropped by the parser, so the formal stayed
+  unbound in the expanded body. Arguments bound by name (`p(.y(b))`) and empty
+  positional arguments (`p(, b)`), which were not bound either, are bound too;
+  a default may name an earlier formal; a default of a declaration in an
+  instantiated module or interface names that instance's variables; and the
+  default of an untyped formal is cast to its self-determined type before it
+  is substituted (§16.8, §16.12, #1309, reported by ds54e).
+
+* A whole unpacked variable of an interface (an array, a structure, a queue, a
+  dynamic or associative array, an unpacked member of a structure) is copied,
+  read and compared through a virtual interface as it is through a
+  hierarchical name. With the handle in a class property, a static property, a
+  package variable, an array element, a subroutine formal or a function local,
+  or used from a class method, `vif.arr = w;` and `w = vif.arr;` did nothing,
+  `vif.arr == w` was 0 or x, and the array passed as a subroutine actual
+  arrived empty; element, slice and packed accesses were not affected (§25.9,
+  §7.6, §11.4.5, #1311, reported by rharikrishna25).
+
+* A class-handle member of an unpacked-struct class property is a handle like
+  any other: `r.h = new();` constructs the member's class, and the object's
+  properties are read and written through the member in a method and from
+  outside the class (`o.r.h.k`), also through a nested struct, an array of
+  handles and an array of structs. The constructor did not run and a write
+  through the member was dropped (§7.2, §8.4, §8.7, #1192, reported by
+  Ganesh-TNL).
+
+* The object behind a `rand` class-handle member of a rand unpacked struct is
+  randomized with the object that holds the struct, under its own constraints
+  and the holder's constraints that read only its members (`r.h.k == 5`);
+  `randomize()` returned 0 for such a constraint (§18.4, §18.5.9, #1192,
+  reported by Ganesh-TNL).
+
+* A type written inside a class method is sized in the class scope:
+  `$bits(logic [W-1:0])` and a method-local `typedef logic [W-1:0] lt;` see
+  the class's own and inherited body constants and the parameters of the
+  active specialization, instead of coming out one bit wide (§8.5, §6.20.4,
+  #1273, reported by Ganesh-TNL).
+
+* `$bits` of a typedef named through a class specialization follows that
+  specialization's parameters through a nested class and through a typedef of
+  the specialization or of the nested class (`box #(6)::pay::wide_t`,
+  `p6_t::wide_t`, `b9_t::pay::wide_t`), with named arguments bound by name
+  (§8.23, §8.25.1, §20.6.2, #1273, reported by Ganesh-TNL).
+
+**Performance**
+
+* Store a named property or sequence body that is identical in every instance
+  once (`--compile` peak RSS 340 MB → 123 MB on 4,096 instances with 16
+  formal-only named properties each) (§16.6, §16.8, #721, contributed by
+  amal-khailtash).
+
+* Compile local assignment expressions in function loop steps and signed
+  bit-index writes to function locals. Stepped processes can also call real
+  math functions with inlined arguments (#1336, #1337, #1326).
+
+* Size a packed declaration inside an instance against its instance's
+  parameters without copying the design-wide parameter table at each move
+  between instances: the overlaid table is kept per outermost scope and only
+  the scopes two instances do not share are taken off and put on (§23.10,
+  #1445, #1452, contributed by akashlevy).
+
+* Walk a dotted name's declared struct type without copying the typedef and
+  its member list (§7.2, §23.6, #1446, contributed by akashlevy).
+
+* Find a net's continuous drivers for a `release`, and for a `force` or
+  `release` of part of a net, through an index of the comb entries that write
+  each signal instead of scanning every entry (§10.6.2, #1447, contributed by
+  akashlevy).
+
+* Keep a subroutine call's own storage keys out of the interface-alias name
+  cache, which grew by an entry per call and collection element on a design
+  with interface ports (§13.5, §25.9, #1449, contributed by akashlevy).
+
+* Hold each token as its kind and its offsets into the preprocessed source, 8
+  bytes instead of 48 plus an owned spelling, in chunks of 4,096 tokens that
+  the parser releases as it finishes each item: a 6.8 MB source of 262,144
+  declarations parses in 272 MiB of peak memory instead of 386 MiB
+  (aionhw/xezim-core#190, contributed by Thomasb81).
+
+* Share the definition's body among the instance copies of a module function
+  or task and rewrite it into its instance only where it is used: 128
+  instances of a module whose 16 functions read module state compile in 31 MiB
+  instead of 133 MiB, as functions that read only their formals do
+  (aionhw/xezim-core#193, contributed by Thomasb81).
+
+* Find all targets of a chain of nested binds in one elaboration that adds
+  only the newly bound scopes on each step, then elaborate the design once
+  more, instead of elaborating the whole design once per level: four levels of
+  binds into 128 instances compile in 0.19 s of CPU time instead of 0.52 s and
+  in 73 MiB instead of 85 MiB (§23.11, aionhw/xezim-core#194, contributed by
+  Thomasb81).
+
+* Share declared element widths across fixed class arrays, retaining indexed
+  writes and checkpoint restore (#1053). The public Rust field
+  `Simulator::widths` now has type `SignalWidths`. It supports key lookups,
+  indexing, inserts, removals and logical iteration; iterated names are
+  `Cow<str>`. Code requiring a concrete `HashMap<String, u32>` or its entry
+  API needs adaptation.
+
+* Compile supported whole unpacked-structure constructor assignments. On a
+  2,000-iteration reproducer, the median instruction count across three
+  Callgrind runs fell from 760,750,106 to 216,426,263. The scalar control used
+  65,620,020 and 65,804,112 instructions respectively (#1394).
+
+* Store contiguous fixed class-array elements in dense runs while retaining
+  their declared widths and typed values (#1053).
+
+* Compile process loops that write packed memory words through fixed banks or
+  indexed instances, including reads through the same instance paths (#1456).
+
+* Inline literal default inputs on positional function calls and compile
+  process locals overwritten by a function output before their first read
+  (#1453).
+
+* Module bodies containing only declarations and continuous assignments reuse
+  their prepared syntax across value-parameter overrides, avoiding repeated
+  cloning and content comparison. Each instance still resolves its own widths,
+  initializers and connections; generate and procedural bodies keep
+  parameter-sensitive preparation (§6.20, §23.10, #721). A synthetic case with
+  1,024 parameter values and 4,096-term initializers compiles in a three-run
+  median of 3.08 seconds instead of 7.56 seconds, with identical artifacts.
+  Peak RSS is 64.1 MiB versus 62.6 MiB; this change reduces compilation work
+  rather than demonstrating a peak-memory reduction.
+
+* Sampling a covergroup whose bins have a `with` filter that compares `item`
+  with constants works from the ranges between the filter's cut points instead
+  of testing each value of a bin's range. A class covergroup with three
+  filtered coverpoints and a cross, sampled 100,000 times, runs in 9.35 G
+  instructions instead of 79.4 G with the same coverage (§19.5.1.1, #1135,
+  contributed by auty1395).
+
+* A continuous assignment that calls a function is evaluated when an operand
+  changes. The called function's own name, its loop variables and the locals
+  of its nested blocks counted as unresolved reads, so the assignment was
+  evaluated at every settle: two such assignments beside a free-running clock
+  took 60,002 evaluations and 40.45 G instructions for 10,000 cycles, now 3
+  evaluations and 84.7 M instructions (§10.3.2, §13.4, #1126, reported by
+  ds54e).
+
+* Compilation-unit variables and nets are no longer copied into every module,
+  interface and program definition and every instance. A synthetic design with
+  4,000 module definitions, 200 unit declarations and four instances peaks at
+  107 MiB instead of 1,500 MiB, and 4,096 instances beside 64 unused unit nets
+  at 161 MiB instead of 1,734 MiB. A hierarchical name such as `inst.v` does
+  not find a unit variable in an instance, whether or not the instance's
+  module names it, as the LRM and the reference simulator agree (§3.12.1,
+  §6.7, §23.6, #721, reported by amal-khailtash).
+
+* Instances whose parameter values prepare the same module body (a generate
+  loop index passed to a child that only uses it in expressions) share that
+  body instead of each keeping its own copy, and net classification tables
+  reuse the signal name text. 8,192 such instances with 32 net initializers
+  each peak at 290 MiB instead of 1,252 MiB, with 32 continuous assignments at
+  261 MiB instead of 1,751 MiB; instances with equal parameters drop from 322
+  to 273 MiB (§23.10, §27, §6.7, #721, reported by amal-khailtash).
+
+* A process parked on an event control is examined when a signal named in its
+  event expression is written, not at every scheduling pass. Waiters on whole
+  signals (level and edge terms, `or`-lists, `iff` guards, named events,
+  ports, hierarchical and virtual-interface names) and on plain expressions of
+  signals (`@(v[3])`, a port connected to a select) are followed this way;
+  clocking events, array cells picked by a variable index, memory cells and
+  terms with a function call are examined at every pass as before. The order
+  in which one event wakes its waiters is unchanged. 8,192 cells with `always
+  @(za or zb)` around a task that suspends on `#0`, idle beside a free-running
+  clock, took 656.8 million parked-waiter examinations for 20,000 cycles and
+  now take 1.39 million; with the two changes below the run drops from 448.7 G
+  to 18.8 G instructions. 1,024 cells armed through `.za(wl[i])` take 6.87 G
+  instead of 33.9 G for 5,000 cycles. `XEZIM_WAITER_INDEX=0` restores the
+  examination of every waiter (§9.4.2, #1194, reported by Ganesh-TNL).
+
+* Setting up a design no longer searches every instance scope for each
+  continuous assignment or port connection that names an unpacked array
+  element whose array shares its name with a signal of the instances: the
+  search places implicit nets, and is skipped when it has none to place. 8,192
+  instances with a port connected to `zq[i]` are set up in under 0.1 seconds
+  instead of 8.8 (§6.10, §23.3.3, #1194, reported by Ganesh-TNL).
+
+* Asking whether a process is parked on `#0` no longer scans the queue of
+  processes parked there, which made a burst of wake-ups quadratic: 8,192
+  processes woken by one event and each suspending on `#0` cost 33 million
+  comparisons per event (§4.4.2.3, #1194, reported by Ganesh-TNL).
+
+* `pop_front`, `push_front`, `insert` and `delete(i)` on a queue no longer
+  take time proportional to the queue's length: the elements of a queue or
+  dynamic array are kept as one run and move as a block, instead of one at a
+  time through a by-name read and write. A loop of 30,000 `pop_front` calls on
+  a queue that grows to 30,000 elements runs in 0.31 s instead of 396 s (2.3 G
+  instead of 3,127 G instructions), with the same cost for every 5,000-pop
+  interval instead of 9.5 s rising to 129 s; module, package, class-property,
+  static, task-local, `ref`-argument and instance-array queues all gain.
+  Queues of unpacked structs, of fixed arrays and of queues keep the
+  element-by-element move. `XEZIM_PROFILE_TIMING=1` prints `[PROF]
+  queue_elem_moves=`, the number of elements still moved one at a time
+  (§7.10.2, #1211, reported by Ganesh-TNL).
+
+* An interpreted store to one element, part-select or bit of a wide packed
+  vector edits the stored vector in place instead of reading the whole vector
+  out, copying it, comparing it and storing it back: module variables, class
+  properties and task or function locals. A loop gathering queued beats into a
+  1-Mibit packed buffer (`frame_buf[i] = beat_q.pop_front();`) costs 188 µs
+  per 32-element execution instead of 1,908 µs, and the reported test case
+  runs in about 18 s instead of 86 s (107.8 G instead of 322.7 G
+  instructions). The loop itself is still interpreted, and a read of one
+  element of a wide vector still copies it. `[PROF] select_store_copies=`
+  counts the stores that copied a whole vector (§7.4.1, §11.5.1, #1210,
+  reported by Ganesh-TNL).
+
+* The second-pass lint folds a child module's constants against one table of
+  package and class constants shared by all instances, instead of copying
+  every `pkg::N` into a table per instance. A design with 16,000 package
+  constants and 4,000 instances compiles in 3.0 s and 139 MB instead of 74.9 s
+  and 8.97 GB (§26.3, #721, reported by amal-khailtash).
+
+* A constant function call reads the module parameter table in place while it
+  sizes its formals, locals and return value; each call used to copy the whole
+  table, so N instances that each call one function cost N x N. With 6,000
+  such instances the inlining phase takes 0.42 s instead of 48.6 s (§13.4.3,
+  #721, reported by amal-khailtash).
+
+* The expression connected to an input port is held once per instance for the
+  instance's deferred bodies and its time-0 port record, not copied into each.
+  The 64-instance, 128-port concatenation fixture of the report peaks at 1,113
+  MB instead of 1,629 MB; the connection assignment keeps its own copy
+  (§23.3.3, #721, reported by amal-khailtash).
+
+* The signals of one declaration share one copy of its declared type across
+  the instances of the module, instead of a copy of the type tree per signal.
+  Ranges written with parameters still resolve per instance, and a type that
+  names a typedef of the instance stays per instance. 4,096 signals of a
+  128-member packed struct peak at 114 MB instead of 548 MB; 131,072 4,096-bit
+  signals at 243 MB instead of 329 MB (§6.8, #721, reported by
+  amal-khailtash).
+
+* A compilation-unit DPI import is copied only into the definitions that name
+  it, directly or through a compilation-unit subroutine they call, and a
+  compilation-unit constant read by its bare name only into the definitions
+  that read it; a constant reached through a hierarchical name, a type, a
+  class or a bind directive is still visible in every definition. With 200
+  unused imports and 2,000 definitions the compile peaks at 117 MiB instead of
+  1,259 MiB; with 200 constants each read by ten of the definitions, at 129
+  MiB instead of 1,742 MiB and 1.0 s instead of 6.9 s. Instances no longer
+  list compilation-unit constants their module does not read (§3.12.1, §23.9,
+  §35.5.4, #721, reported by amal-khailtash).
+
+* On a synthetic five-level design of 26,200 instances and 377,915 signals
+  these changes together bring the peak RSS of `--compile` from 1,746 to 1,208
+  MiB, the memory held after instance expansion from 833 to 703 MiB and the
+  compile from 136.06 G to 53.51 G instructions, with the same artifact and
+  simulation output (#721).
+
+* An automatic function that reads an element of a packed-array member of a
+  packed-struct formal (`c.gain_shift[ci]`), or that calls a helper reading
+  its module's `localparam`, is compiled into the calling block instead of
+  running every call on the interpreter. The reported wide `always_ff` design
+  runs in 8.27 G instead of 400.8 G instructions, its hot section in 1.9 s
+  instead of 90 s (§7.4.1, §6.20, §13.4, #1245, reported by Ganesh-TNL).
+
+* The `&&&` conditions and the timestamp and timecheck conditions of timing
+  checks are compiled when first evaluated instead of interpreted at every
+  event. The reported gated-clock capture pipeline runs 400 frames in 3.82 G
+  instead of 66.2 G instructions, against 1.58 G with `+nospecify` (§31.7,
+  #1246, reported by Ganesh-TNL).
+
+* Calling a class method whose formal, return or local is sized by a class
+  parameter, or that evaluates `$bits` of such a type, no longer copies the
+  design's whole parameter table on every call. A call cost time linear in the
+  design's parameter count, about 0.14 ms per call with 8,000 unrelated
+  parameters; the reported case now runs in the same 277 M instructions with
+  8,000 parameters as with none (§8.25, #1276, contributed by auty1395).
+
+* A static function whose local is written bit by bit through constant selects
+  before anything reads it (`n[0] = a[31]; ... n[31] = a[0]; f = n;`, the body
+  of a CRC or bit-reversal function) is inlined into compiled code, so the
+  continuous assigns that call it compile. The local was judged to carry its
+  value between calls, which made the function impure and left every such
+  continuous assign on the AST interpreter (a 32-bit bit reversal evaluated
+  100,000 times: 10.5 instead of 4.4 billion instructions). A select in a
+  branch or a loop, a non-constant index or range, or a read before every bit
+  is written still keeps the value between calls (§6.21, §13.4.2, #1296,
+  reported by git-hevangel).
+
+* An operator chain of selects (`d[3] ^ d[9] ^ ... ^ d[251]`, the shape of a
+  CRC or parity function) costs work in proportion to its length on the
+  interpreter: a select is sized from the select, not by evaluating it, so
+  each level of the chain no longer evaluates every select under it again, nor
+  scans it again for a shift. A function of 8 chains of 260 selects over a
+  256-bit local: 12.4 billion instructions before, 0.09 billion now (§11.5.1,
+  §11.6.1, #1295, reported by git-hevangel).
+
+* A select of a task or function local, formal or return variable reads and
+  writes the frame's value directly instead of first trying the design's name
+  tables: 2,000 calls writing a 64-bit local bit by bit take 23% fewer
+  instructions, 34% fewer in a class method (§11.5.1, #1298).
+
+* A copy of a procedural statement shares the statement list of each
+  `begin`/`end` and `fork`/`join` block with the statement it was copied from,
+  and a root process whose body the final rewrite leaves unchanged keeps the
+  list it was parsed into; a block is copied only when a rewrite changes it
+  (§9.3, §9.2, #721, reported by amal-khailtash).
+
+* The optional parts of a declaration or statement that most designs leave out
+  (a nonblocking assignment's intra-assignment delay, a declarator's
+  initializer, net and continuous-assignment delays, a case item's pattern and
+  guard, an assertion's inferred clock, clocking skews) and the rare module
+  items (`for` generate, DPI import and export) are held out of line, so a
+  statement or module item without them is smaller (§10.4.2, §6.7.1, §10.3.3,
+  §12.6, #721, reported by amal-khailtash).
+
+* The parser hands over statement, declaration, port, argument and dimension
+  lists in buffers of their exact length, and the pages freed by parsing and
+  by the top module's elaboration are returned before the next phase allocates
+  (#721, reported by amal-khailtash).
+
+* The declaration-before-use check shares one table of module names between
+  the procedural scopes of a module instead of copying it for every function,
+  block and condition (§6.5, §6.21, #721, reported by amal-khailtash).
+
+* A leaf module with no instances, binds or generate constructs is inlined
+  without a second prepared copy of its items, and the check of inlined bodies
+  builds the table of names outside classes only when a class method needs it
+  (§23.3, §13.4, #721, reported by amal-khailtash).
+
+* A signal wider than 64 bits holds a previous-value copy for edge detection
+  only once it has been sampled; until then its all-x initial value is implied
+  (§9.4.2, #721, reported by amal-khailtash).
+
+* The declared types of a struct variable's members are read from an ordered
+  index of member names when a subroutine saves and restores a local, the
+  edge-block compilers share one index of qualified function names, and a
+  design without continuous assignments skips the buffer collapse pass (§7.2,
+  §13.4.2, §10.11, #721, reported by amal-khailtash).
+
+* Elaboration releases the prepared body of a parameter environment that no
+  second instance repeats. A body another instance asks for is kept for the
+  whole pass as before; of the bodies only one instance used, each definition
+  keeps its 16 most recent, and an environment that comes back after its body
+  was released is prepared once more and then kept. 512 instances of a module
+  generated under a distinct parameter value each peak at 136 MiB instead of
+  1,147 MiB; a design whose instances share their environments is unchanged
+  (#721, suggested by amal-khailtash).
+
+* The typed value parameters of one declaration share one copy of its declared
+  type across the instances of the module, instead of a copy of the type tree
+  per parameter per instance. Ranges written with parameters still resolve per
+  instance, and a type that names a typedef of the instance stays per
+  instance. 512 instances with 32 parameters of a 64-member packed struct peak
+  at 514 MiB instead of 1,393 MiB (§6.20.2, #721, suggested by
+  amal-khailtash).
+
+* The index that finds the parameters of an interface instance bound to an
+  interface port holds the path of each instance once, with the names of its
+  parameters beside it, instead of the full key of every parameter. 2,048
+  interface instances with 96 untyped parameters each peak at 631 MiB instead
+  of 704 MiB; an instance with a single parameter costs what it did (§25.10,
+  #721, suggested by amal-khailtash).
+
+* A class declared in a module holds its constraint blocks once for every
+  instance of the module, and a class specialization shares them with the
+  class it specializes; each elaborated copy of the class used to hold a deep
+  copy of every block. The blocks are shared where the class is copied, with
+  no comparison afterwards, so the compile gets faster as well: 1,024
+  instances of a module whose class has 128 constraint expressions peak at 44
+  MiB instead of 1,672 MiB and compile in 0.70 s instead of 2.68 s. A
+  `randomize()` call solves a working copy of its own, as before, and an
+  out-of-block constraint body is installed in the class it names (§8.3,
+  §18.5, #721, suggested by amal-khailtash).
+
+* The continuous assignments of an instance record one shared scope string for
+  code coverage instead of a copy of the instance path each, and the
+  assignments deferred during instance expansion are moved into a table
+  reserved once for all of them. 1,024 instances with 512 assignments each and
+  512-character instance names peak at 1,616 MiB instead of 2,066 MiB (§10.3,
+  #721, suggested by amal-khailtash).
+
+* The scope tree that upward hierarchical names are resolved against holds
+  each instance path and each definition name once, and a parent lists its
+  children by their paths instead of by a copy of the instance name and of the
+  definition name. 66,560 instances with 256-character names peak at 206 MiB
+  instead of 309 MiB (§23.8, #721, suggested by amal-khailtash).
+
+* Join alias groups and the ports that reach them with an index union-find, in
+  one pass instead of one pass per level of ports (§10.11, #1302, contributed
+  by Thomasb81).
+
+* Classify each key of an array pattern once and build nested element names in
+  place: a loop of keyed patterns on the interpreted store takes 5.5 % fewer
+  instructions (#1290, contributed by Thomasb81).
+
+* A `for` loop that stores `q.pop_front()` or `q.pop_back()` into a variable
+  or array element is compiled; it used to run whole in the AST interpreter.
+  The reporter's stream collector runs in 83.4 G instead of 108.7 G
+  instructions (§7.10.2, §12.7.1, #1210, reported by Ganesh-TNL).
+
+**Command line**
+
+* A run that SIGINT or SIGTERM stopped exits with 130 or 143 (128 + the signal
+  number) after the same clean shutdown, instead of 0, so a harness that
+  judges a run by its exit status no longer takes it for a pass (#1407,
+  contributed by akashlevy).
+
+* Preserve live packed memories up to 16,777,216 bits by default, including
+  declarations inside parameterized instances. Set `XEZIM_MAX_PACKED_WIDTH` to
+  change the limit, up to 134,217,728 bits. Elaboration reports live
+  declarations that exceed the configured limit (#1475).
+
+* Compile C and C++ DPI sources (`.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.C`)
+  named on the command line or in a `-f`/`-F` list with `$CC`/`$CXX` and
+  xezim's DPI headers, link them with any listed `.o`/`.a` into one cached
+  shared library and load it like `--dpi-lib`, instead of parsing them as
+  SystemVerilog. A listed `.so`/`.dylib`/`.dll` is loaded as it is,
+  `-CFLAGS`/`-LDFLAGS` add compiler and linker arguments, and `--compile -o`
+  warns that the artifact does not include the C files (§35, #1443,
+  contributed by akashlevy).
+
+* `$dumpvars` and `$fsdbDumpvars` accept indexed scope arguments: a
+  generate-block instance (`tb.u.g_lane[2].u_lane`), the generate block
+  itself, an instance-array element and an unpacked-array element, with the
+  same selection as `--fst-scope`. An argument that names no object is
+  reported, and a call whose arguments all fail dumps nothing instead of the
+  whole design (§21.7.1.2, #1103, contributed by Ganesh-TNL). Every
+  `$dumpvars` call made at the time the dump starts adds its objects, each
+  with its own level count (§21.7.1.2, #1103).
+
+* `--wave-suppress <entry>` excludes signals from the VCD, FST and XTrace
+  dumps: a bare name is a module definition and removes every instance of it
+  at any depth, a dotted name is one hierarchical path (an instance, an
+  instance array or generate loop, or a variable with its array elements; the
+  top-module name is optional), and a bare name that is not a module is a path
+  below the top module. `--wave-suppress-module <name>` forces the module
+  reading and `--wave-suppress-file <file>` (`-wave_suppress_file` in an args
+  file) reads the list from a file. Excluded signals are dropped while the
+  dump collects its signals, so a dump without a design's memories is faster
+  and smaller than the whole-design dump; each entry reports what it removed,
+  an include scope naming something inside an excluded scope dumps what it
+  names, and a compiled artifact takes the options when it runs (#1104,
+  contributed by Ganesh-TNL).
+
+**Compatibility**
+
+* Add VPI assertion objects, callbacks, coverage queries and controls (#1191).
+
+* Support cocotb 2.0.x and 2.1.0 runner APIs (#1189).
+
+**Maintenance**
+
+* Move two-state bytecode lowering and its existing compiler tests into
+  dedicated modules, preserving the compiler's public paths (#961).
+
+**Documentation**
+
+* Explain balanced `dist` schedules, seed-dependent ordering, and why equal
+  histograms do not imply ignored seeds (#978).
+
+**Validation**
+
+* xezim `3656b110` with the release commits, built against xezim-core
+  `ebd7886` (the core release commit), passes 8,159 default tests with five
+  ignored tests (one deliberate difference from the reference simulator,
+  four open gaps), plus the two JIT smoke tests, 55 further
+  native-backend tests and the DPI tests on the nested-scheduler fallback.
+  Core and parser pass 766 and 296 tests. Everything was built with
+  Rust 1.100, the minimum supported version. The release commits change only
+  version numbers, documentation and these notes.
+* Artifacts written by 0.11.6 or earlier are refused with the "recompile
+  with current xezim" message; recompile saved designs.
+* Behavior that changes for existing designs: a run that SIGINT or SIGTERM
+  stopped exits 130 or 143 instead of 0; a concurrent assertion runs its pass
+  action on a vacuous success unless `$assertvacuousoff` is in effect; a
+  second package of the same name, a typedef redefined with different text
+  and an undeclared type name are errors (§3.13). For Rust users of the
+  library, `Simulator::widths` is a `SignalWidths` instead of a `HashMap`.
+
+### 0.11.6 — lower elaboration memory, constant expressions and runtime correctness (November 2026)
+
+**Performance**
+
+* Child net initializers share their declaration target expressions across
+  instances, qualifying each target when needed instead of retaining a
+  separate qualified expression per instance (§10.3.1, #721). Three alternating
+  runs of the 32,768-instance synthetic fixture reduce median peak RSS from
+  1,431 to 1,105 MiB (22.8%) and compile time from 8.40 to 7.89 seconds.
+  The original full-design OOM remains unverified.
+
+**Command line**
+
+* `XEZIM_OOM_TRACE=memory.jsonl` streams phase, source, instance, table-count
+  and resident-memory records during compilation and simulation. Periodic
+  samples preserve the active work when a process is killed (#721).
+
+* Informational flags run without a simulation worker. If its requested
+  stack does not fit the address-space limit, startup retries smaller stacks
+  without changing `XEZIM_STACK_MB`. Output remains available if its writer
+  thread cannot start (#1111).
+* `--max-time` accepts `fs` and rounds integer femtosecond values exactly to
+  whole nanoseconds, including values beyond floating-point precision (#1113).
+* Runtime plusargs read from `-f` and `-F` files reach the native DPI/VPI
+  argument list in parsed order, including duplicates, when running a compiled
+  artifact. The native view previously omitted file values (#1131).
+
+**Correctness**
+
+* Clocking inputs with an explicit positive skew retain history for each
+  unpacked-array element, so indexed reads use the skewed sample (§14.4,
+  #1137, PR #1138).
+
+* Constant arithmetic uses the enclosing operand width before truncation,
+  including conditional arms, real-math arguments, declaration initializers
+  and packed-pattern elements (§11.8.2, #1096, #1109, #1125).
+* Constant functions preserve real locals and declared formal/return types;
+  integral expressions finish before conversion to a real destination
+  (§6.12.2, §13.4.1, #1125).
+* Qualified compilation-unit parameters survive module shadowing, and their
+  dependent initializers and ranges retain compilation-unit scope
+  (§3.12.1, #1109).
+
+* Hierarchical references reach static task/function locals before their first
+  call and preserve instance-specific storage (§6.21, §23.6).
+* Preprocessor warnings preserve the run's exit status when stderr closes
+  (§20.10, #1037).
+* Typed constructor arguments use the caller's parameters; defaults and
+  initializers use the constructed class's parameters (§8.8, §13.5).
+
+* Typed constructor calls build the named class, including type parameters
+  and specializations (§8.8, #1051).
+
+* `randomize()` propagates aligned packed-concatenation equalities field by
+  field and establishes unconditional hard bounds before translating bounded
+  wide arithmetic. Satisfiable relations could exhaust the search budget or
+  be rejected depending on constraint order (§18.5, §11.4.12, #1003).
+
+* An index naming a class property selects the virtual interface it names:
+  `dst[j] = src[j]` with `j` a property, `@(posedge vifs[idx].clk)`,
+  `vifs[n-1]`, `vifs[cfg.idx]` and a static index copied a null handle or
+  armed the wait on nothing, so the wait returned at once and its loop spun at
+  one time step (§25.9, §9.4.2, #988, reported by Ganesh-TNL).
+
+* `@(vif)`, `@(vifs[0])` and `@(cfg.vif)` on a virtual-interface variable wait
+  for it to refer to another instance; they never resumed, or returned at once
+  (§9.4.2, §25.9, #988, reported by Ganesh-TNL).
+
+* An edge on a select of a class property (`@(posedge bus[1])`), on a property
+  of a handle-array element (`@(posedge subs[1].clk)`), and an `or` list
+  mixing a signal with a class property (`@(posedge clk or posedge h.rst)`)
+  wait for their edges; they spun at one time step, or at the head of a
+  `forever` loop missed the property's edge (§9.4.2, #993, reported by
+  Ganesh-TNL).
+
+* `randomize()` solves relations that read a signed variable unsigned
+  (`row_bytes == line_width * 8` with an `int row_bytes`, `byte` or `shortint`
+  sizes, `x < 32'h8000_0010` on an `int x`), products of two variables (`start
+  + cnt * pitch - 1 <= top`), a wrapped side bounded by an open one
+  (`(start_addr - 8'h70) <= top - row_bytes`), and `if`/`->` branches that
+  fail only once enforced; these satisfiable classes returned 0 (§11.8.2,
+  §11.4.3, §18.5, #994, reported by Ganesh-TNL).
+
+* A signed member of a packed struct class property reads signed, a struct
+  member's signedness decides a relation's (`m.s + 4'sd1 < l.s + b.u`
+  sign-extended its left side), and `randomize()` solves `p.s inside
+  {[-4:-1]}` (§7.2.1, §11.8.2, §18.5, #994, reported by Ganesh-TNL).
+
+* A packed struct member that is a packed array of a typedef element (`t3_t
+  [3:0][7:0] f0`), or whose dimensions live in its typedef, selects an element
+  at every index on variables, ports, locals and formals, and an x/z index
+  into it in compiled code reads x at the element width (§7.2, §7.4.1,
+  §11.5.1, #984, reported by Ganesh-TNL).
+
+* A non-ANSI port of a packed struct type records its members' packed shapes,
+  so `arg.vec[1]` selects a byte on the port and in a callee whose formal has
+  the port's name (§23.2.2.1, §7.4.1, #984, reported by Ganesh-TNL).
+
+* An element select of a packed-array member of a call result (`set_td(a, i,
+  j, k).f0[1][1][1]`) selects by the member's dimensions instead of a bit
+  (§13.4.1, §7.4.1, #984, reported by Ganesh-TNL).
+
+* `$size`, `$left`, `$right`, `$high`, `$low`, `$increment` and `$dimensions`
+  of a select that leaves several packed dimensions (`$size(a3[1])`) describe
+  the dimensions left (§20.7, §7.4.5, #984, reported by Ganesh-TNL).
+
+* A path from a nested generate block through an enclosing one names the
+  enclosing block's declaration when both declare the name (`g.x`, `g.f()`,
+  `g.t`, `disable g.t`): the call recursed until the stack overflowed and the
+  read gave the nested block's value. An interface or module instance of a
+  generate block can be a value or path head in the block (a virtual interface
+  handed to a class, `u.a[i].f = ...`), where it was undeclared, and `-> ev`
+  in a method of a class declared in the block fires the class's own event
+  (§23.6, §23.9, §25.9, §15.5.1, core #184 / #989, contributed by philipaxer).
+
+* A generate loop's genvar reads its iteration's value in properties,
+  sequences, covergroup bins, gate terminals, formal defaults, typedefs and
+  the other items of the loop body; a formal, local, class member or property
+  formal of the same name hides it (§27.4, §13.5, §8.3, §16.8, core #185 /
+  #990, contributed by philipaxer).
+
+* `disable lab.sub` of another process's block, from inside a nested `begin
+  ... end`, stops that block and lets the nested block go on; it ended the
+  disabling block too. `disable l[1].lab.sub` stops that iteration's block,
+  not the first `sub` found (§9.6.2, #952).
+
+* An unpacked array of unpacked structs declared in a generate block stores
+  its elements member-wise (`g.q[2].f` read x), and `%p` prints an element or
+  nested member of a generate block's variable (`q[2]`, `o.in`, `l[1].t[1]`)
+  from its declared type (§7.2, §21.2.1.7, §27, #952).
+
+* An assignment pattern written to a row of a multi-dimensional unpacked array
+  assigns each element of the row, in a blocking store and in a continuous
+  assignment: `c[0] = '{V, V}` on `logic [39:0] c [2][2]` and `assign c[0] =
+  '{a, b};` left the row x. Rows of struct elements are spread too (§10.9.1,
+  §10.10, §7.6, §10.3, #999, contributed by chuanseng-ng).
+
+* A nonblocking store, a continuous assignment or a delayed nonblocking store
+  to a packed struct element of an unpacked array writes the whole struct:
+  `b[0][1] <= v` on `le_t [1:0] b [2]` kept one bit, and a row of two structs
+  kept two (§7.4.1, §7.4.5, §10.4.2, §10.3, #997, contributed by
+  chuanseng-ng).
+
+* A packed element selected inside an unpacked array's element reads right in
+  compiled code: `d[1][0]` on `logic [1:0][7:0] d [2]` is the low byte of
+  `d[1]`, for queues, dynamic arrays, run-time indices and arrays of packed
+  structs. It read `0X` or one bit. A three-dimensional array element at
+  run-time indices read `000X`, and an x or z literal index read element 0
+  instead of x (§7.4.1, §7.4.5, §11.5.1, #985, contributed by chuanseng-ng).
+
+* `always_comb` and `always @*` follow a whole read of an unpacked struct that
+  is a continuous copy of another (`assign q = p; always_comb c = q;`), of an
+  element of an unpacked struct array (`c = pa[0]`) and of the whole array;
+  they missed every change after time zero (§9.2.2.2, §9.4.2.2, §7.2, #991,
+  contributed by ds54e).
+
+* A store to an element of a multi-dimensional packed member of a struct array
+  element (`sa[1].f0[3][7] = v`) was dropped, a nonblocking one kept one bit,
+  and the same select in compiled code took one bit (§7.4.1, §7.2, §10.4.2,
+  #984).
+
+* An assignment pattern on a whole multi-dimensional unpacked array whose
+  element is a multi-dimensional packed type assigns every element: `n =
+  '{default: 80'h0}` on `logic [1:0][39:0] n [2][2]`, the same declaration
+  initializer, and positional, keyed, nested and nonblocking patterns left
+  every element x (§10.9.1, §7.4, §6.8, #1013, contributed by chuanseng-ng).
+
+* Header parameters and ports hide wildcard-imported names throughout the
+  module body; package functions and classes retain their own parameter values
+  (§26.3, #995, reported by ds54e).
+* Finite zero-delay phases stay in their timestamp through deferred events,
+  mailboxes, semaphores and edge relays. Stall checks include local data and
+  suspended loop control, while explicit limits retain their strict behavior
+  (§4.4, #996, reported by Ganesh-TNL, contributed by Thomasb81).
+* Collection call results and concatenations bind element by element to fixed
+  array and queue formals, with per-call storage, reference aliases and staged
+  output writeback. Handle members, package arrays and class-scoped associative
+  queue elements preserve their collection contents (§10.10, §13.5,
+  #1001, #1004, #1006, #1008, #1018, #1028, reported by Ganesh-TNL and
+  auty1395, contributed by auty1395).
+* Unpacked struct concatenations retain nested members, strings, real values
+  and collection fields, including when the destination also appears in the
+  concatenation (§10.10, #1035, reported by auty1395).
+* Chained packed typedef indices retain their declared dimensions in compiled
+  locals and members of selected unpacked-array elements (§7.4.1, #1002,
+  reported by Ganesh-TNL).
+* Whole multidimensional unpacked-array patterns spread across packed-array
+  elements. Loaded artifacts retain parameter-keyed patterns and lexical struct
+  widths, and prepared continuous assignments retain falling and turn-off delays
+  (§10.9.1, §20.6.2, §10.3.3, #1013, #1014, #1015, #1016, reported by
+  chuanseng-ng and ds54e, contributed by chuanseng-ng).
+* Randomization preserves class typedef and specialization handles, solves
+  sub-object back references jointly, and draws rand members of dynamic unpacked
+  struct arrays. Concatenated `$countones` operands and inline caller-scope
+  `foreach` constraints participate in the solve (§18.4, §18.5.9, §18.7,
+  §20.9, #1010, #1020, #1022, #1024, #1030, #1034, reported and contributed
+  by auty1395).
+* Covergroups sample implicit cross operands in their owning instance's scope
+  (§19.6, #1026, reported and contributed by auty1395).
+* Clocking output edge skews drive on the declared edge. Aliases keep their
+  clockvar identity and distinct pending drives survive checkpoint restart
+  (§14.3, §14.16.2, #1032, core #186, reported and contributed by auty1395).
+
+* Sparse integral constraints propagate through packed concatenations, squares,
+  constant division and remainders, split packed fields and wide arithmetic.
+  Wide array reductions and arrays beyond 8,192 elements join the solve, and
+  indexed record fields retain their own dependencies (§18.5, §11.4.3,
+  #1003, reported by Ganesh-TNL).
+
+
+* Nested generate labels resolve within the declaring block and instance,
+  including child functions and indexed generate arrays after cache or artifact
+  reloads (§23.6, §23.8, §27.6, core #187 / #188, reported and contributed by
+  chuanseng-ng).
+* An inlined function hides its caller's loop constants while executing its
+  body, then restores the caller's bindings before copying output arguments
+  back to local variables or indexed destinations. Nested returns resume the
+  innermost caller before output writeback (§13.4, §13.5.3, #1041 / #1042,
+  reported and contributed by chuanseng-ng).
+* Explicit static locals of automatic tasks and void functions retain shared
+  state across clocked calls, nested blocks and conditional updates. Automatic
+  and write-first locals keep their ordinary behavior (§6.21, #1049).
+* `$dumpflush` waits until the threaded VCD writer has flushed preceding
+  records, so another reader can see them during simulation (§21.7.1.6,
+  #1047 / #1048, core #189, reported and contributed by ds54e).
+* Closing stdout or stderr early preserves the run's exit status and waveform,
+  including library and core diagnostics for runtime failures (§20.10, #1037 /
+  #1038, reported and contributed by chuanseng-ng).
+* Method formals written without a type keyword (`input [W-1:0] v`) keep
+  their declared width, including class specializations, defaults and narrow
+  expression actuals. Compiled results retain their specialized width, and
+  packed-formal `foreach` loops use the bound width
+  (§13.5.1, §11.8.2, §12.7.3, #1044, reported by Ganesh-TNL).
+* Assignment patterns write unpacked-array slices in declared order, including
+  dynamic arrays and class properties. Each item takes the element type, and
+  all source values are read before the selected elements are overwritten
+  (§7.4.5, §10.9.1, #1045, reported by Ganesh-TNL).
+
+* Nets inside module instances resolve their drivers as top-level nets do: a
+  drive strength on a continuous assignment or a net declaration assignment is
+  kept, `%v` reports it, and several bit or part-select drivers of the same
+  bits are all resolved (§6.5, §6.7, §10.3.4, §28.12, #1062 / #1063, reported
+  by philipaxer, contributed by Thomasb81).
+
+* An unsized `'0`, `'1`, `'x` or `'z` fills every bit of a net resolved by
+  strength, as a weak or pull driver and as the released value of a strong
+  one, on nets wider than 64 bits too (§5.7.1, §28.12, #1061, reported by
+  philipaxer, contributed by Thomasb81).
+
+* A tri0, tri1 or supply port merges with the net connected to it: the net
+  outside pulls as the port does, with or without a driver, also on a bit or
+  part select, across an instance array and when the net has the port's name.
+  A tri0 or tri1 net driven only through selects pulls the bits they release
+  (§6.6.5, §23.3.3.7, #1060, reported by philipaxer, contributed by
+  Thomasb81).
+
+* An `interconnect` array takes the types of the ports bound to its elements,
+  so a `real` nettype element carries its value, and an interconnect bound to
+  a struct nettype port, whole or as an array element, keeps the struct's
+  members (§6.6.7, §6.6.8, §23.3.3.7.1, #1039 / #1040, reported by ds54e,
+  contributed by Thomasb81).
+
+* A `disable`, `break` or `continue` run in a `forever` body before the body's
+  delay ends the iteration there. `disable` of a process's own top-level
+  block, an `always` body or a named `forever` body stops that block, and `%m`
+  in such a body names it (§9.6.2, §12.8, #1068, reported and contributed by
+  chuanseng-ng).
+
+* Each driver of a net applies its own rise, fall and turn-off delays before
+  the net resolves them. A primitive's fall delay used to delay the whole net,
+  so `buf #(1,5) g(w,a); assign #(1,1) w=a;` read 1 where the drivers
+  disagreed (§28.16, §28.12, #1065, contributed by ds54e).
+
+* Delayed tristate and MOS primitives that share a net are resolved with the
+  net's other drivers; the net read as the last such primitive alone,
+  undelayed. A primitive with a zero rise delay (`buf #(0,5)`) falls after its
+  fall delay (§28.6, §28.7, §28.16, #1065).
+
+* A UDP output that shares its net with a continuous assignment or another UDP
+  is one driver of the resolved net; the last writer used to win (§29.3,
+  §28.12).
+
+* A whole-variable nonblocking assignment after a partial one to the same
+  variable in the same time step wins: `bus.vld <= 1'b0; bus <= PKT;` in a
+  task, initial block or class method left `vld` at 0. This covered struct
+  members, bit-, part- and indexed part-selects, concatenations, and
+  interface, package, generate, submodule and virtual-interface targets. A
+  queued partial update also keeps a blocking write to the variable's other
+  bits (§4.6, §10.4.2, #1050, reported and contributed by Ganesh-TNL).
+
+* A nonblocking assignment to a class property is sized by its declared type.
+  Through a handle or the class name, a property wider than 32 bits kept only
+  its low 32 bits, a `real` one (also through a type parameter) took an
+  integer, a `super.` one was dropped, and one sharing a module signal's name
+  wrote that signal (§10.4.2, §8.5, §6.12, #1050, reported and contributed by
+  Ganesh-TNL).
+
+* A reference through an interface modport (`ci.drv.bus_a`) names the
+  instance's own variable; writes went to a copy that reads did not see
+  (§25.5, #1050, reported and contributed by Ganesh-TNL).
+
+* A member of a packed-struct static class property (`C::sp.vld`, `h.sp.addr`,
+  `sp.hdr.tag` inside the class) reads the static's value; it read 0 (§8.9,
+  §7.2.1, #1050, reported and contributed by Ganesh-TNL).
+
+* `wait fork` no longer waits for a grandchild whose parent finished before
+  it, including in DPI-exported tasks; `disable fork` and `kill()` still
+  terminate it (§9.6.1, §9.6.3, §9.7, #1072, reported and contributed by
+  chuanseng-ng).
+
+* A packed array or packed struct compared with a bare assignment pattern (`a
+  == '{2,2,2,2}`, `ps != '{lo:1, default:2}`) takes the pattern in the
+  operand's type and compares the two packed values bit for bit, from every
+  declaration form: a variable, a packed member or element of an unpacked
+  aggregate, a class property (also through implicit `this`), a function
+  result or formal, a plain vector, a parenthesized operand, a continuous
+  assignment and a concurrent assertion. The pattern was concatenated at its
+  items' 32-bit widths, so the comparison always reported unequal (§10.8,
+  §10.9, §11.4.5, §11.4.6, #1043, reported by Ganesh-TNL, contributed by
+  Thomasb81).
+
+* `===` and `!==` on unpacked arrays, queues, dynamic and associative arrays
+  and unpacked structs compare the elements' 4-state bits; they answered
+  "exactly equal" for any two same-shaped arrays (and "not equal" for
+  associative arrays). `==?`/`!=?` compare unpacked arrays and structs
+  element-wise, and `==`/`!=` compare module-level associative arrays by
+  content (§11.4.5, §11.4.6, §7.8, #1043, reported by Ganesh-TNL, contributed
+  by Thomasb81).
+
+* `==` and `!=` on unpacked arrays and structs are x when x or z elements
+  leave the relation open, and a differing element decides wherever it sits;
+  both answered 0, and an element differing after an x one was ignored
+  (§11.4.5, #1043, reported by Ganesh-TNL).
+
+* An element select of a packed-array member of a packed struct reached
+  through a class property (`h.frame.lanes[0]`, `frame.lanes[0]` in a method,
+  `arr[i].lanes[0]` of an array property) reads and writes the element;
+  indexed and constant part-selects (`lanes[0 +: 2]`, `lanes[1:2]`) address
+  lanes, not bits; `super.frame.lanes[0] = v`, `foreach (frame.lanes[k])` and
+  an ascending inner member (`g.pairs[0].pair[0]`) select the declared
+  element. The select read one bit and a write through a typedef-typed member
+  hit the wrong bits (§7.2.1, §7.4.1, §11.5.1, §12.7.3, #1046, reported by
+  Ganesh-TNL, contributed by Thomasb81).
+
+* An explicit import of a package nettype (`import p::N; N w;`, in a module
+  body, a module header or at compilation-unit scope) declares nets of that
+  nettype; elaboration stopped with "Symbol 'N' not found in package 'p'". The
+  resolver named after `with` is the package's function, even where the
+  importing module declares a function of the same name, a typedef or nettype
+  of the same name in another package no longer takes the imported nettype's
+  place, and a nettype that two wildcard-imported packages declare is an error
+  where it is used (§26.3, §6.6.7, #1083, contributed by ds54e).
+
+* A delayed continuous assignment to a vector net takes the rise delay when
+  its value changes to x or to a partly-z value, as for any change other than
+  one to 0 (fall) or to z (turn-off): `assign #(4,2) w = x;` changed `w` after
+  the smallest delay, the gate rule §10.3.3 keeps for a scalar target. This
+  covers net declaration assignments, `[0:0]` vectors, packed-struct nets and
+  a select another driver overlaps (§10.3.3, §28.16, #1076, contributed by
+  ds54e). A whole vector variable follows the same rules, and an assignment to
+  a part-select or bit-select that no other driver overlaps, and a primitive
+  whose output is a bit-select (`and #(4,2) g(w[2], a, b);`), apply their fall
+  and turn-off delays; they took the rise delay for every change. Disjoint
+  select drivers of one net that change in the same step keep their own
+  delays: `assign #2 d[3:0] = a; assign #5 d[7:4] = b;` changed both halves
+  after 2 (§10.3.3, §28.16, #1076).
+
+* A warm `--cache-dir` run starts continuously driven nets at x before their
+  drivers' first update, as an uncached run does; with the prepared tables
+  from the cache they started at z, so `assign #2 w = a;` read z at t1 and a
+  zero-delay loop read z for the whole run (§6.7.1, #1079, contributed by
+  ds54e).
+
+* A continuous assignment of a structure pattern gives an unpacked array
+  member every element its nested pattern sets by `default:`, by index key (a
+  parameter name too), by type key or by replication (`assign v = '{tag: x, a:
+  '{default: x}};`), and a structure-level `default:` or type key reaches the
+  members and elements of nested arrays and structures, through a child
+  module's output port and on nets of a user nettype with or without a
+  resolver. The array member read 0, or x on a nettype net, and a replication
+  set only its first element (§10.9.1, §10.9.2, #1081, reported by ds54e).
+
+* A `defparam` cannot set a parameter that cannot be overridden, wherever the
+  child is defined: a body `parameter` of a module that has a parameter port
+  list, a `localparam`, a type parameter, or a parameter of one of the child's
+  generate blocks. With the child in another file, the value was applied or
+  dropped without a message (§23.10.1, §6.20.1, §6.20.3, core #199,
+  contributed by chuanseng-ng).
+
+* A `defparam` written in a generate block reaches that block's instances. It
+  was dropped, so `u.A` kept its default (§23.10.1, §27).
+
+* A bind directive with several instances (`bind t c #(3) a(), b();`) binds
+  each of them, also in the colon form and into an instance path. A bound
+  array of instances builds its elements, and a bind directive the parser
+  cannot read is an error (§23.11, §23.3.2, core #200, contributed by
+  chuanseng-ng).
+
+* A module can name an instance that a compilation-unit `bind` adds to it
+  (`a.y`), from its own processes and from below through an upward name.
+  Another top cannot (§23.11, §23.8, core #201, contributed by chuanseng-ng).
+
+* A variable declared through a type parameter has the members of the type the
+  parameter is bound to. This covers class-method locals and formals of every
+  kind, collections, class typedefs of `T`, structs with `T` members, static
+  properties, static methods called through a handle, and module, interface
+  and program subroutine locals. Member reads returned 0 while the whole value
+  was right. A store into an element of a packed-struct or packed-union array
+  local is fitted to the element's width: `a[0] = '0;` kept one bit, so later
+  member writes read x (§6.20.3, §8.25, §7.2, §10.7, #1082, reported by
+  Ganesh-TNL).
+
+* A later ANSI port that omits its direction, port kind and data type takes
+  all three from the port before it; a port that gives any of them takes only
+  the direction. In `input logic [7:0] d, input clk, rst_n` the port `rst_n`
+  is one bit. A list opened by a port kind or packed dimensions now parses as
+  ANSI (§23.2.2.3, #1078, reported by ds54e).
+
+* The equality operators compare parenthesized unpacked arrays and structs
+  element by element (member by member): `(a) === (b)` was 1 for two different
+  arrays and `(a) == (b)` x, so a UVM `compare()`, whose comparer macros write
+  `(LVALUE) !== (RVALUE)`, reported differing `uvm_field_array_*` and
+  `uvm_field_sarray_*` fields equal. A call returning a fixed-size, dynamic
+  array or queue compares its returned elements too (`f() == g` was x)
+  (§11.3.2, §11.4.5, §13.4.1, #1085, reported by philipaxer).
+
+* An unpacked array of unpacked structs copies member by member between
+  differently shaped arrays: fixed-size to dynamic or queue and back,
+  variables and class properties (`da = fx` in a method, `g = h.fx`), and out
+  of a function, also a local queue or dynamic array of structs. The copy had
+  the right length and default members, or was empty. A member written from a
+  variable into an element of a subroutine's local dynamic array of structs
+  (`d[i].a = s[i].a`) was taken for the whole struct and lost (§7.6, §7.2,
+  §13.4.1, #1057, reported by Ganesh-TNL).
+
+* `sort()` and `rsort()` with `with (item.<member>)` order a queue of packed
+  structs by the member: the members were unbound, every key read 0 and the
+  queue kept its order. `sort`, `rsort`, `min`, `max` and `unique` compare
+  elements and keys at their full width and as their type does: a value wider
+  than 64 bits was cut to its low word, a signed `int` sorted as unsigned
+  (`'{0, 5, 7, -10, -3}`) and a `real` by its bit pattern. A signed packed
+  member read in a `with` clause is signed, and a pattern pushed into a queue
+  of packed structs (`q.push_back('{k, v})`) takes the element type (§7.12.1,
+  §7.12.2, §7.12.3, §10.9, #1059, reported by Ganesh-TNL).
+
+* A call returning an unpacked array, used as a whole operand of `inside`,
+  `case ... inside`, `%p`, `$size` or an unpacked array concatenation, reads
+  the elements it returns and runs once: `v inside {f()}` compared `v` with 0,
+  `%p` printed 0 and a constraint `x inside {f()}` drew 0. A bare call in a
+  class method (bound to the class first), `this.f()`, `pkg::f()`, `C::f()`
+  and a method known by its `extern` or `pure virtual` prototype are
+  recognized as returning an array, also for `size()`. An associative array
+  variable in an `inside` set contributes its elements (§11.4.13, §21.2.1.7,
+  §13.4.1, §18.5.11, #1036, reported by git-hevangel).
+
+* `$urandom(seed)` reads its seed and never writes the generated value back
+  into it, whatever the argument's storage or context (a `for` loop over a
+  seeded index ran once). The seed now initializes the calling thread's
+  generator: the calls without a seed that follow repeat for the same seed,
+  and other threads are untouched. A seeded call returns the same value as
+  before (§18.13.1, §18.14.2, #1058, reported by Ganesh-TNL).
+
+* A property a subclass redeclares hides the base property only in code
+  written in the subclass. Base-class methods (`f.add()`, `f.n++`), base-type
+  handles at any link of a chain (`b.f.tag`, `b.f.n = 50`, `b.f.add()`) and
+  `super.f` keep the base's property, also when one of the two is static. A
+  sequencer that declared its own `m_req_fifo` took the requests, and the
+  driver waited in `get_next_item` forever (§8.14, §8.15, #1064, reported by
+  philipaxer).
+
+* A member write to a packed-struct static class property (`Cls::sp.m = v`)
+  updates the shared cell, and an element select of its packed-array member
+  (`Cls::sp.lanes[0]`, `sp.lanes[1]` in a method) slices it. The write went to
+  a stray copy that only module-scope reads saw (§8.9, §7.2.1, §7.4.1, #1046,
+  reported by Ganesh-TNL).
+
+* `$root.top.u.s.m` reads like `top.u.s.m`, and `top.u.s.lanes[i]` selects the
+  element; both read x or a single bit. In a module instance, including every
+  top of a multi-top design, `s.pairs[1].pair[0]` and an unpacked struct's
+  `us.lanes[0]` select whole elements in declared order (§23.6, §7.2.1,
+  §7.4.1, #1046, reported by Ganesh-TNL).
+
+* A member of an element of an ascending packed array of packed structs inside
+  a struct (`b.slots[0].dir` on `hdr_t [0:2] slots`) reads the right element
+  in continuous assignments, `always_comb` and functions, through ports and in
+  instances; `slots[0]` read x and `slots[2]` read element 0 (§7.4.1, §7.2.1,
+  #1088, reported by Ganesh-TNL).
+
+* `push_back`, `push_front` and `insert` on a queue of queues or of dynamic
+  arrays store a concatenation (`{1, 2}`, `{tmp, 3}`) or an assignment pattern
+  (`'{3, 4, 5}`, `'{3{7}}`) as the new row; the row was empty, or had one
+  element for a class property or task local (§7.10.2.2, §10.10, #1086,
+  contributed by chuanseng-ng).
+
+* Real math functions in constant expressions, including logarithms,
+  trigonometric functions and nested real/bit conversions, produce their
+  real results at elaboration. `$rtoi` can use those results in dimensions,
+  and parameter substitutions in subroutine signatures preserve the declared
+  width and signedness. Recompile saved designs made with an earlier build
+  (§11.2.1, §20.5, §20.8.2, #1089, reported by ds54e).
+
+* Continuous assignments passing an unpacked struct array to a function
+  reevaluate when an element's member changes, including nested members and
+  instance-scoped arrays; the result previously retained its old value
+  (§10.3.2, §7.2, #1090, reported by ds54e).
+
+* A scope randomize call without the `std::` prefix outside a class,
+  `randomize(x)` or `randomize(x) with { x == 9; }`, solves its variables as
+  `std::randomize` does; it returned 0 and left them unchanged (§18.12,
+  #1105).
+
+* A `release` of a forced net run from an `always` block returns the net to
+  a driver that reads no signal (`wire w = 4'h5;`, `assign w = 4'h6;`); the
+  net kept the forced value, so such nets stayed `'x` after a UPF power-up
+  (§10.6.2, #1121).
+  Re-evaluating the driver also preserves the releasing procedure's `%m`.
+* Restoring a checkpoint preserves the complete continuation of a process
+  that forked before the save; omitted continuation-cache entries could
+  misnumber shared statement lists (Annex D.9, §9.3.2, #1115).
+* Deleting an associative-array element of unpacked struct type removes its
+  member cells even after an assignment-pattern store. Residual members made
+  `num()` and `exists()` report deleted entries (§7.9.2, #1124).
+* UPF root-scope element paths resolve without a leading dot, so root power
+  domains corrupt and release their connected child outputs (core #206).
+
+**Performance**
+
+* Deferred instance type contexts share exact-equal type, width and array-query
+  maps, including the thread-local snapshots used during materialization.
+  A synthetic 2,048-instance design with 64 type parameters peaks at 269 MiB
+  instead of 449 MiB; different widths and bounds remain independent
+  (§6.20.3, §20.7, #721).
+
+* Unused compilation-unit properties and sequences remain on one root for
+  validation instead of being copied into every unrelated module definition.
+  A synthetic case with 1,024 unused modules and four 512-term properties
+  peaks at 35 MiB instead of 1,141 MiB (§3.12.1, §16.8, §16.12, #721).
+
+* Edge-dispatch plans execute serially by default
+  (`XEZIM_PARALLEL_SERIALIZE=1`). Set it to `0` to allow worker threads
+  when the parallel dispatcher qualifies.
+
+* Callable locals with literal or name-free dimensions stay shared during
+  elaboration, avoiding copies for unrelated parameters (§6.20.2, #721).
+
+* Preparing parameterized modules preserves shared function/task bodies when
+  local declarations need no dimension or type folding. The public core #192
+  reproducer's peak requested heap falls from 150.3 MB to 9.7 MB; genuinely
+  instance-specific rewritten bodies still retain their own storage (§13.3,
+  §13.4, #721).
+
+* The class collector also runs when the name-keyed store has grown by 100,000
+  values, so objects with large array members are reclaimed before 20,000 of
+  them exist: 16,384 objects with a 256-byte array peak at 156 MB instead of
+  1.5 GB (§8.7, #1054, contributed by Thomasb81).
+
+* The command line simulates on the large-stack worker it already runs on
+  instead of reserving a second stack; a run under a 4 GiB address-space limit
+  no longer fails at the default stack size (#1055, contributed by Thomasb81).
+
+* An instance's initial block is materialized when its process starts, not at
+  setup: 512 instances of a 512-statement block take 47 MB instead of 349 MB
+  after scheduling, and 4 ms instead of 254 ms (§9.2.1, #1056, contributed by
+  Thomasb81).
+
+* The reference census of dotted names is released when the last compilation
+  session ends (xezim-core #191, contributed by Thomasb81).
+
+* A constant-function call during elaboration (a generate condition, a
+  dimension or a parameter that calls a package function) shares the design's
+  typedef tables instead of copying them on every call, and copies of an
+  elaboration share its typedef table until one of them is written. 64
+  generate conditions calling a package function beside 256 packed-struct
+  typedefs take 0.89 G instructions instead of 4.67 G, 256 calls beside 1,024
+  typedefs 3.6 G instead of 63.8 G, and 2,048 typedefs peak at 373 MB instead
+  of 484 MB (§13.4.3, #721, reported by amal-khailtash).
+
+* Finished fork children release origin and scope metadata after their last
+  reader, while retained process handles, diagnostics, callbacks and
+  checkpoint restoration retain the state they need (§9.3.2, §9.7, #1118).
+* Repeated module and interface task calls share immutable continuation bodies
+  for forks and nested blocks with timing controls. Each invocation retains
+  its own arguments and locals; checkpoint designs keep the serialization
+  path. The startup checkpoint scan visits shared source once and skips
+  runtime value tables (§9.3, §13.3, #1127).
+
+* Checkpoints omit the derived class-property owner index and rebuild it
+  from restored shared class definitions. Serializing this cache copied each
+  declaring class once per property and greatly inflated restored memory
+  (Annex D.9, §8.3, #1116).
+
+**Build**
+
+* Building from source requires Rust 1.100 or newer. The simulator, core and
+  parser share this minimum supported Rust version, checked directly in CI
+  for default and optional native-backend builds.
+
+* Native C/C++ dependencies, DPI libraries and build shims default to Clang
+  and LLVM archive tools. Linux x86_64 Rust builds link through Clang and
+  Rust's bundled LLD. Local core overrides now live in the ignored
+  `.cargo/local-core.toml`, preserving the tracked compiler configuration.
+
+### 0.11.5 — generate-block scopes, checkpoints, class and randomization correctness (November 2026)
+
+**Command line**
+
+* `--relax-library-packages` (`XEZIM_RELAX_LIBRARY_PACKAGES=1`) compiles the
+  packages a `-v` library file declares, as if the file were also a source
+  file; by default a library file supplies only modules, interfaces,
+  programs and primitives (#937, requested by Ganesh-TNL). A package a
+  source file declares wins.
+* Checkpoints: `--save-at <time>[,<file>]` saves the state at the end of a
+  time slot and `--restore <file>` continues from it, and `$save`,
+  `$incsave` and `$restart` do the same from the design (IEEE 1800 Annex D,
+  #738). A restored run prints what the uninterrupted run prints after the
+  saved slot; open files are reopened at their positions, plusargs come from
+  the restoring command line, and a checkpoint of another design or xezim
+  build is refused. The interpreter, `XEZIM_JIT` and `XEZIM_AOT` may differ
+  between the two runs. Not yet restored: a process forked to call a task
+  while it is still inside the task, which is refused with an error.
+  `XEZIM_CKPT_AUDIT` lists the fields a run changes after setup.
+* On the command line, `-svseed <n>`, `-seed <n>`, `-svseed=<n>` and
+  `-seed=<n>` seed the run, as they did in args files; they were read as a
+  glued `-s<top>`. `-sv_seed=<n>` is accepted in both places. A run given a
+  seed prints `[xezim] seed: <n>` on stdout, so the output and the `-l` log
+  name it, and `+seed=random` prints the seed it drew there too instead of
+  on stderr. `-top <module>` is `-s <module>`, on the command line and in
+  args files.
+
+**Correctness**
+
+* A generate block is a scope of its own. Each definition gets a scope tree
+  and a binder that resolves every simple name, and the generate rename
+  follows that binding:
+  - an unlabelled block keeps its data under `genblk<n>` (§27.5, §27.6);
+  - a bare upward subroutine call resolves through the instance tree
+    (§23.8.1);
+  - a `disable` names its block by path (§9.6.2);
+  - a block's typedefs are the block's (§6.18);
+  - an undeclared bare name inside an instance is an error, as it is at the
+    top level (§6.10, §23.9).
+
+  (#952, contributed by philipaxer)
+* A generate block's tasks, functions and processes take their time scope and
+  clocking blocks from their instance (§3.14.2.1, §14.3, contributed by
+  philipaxer).
+* A task or void function with no written lifetime is static on the compiled
+  tier too, so a local or output formal that carries a value keeps it between
+  calls from a clocked process (§6.21, §13.3.1, #970, contributed by
+  philipaxer). A subroutine whose variables are all written before they are
+  read stays inlined.
+* An implicit net created inside a sub-module counts as declared for a later
+  initializer in that module (§6.10, #982, #983, contributed by davekeeshan).
+  An implicit net of one module no longer declares the same name in an
+  unrelated one. An implicit net used in a generate block belongs to that
+  block: each loop iteration has its own, and `g[0].n` reaches it.
+* Array queries and `$bits` over a generate-block variable are answered from
+  its declared shape, also from outside the block (`$size(g[0].arr)`)
+  (§20.6.2, §20.7, xezim-core#178, xezim-core#179, contributed by
+  chuanseng-ng).
+* A comparison between two elements of a class-member array in a compiled
+  method (`base[i] < base[j] + len[j]`) evaluates at the elements' declared
+  width; it used only their lowest bit (§11.6.1, #977, #980, contributed by
+  shabbarvejlani).
+* A `foreach` modulo equality on array elements (`(base[i] % sz[i]) == 0`)
+  is solved by drawing the element from its congruence class, within the
+  element's `<`, `<=`, `>` and `>=` bounds. `randomize()` used to report no
+  solution (§18.5.8.1, #976, #979, contributed by shabbarvejlani).
+* A bit, part or element select written to a class property lands. This
+  covers properties declared through a typedef or an enum, and `int`,
+  `byte`, `shortint` and packed struct or union properties; the write was
+  dropped (§7.4.1, §6.11, #972, #973, contributed by davekeeshan).
+* A select past an associative array's dimensions selects into the element
+  (`a[k][3]`, `p[k][1]`, `p[k][3:2]`), and elements of multi-dimensional,
+  offset and ascending packed types are stored whole (§7.8, §7.4.1, §11.5.1,
+  #956, #958, #957, #959, contributed by chuanseng-ng).
+* A static method called through a handle runs on the handle's declared class
+  and specialization (§8.23, §8.25, #953, #954, contributed by davekeeshan).
+  This holds through a null handle and in compiled code, where it returned 0,
+  and through a base-typed handle to a derived object, where it ran the
+  derived class's method.
+* `@(posedge x)`, `@(negedge x)` and `@(edge x)` on a class property or a
+  procedural local wait for the transition; they returned at once (§9.4.2,
+  #950, #951, contributed by davekeeshan). The edges follow Table 9-2 on the
+  LSB, and `or` lists and `iff` guards over class properties wait for their
+  own transitions.
+* VPI handles to an unlabelled generate block's variables read the block's
+  own value (§27.6, §37).
+* A typedef that depends on the genvar of a generate-for block inside an
+  instance has each iteration's width (§6.18, §27.4).
+* `$unit::x` in a generate block that declares `x` reads the compilation
+  unit's `x` (§3.12.1).
+* Regression suites for base-class properties shadowed by a derived class's
+  parameter or static (§8.14, #944, #960, contributed by Thomasb81).
+* A class property that a derived class redeclares as a `localparam`,
+  `parameter`, `static` property or typedef resolves in the scope of the
+  reference (§8.14, §8.23, #944, reported by Ganesh-TNL). This covers
+  `this.x`, bare `x`, compound, select and nonblocking writes in base
+  methods, base-typed handles (package-qualified ones included), collection
+  elements, static handles and member chains, base-class constraint blocks
+  and inline `randomize() with` blocks. Writes went to the derived class's
+  static or constant.
+* A `foreach` over a packed array of packed structs, or over another
+  multi-dimensional packed class property, covers every element: in a
+  constraint `foreach (c[i]) c[i].valid == 1'b1` is solved and checked, and
+  a procedural loop runs once per element instead of once (§7.4.1,
+  §18.5.8.1, #928, reported by Ganesh-TNL).
+* Live frames of different processes that declare a local of the same name
+  each keep their own type, and switching between them no longer rescans the
+  module's struct and packed-layout tables; the reporter's matrix drops from
+  78 s to under a second. A fork child's block local named like a variable
+  of its parent keeps its own value (§6.21, §9.3.2, #943, reported by
+  Ganesh-TNL).
+* An ascending packed array of a multi-bit typedef (`u8_t [0:7]`) declared as
+  a non-ANSI port keeps its element order; it was mirrored across the port.
+  A module-local typedef no longer sizes such a port at 32 bits per element,
+  packed struct-array ports get their shape, and a module-local
+  unpacked-array typedef keeps its dimensions in a submodule (§7.4.1,
+  §23.2.2.1, #942, reported by Ganesh-TNL). A function local or formal with
+  an ascending outer packed dimension no longer comes back element-reversed
+  from a continuous assignment or `always_comb`.
+* A compiled read of a module-scope queue or dynamic-array element at index
+  64 or above read x, so a `for` loop `t += q[i]` over 65 elements summed to
+  0, and a read past `size()` returned a stale element (§7.5, §7.10). Such
+  reads now use the live collection.
+* `s += x` on a 2-state local inside a `foreach` of a compiled function kept
+  `s` at x (§6.11.1). `d[i] = new[n](d[i])` keeps the row's elements
+  (§7.5.1), and `$size` and the other array queries of a class member's
+  dynamic array of fixed rows, and `$bits` of a module-scope row, count the
+  row (§20.6.2, §20.7).
+* In a design with more than one top-level module, a `$unit` nettype's
+  resolution function runs; the net read one driver alone. Two drivers of a
+  nettype without a resolution function, through ports or from a child and
+  its parent, are an error, as §6.6.7 requires.
+* A read of a queue or dynamic-array element at or past `size()` gives the
+  element type's default (x, 0, null or "") instead of the element a
+  `delete`, `pop_front` or `pop_back` left behind (§7.10.1, §7.8.6, #949 and
+  #948, contributed by davekeeshan). This includes a row of a fixed array of
+  queues, `fq[1][3]`, and a queue of class handles, which reads null.
+* A package array whose first dimension is sized by a parameter,
+  `logic [31:0] d [N][2]`, keeps all its dimensions (§7.4.2, §26.2, core #169
+  and #168, contributed by chuanseng-ng); `p::d[3][1]` read 0.
+* A user-defined nettype without a resolution function takes an
+  assignment-pattern driver through an output or inout port (§6.6.7, core
+  #170, #945 and #946, contributed by ds54e); the parent net read 0 in every
+  member. A continuous assignment that selects into such a net,
+  `assign p.V = v;`, is now an error (§10.3).
+* A name declared nowhere in the design is an error in a class parameter
+  override, nested ones included (`R #(A #(bad))`), in a class
+  value-parameter default and in a class property or package variable
+  initializer (§6.20.2, §8.25, #947 and #888, contributed by Ganesh-TNL).
+  Literals and system calls in a nested override, such as `8'hFF`,
+  `$clog2(16)` and `10ns`, are not taken for names.
+* A whole-struct write through a port reaches an instance-array element
+  actual and a nested struct member actual member by member (§23.3.3.5,
+  §7.2, core #166 and #917, contributed by ds54e); the parent read every
+  member as 0.
+* A nonblocking assignment to a row of a multi-dimensional unpacked array,
+  `q[1] <= x`, updates every element of the row (§10.4.2, §7.6, #906,
+  contributed by auty1395).
+* A class specialized by a parameterized virtual interface, `res#(virtual
+  mon_if)`, is the same type under each spelling, and `$cast` to it succeeds
+  (§8.25, §25.9, #908, contributed by auty1395).
+* A class-typedef formal of a 2-state type is 2-state, and a function-name
+  return variable has the declared width before the method compiles
+  (§6.11.2, §13.4.1, §8.25, #910, contributed by auty1395).
+* `C::q` and `D::q` of a static queue copy the queue in a whole-array
+  assignment, also through a subclass (§8.23, §8.9, §7.6, #912, contributed
+  by auty1395).
+* Assigning a struct class property copies its nested struct and queue
+  members (§7.2.2, #914, contributed by auty1395).
+* `unique {a, b}` over rand dynamic arrays, fixed-size arrays and scalars
+  makes every element distinct; `randomize()` failed, or allowed duplicates
+  with a scalar in the list (§18.5.5, #918, contributed by auty1395).
+* A continuous assign that calls a function reading a member of a
+  packed-struct formal is compiled instead of interpreted (§7.2, §13.4,
+  #923, contributed by auty1395).
+* A class queue of unpacked structs keeps its declaration initializer,
+  element by element (§7.10, §10.9, #926, contributed by auty1395).
+* Shift, `/`, `%` and `**` on a property sized by a class parameter give
+  the right result once the method runs compiled (§11.4.10, §11.4.3, #929,
+  contributed by auty1395).
+* A bare identifier used as the key of an array assignment pattern,
+  `'{ CMD_VOUT : v }`, is an index (§10.9.1, #931, contributed by
+  davekeeshan); the item was dropped. A type name as the key is still not
+  supported.
+* A time or real bound of an `inside` range keeps the integers it covers,
+  `x inside {[0:2000ns]}` (§11.4.13, #933, contributed by davekeeshan);
+  `randomize()` failed every trial.
+* A fork child's write of the value a shared automatic held at the fork
+  reaches the parent, whether the child or a sibling changed it before;
+  and a child that only received a sibling's write no longer sends it back
+  over the parent's own later write (§6.21, §9.3.2, #935, contributed by
+  davekeeshan).
+* The dead-clock watchdog fires only when the awaited signal has no live
+  driver, so a control signal held during a slow power-up is not reported
+  (#938, contributed by davekeeshan).
+* `$cast` takes a scoped and a bare spelling of one class or
+  specialization for the same type, a bare `new()` inside a parameterized
+  class keeps the active specialization, a program `initial` process that
+  calls a class task across a delay keeps its context, and a compiled
+  method keeps a real type-parameter return real (§8.16, §8.25, §24.3,
+  #940, contributed by Thomasb81).
+* An instantiated module's `import` of a package the design does not
+  declare is an error at that import (§26.3, #937, reported by Ganesh-TNL).
+  The import was skipped, so a name used from the package was reported as
+  undeclared, or nothing was reported. A package declared in a `-v`/`-y`
+  library file is still not compiled, since a library file supplies only
+  modules, interfaces, programs and primitives; the error now notes where the
+  library file declared it. An error inside a module adopted from a library
+  file names a line of that file instead of a line of a primary file, and
+  `import std::*;` no longer fails with "Package 'std' not found".
+* A function or task declared in a generate block belongs to that block
+  (§23.9, §27.6, #897, reported by philipaxer). A bare call from the block's
+  processes, continuous assigns, other subroutines or nested blocks, and a
+  `disable` of its task, bind to the innermost enclosing block that declares
+  the name, then to the module; a formal shadows same-named block data; a
+  block's task no longer collides with a same-named module task. Two blocks
+  that each declared `look()` both ran the one inserted last, and a
+  generate-for in an instance left its calls on the module's table.
+* A `[N]` array declared in a generate block and sized by a module-level or
+  package parameter is a fixed array (§7.4.2, core #162). It was registered
+  as associative as well, so `foreach` ran zero times and reads gave x.
+* `.*` connects no null port or unnamed port expression of a non-ANSI child,
+  and the missing-connection check no longer reports their placeholders
+  (§23.3.2.4, core #163).
+* An upward hierarchical name is resolved at elaboration to the nearest
+  enclosing scope it names (§23.8, #890, reported by Ganesh-TNL): the module
+  name of an enclosing instance (`node1.req1` in a module bound into an
+  instance of `node1`), a child instance of an enclosing scope, or an
+  enclosing scope's generate label, in continuous assigns, procedural blocks,
+  function bodies, event controls, generate blocks and on the left-hand side
+  of a store. Such a name used to fall back to a same-named signal of the
+  top module. A class collection reached through a handle named by an
+  instance path (`u_n.obj.arr[k]`) reads and stores the object's collection
+  instead of x (§23.6).
+* A real stored into an integral target rounds to the nearest integer, ties
+  away from zero, at the target's declared width on every store path
+  (§6.12.2, #889, reported by Ganesh-TNL): associative-array elements of any
+  key type and nesting, class instance and static properties, including
+  inherited ones and those reached through handle chains or copied from task
+  and constructor formals, struct members of collection elements and package
+  structs, and `ref` formals. `%d`, `%h`, `%o`, `%b` and `%c` of a real
+  argument print the value converted to a 32-bit integer; they printed the
+  real's digits or its IEEE-754 bits.
+* A subroutine local's packed geometry no longer leaks into another
+  subroutine's same-named local (§23.9, #916, reported by Ganesh-TNL). After
+  a function declaring `u8_t [0:7] v` had run, a compiled function with a
+  plain `logic [63:0] v` wrote single bytes through the stale geometry when a
+  statement fell back to the interpreter. A fresh local's registration is
+  removed when its call ends, and compiled code's fallbacks shadow stale
+  bare-name geometry.
+* A class property whose type is a packed struct with packed dimensions
+  written before the declarator, `rand cand_t [0:2] a;`, a
+  `typedef cand_t [0:2] carr_t` or an inline `struct packed {…} [0:2] a`, is
+  a packed array of structs (§7.4.1, §6.20.2, §18.5, #928, reported by
+  Ganesh-TNL): `a[i]`, `a[i].f`, `this.a[i].f`, nested and 2-D selects read
+  and write the element's bits, and constraints on `a[i]` and `a[i].f`
+  (equality, `inside`, `dist`, implication, `soft`, cross-element,
+  part-selects) are solved at the property's full width. The dimensions were
+  lost with the typedef name, so `a[i]` read 0 and such constraints were
+  dropped. Still open: a field named through a `foreach` loop variable,
+  `foreach (c[i]) c[i].valid == 1'b1`, and an unpacked array of struct
+  arrays, `cand_t [0:1] g[2]`.
+* The array reductions `and()`, `or()`, `xor()` and `product()` keep every
+  bit of elements wider than 64 bits in the evaluator and the solver, element
+  chains such as `a[0] + a[1]`, `a[0] - a[1]` and `a[0] + b[0]` accept
+  targets above 2^64 - 1, and `unique {a}` over wide elements no longer
+  disables the rest of the constraint set (§7.12.3, §18.5.8, #928, reported
+  by Ganesh-TNL). Only `sum()` had the wide path.
+* A collection of virtual interfaces keeps its element handles when passed
+  as a subroutine or constructor argument (dynamic, queue, fixed, 2-D,
+  typedef'd, `ref` or `output`, or an interface instance array as the
+  actual), declared as a task local, returned from a function, or held in a
+  2-D class property (§13.5.1, §23.9, §25.9, §25.10, #925, reported by
+  Ganesh-TNL): `f[i] != null`, `f[i].sig`, `@(posedge f[i].clk)` and
+  `wait (f[i].sig)` resolve through it; the elements read null or x. Still
+  open: `f[i][j] != null` and `.sig` reads of a fixed-size 2-D formal, and a
+  module-scope 2-D array variable of virtual interfaces.
+* A module's own package imports are searched before the compilation unit's
+  wildcard import when a contested name sizes an unpacked array `a[N]`
+  (§26.3, §7.4.2, #895, reported by philipaxer). The value was right and the
+  dimension used the unit's candidate.
+* A parameter with a declared type is folded at that type's width wherever
+  it sizes a declaration, not only in its value (§10.8, §11.6.1, #894,
+  reported by philipaxer): `localparam int A = (8'd128 + 8'd128) >> 8` gives
+  `logic [A:0]` two bits; it gave one. An untyped parameter keeps the
+  self-determined width.
+* The constant checks of the elaboration lint, a zero-width indexed
+  part-select (§11.5.1), a zero-size unpacked dimension (§7.4.2) and
+  duplicate enum values (§6.19), run on every instance of a child module,
+  and `int m [N]` with a zero `N` is rejected at the top too (#893, reported
+  by philipaxer). A child with any of them elaborated silently.
+* An equality that reaches its random variable through `^`, `~^`, `~`, `+`
+  or `-`, such as `(data ^ 32'hf0) == 32'h3`, is solved exactly, in class
+  constraints and in `std::randomize() with` (§18.5.12, §11.8.2).
+  `std::randomize` returned 0 even for `(data ^ 'hf) == 0` on a 32-bit
+  variable. A class constraint solved it only when the constant happened to
+  keep the expression linear on the solver's probe points, as `'hf` does and
+  `'hf0` does not. The solution still has to fit the variable once extended
+  to the comparison's width, so an 8-bit `p` gives
+  `(p ^ 32'h100) == 32'h5` no solution.
+* An input port whose actual holds its declaration initializer takes that
+  value as an edge at time 0 (§23.3.3, §9.4.2). With `logic clk = 0`, a
+  child's `always @(negedge clk)` runs at time 0, and with `logic rst_n = 0`,
+  an `always_ff @(posedge clk or negedge rst_n)` resets at time 0. These
+  blocks used to wait for the first later change. The edge starts from x for
+  a 4-state port and from 0 for a 2-state one. The declaring module's own
+  blocks on the variable still see no event (§6.8), and neither do the
+  instance's initial procedures or `iff` terms. The same update reaches a
+  parent's block on the port's hierarchical name (`@(negedge v.clk)`, §23.6)
+  and the readers of a whole-net identity assignment from such a variable
+  (`wire w = v`, `assign w = v`, §10.3.3), whose net took the variable's
+  initializer silently. When a process also writes the variable at time 0,
+  the port's edge comes first and a block both wake runs once; a `#0` or
+  nonblocking write wakes it again.
+* A constraint that joins one-bit terms with `&` or `|`, such as
+  `s == S_DATA & data == 32'h1234`, is solved like `&&` and `||` (§11.4.5,
+  §18.5, #899). `randomize()` returned 0 and left the members unchanged,
+  because the 32-bit term was only ever sampled. A `rand bit`, a bit select
+  such as `data[0]` and a relation the solver inverts, such as
+  `(data ^ 'hf) == 0`, count as one-bit terms too; an operand wider than one
+  bit keeps its bitwise meaning (PR #900, contributed by davekeeshan).
+* A continuous assignment to a path that enters a scope through an index,
+  such as `assign tb.g[0].u.a = s;`, drives its target (§23.6, §10.3.2,
+  #901). Written with the top module's name, or with a delay, it drove
+  nothing and printed nothing. A bit or part select on the target,
+  `assign g[0].u.a[3:1] = 3'b011;`, drives those bits, and the generate
+  block no longer becomes a 1-bit implicit net with a warning (PR #902,
+  contributed by davekeeshan).
+* An event control on a path that enters a scope through an index, such as
+  `@(posedge g[0].u.clk)`, `@(posedge g[0].u.c[0])` or `@(g[0].u.c[2:1])`,
+  wakes on every change (§9.4.2, #903). The process woke once at time 0 and
+  never again, so a flop clocked through such a path stood still (PR #904,
+  contributed by davekeeshan).
+* The lint reads a child module's names in the child's own scope (§23.9,
+  #891). A variable of one module is no longer taken for a same-named queue
+  of another, and a child's part-select widths, enum values, array sizes and
+  queue bounds are no longer folded with the top module's parameters, which
+  rejected legal children. A child's check still runs when its expression
+  reads only literals and package constants. A parenthesized integral value
+  assigned to a queue, `q = (x + 1)`, is rejected like `q = x + 1` (§7.6)
+  (PR #892, contributed by philipaxer).
+* A reference in a generate block binds only to declarations visible from it
+  (§23.9, §27.5). An outer `W` beside a nested block's own `localparam int W`
+  was taken for the nested one, giving a 1-bit parameter type, a value of x
+  or 0, or an undeclared `g.W`; parameter types, unpacked dimensions,
+  initializers, declarations, assigns and statements now read the outer `W`
+  (core #162, PR core #165, contributed by chuanseng-ng).
+* A function or task declared in a generate-for block can be called by its
+  bare name from inside the block: from an `initial` or `always`, a
+  continuous assign, another subroutine of the block, the function's own
+  result variable or a nested block (§27.4, §23.9). Each iteration's copy is
+  named `g[i].f`, but the call was left bare, so elaboration stopped with
+  "Undeclared identifier 'f'". `g[i].f()` from outside the loop already
+  worked.
+* Module parameters in class and virtual-interface specialization arguments
+  fold in their calling scope even when an unrelated class declares a
+  parameter with the same name (§8.25, #874). A virtual-interface key such
+  as `data_if#(DATA_WIDTH)` now matches `data_if#(32)` when the module's
+  `DATA_WIDTH` is 32, allowing an inherited agent's `uvm_config_db::get`
+  to retrieve the interface. Compound expressions resolve using the active
+  module or class parameter bindings.
+* A trailing comma in a `#(...)` parameter value list is an error in strict
+  mode (Annex A.4.1.1, #874). An empty list, `#()`, and named default
+  assignments such as `.WIDTH()` are accepted.
+
+* `size()` applies to the queue a locator method returns: `q.find_index
+  with (item > 2).size()` read 0 (§7.12.1, §7.10.2, #779). A locator on a
+  row of a nested associative array, `m["a"].find_index with (item > 1)`,
+  searches that row by its own index type, where it returned `'{0}`
+  (§7.12.1, §7.8.1, #780). A string-keyed array whose keys all read as
+  integers is ordered as strings: `first()` gave the number 9 instead of
+  `"10"` (§7.8.2, §7.9.4, #781). `%p` of a locator call prints an enum
+  index or element by its label, `'{BLUE}` where it printed `'{2}`
+  (§21.2.1.6, #782). Every queue method and the `with` reductions apply to
+  a locator result too (`q.find with (item > 2).sum()`, `q.unique.size`), a
+  row of a class member's nested array is searched the same way, and an
+  enum index named through a typedef alias or held by a function-local
+  array prints its labels. Reported by philipaxer, with PRs #783, #784,
+  #785 and #805.
+* A string key may hold `[`, `]` or `\` everywhere: such a key is escaped in
+  the element's name, where `%p`, `num()`, nested rows and the walks split
+  it at the bracket and read another key. `next()` and `prev()` from a key
+  that is not in the array move to the nearest key, where they returned 0
+  (§7.8.1, §7.8.5, #775, PR core #134 and #776). The locator methods search
+  an associative array by key: a string-, signed- or wide-keyed array gave
+  an empty queue, and the `_index` forms and `item.index` take the array's
+  index type (§7.12.1, §7.12.4, #777, PR #778). Reported and fixed by
+  philipaxer. An index type wider than 64 bits names one element per
+  value, so `w[5]` and `w[100'h5]` are the same element and a `next()`
+  walk over such keys ends (§7.8.4).
+* A fixed-size array declared in an `initial`, `always` or `final` block,
+  a nested block, a fork child or a static task keeps the element writes a
+  `for (int i ...)` loop makes: a loop the process compiled stored each
+  element through the signal table, where a block-local array has no cells,
+  and every write was dropped, so the array read 0 or x after the loop
+  (§6.21, §12.7.1, reported by Ganesh-TNL).
+* A constructor call is checked against the class's own `new` like any
+  other call: too many actuals, or a formal left without an actual and
+  without a default, is an error, for `new`, `new(...)` and `C::new(...)`,
+  in assignments and declarations. A class that declares no constructor has
+  the implicit `new()`, which takes no arguments. Such calls ran with the
+  missing formals left at their defaults and the extra actuals dropped
+  (§8.7, §13.5, #812, reported by dhanunay).
+* Concurrent processes whose automatic locals share a name but not a type
+  keep each local's own type. The declaration that ran last registered its
+  enum typedef, struct members, packed layout and class under the bare
+  name, so a class task suspended across another's declaration read
+  `c.num()` from the other enum, printed the other struct's members with
+  `%p` and selected `w.f[3]` with the other packed layout (§6.21, §13.3.1,
+  reported by Ganesh-TNL).
+* An `event` declared in a labeled block of two processes is two events,
+  stored under the blocks' names: a wait on one resumed in the same time
+  step instead of at its trigger, so `@(e)` woke at time 0, even with
+  nothing triggering it (§6.21, §15.5, reported by Ganesh-TNL).
+* Two class handles declared under one name in nested blocks of a process
+  each read their own members: the block rename gave every reference the
+  declaration's source position, and `p.b.size()` read `p.a`'s length
+  (§6.21, §23.6, reported by Ganesh-TNL).
+* A `dist` on a dynamic array's or a queue's `size()` is drawn on every
+  `randomize()`; an object randomized again kept the length it had (§18.4,
+  §18.5.4, reported by Ganesh-TNL).
+* `and()`, `or()`, `xor()` and `product()` equalities in a constraint are
+  solved and checked, where `randomize()` returned 1 with them violated. A
+  reduction or locator `with (item.field)` over packed-struct elements
+  reads the field, which read 0 for every element, and the result has the
+  field's width, so `sum() with (item.code)` over 4-bit codes wraps. An
+  associative array is never resized by randomization, so an unmet
+  `aa.size()`, `num()` or `exists()` constraint fails the call instead of
+  passing with the array empty (§7.12.1, §7.12.3, §18.4, §18.5.8.2,
+  reported by Ganesh-TNL).
+* `dist` weights hold for an element of a fixed array and for a field of a
+  dynamic array's struct element (`p[i].mask dist …`), which were drawn at
+  the uniform baseline, and for an item whose branch adds constraints: a
+  failed trial no longer uses up its dealt item, the retries deal it again,
+  and the joint solver that follows keeps it where it can. That solver
+  repaired the failed trial toward the other item, so a 1-in-10 wrap mode
+  came out 1 in 30 to 1 in 50. A fresh object's first draw is no longer
+  always the heaviest item, which a testbench creating an object per call
+  saw as a 1-in-10 item never drawn. A field equality on an element
+  (`p[i].valid == 1`) is solved too, where it made the element be drawn
+  again whole (§18.5.4, §18.5.7, reported by Ganesh-TNL).
+* A run with programs ends when every thread that started in a program's
+  initial procedures has ended, by an implicit `$finish`, and a program's
+  remaining threads end with its initial procedures. The run went on to its
+  time limit, so `final` procedures reported that time and a module's later
+  output still printed (§24.3, §24.7).
+* Each operand of `&&`, `||`, `->` and `<->` is self-determined in
+  compiled continuous assignments, `always_comb` and `always_ff`: both were
+  sized to the wider one, counting a call as wide as its widest argument, so
+  `~f(x) || 1'b0` with a 1-bit `f(x)` of 1 read true (§11.6.1, #810,
+  reported by chuanseng-ng).
+* A value change made by `vpi_put_value` inside a VPI routine is reported
+  once that routine returns, in the same time slot, not by calling the
+  value-change routine from within it. cocotb 1.x aborted with "We are
+  calling up again" when a test drove a clock from Python and awaited its
+  edge (§38.36.1, #811, reported by chuanseng-ng).
+* `$cast` to an interface-class handle succeeds when the object's class, or
+  a base class, implements that interface class or one extending it; it
+  returned 0 because only the `extends` chain was searched (§8.26, §8.16,
+  #806, reported by dhanunay).
+* A time literal and `$time` in a package or `$unit` task, function or
+  class use that scope's time unit, as its delays do; they used the calling
+  module's, so `time t = 1ns; #(t);` in a 1 ns package waited 1 µs from a
+  1 ps module (§3.14.2.3, §5.8, #807, PR core #139 and #808). Reported and
+  fixed by philipaxer.
+* The array queries of a type parameter (`$left(T)`, `$right`, `$high`,
+  `$low`, `$size`, `$increment`, `$dimensions`, `$unpacked_dimensions`)
+  answer from the type it is bound to, in constants and at run time; they
+  read the type's width alone as `[w-1:0]` in a constant and 0 in a
+  statement (§20.7, PR core #138, contributed by chenbhil).
+* An array pattern fills a packed array element by element where the array
+  is a member of a packed struct and where its elements are packed structs:
+  a nested `'{default: 4'hA}` member pattern, a direct `cfg.dom = '{...}`
+  with positional, `default:` or `index: value` items, and `'{default:
+  '{...}}` on a packed or unpacked array of structs kept only the low
+  element, wrote nothing, or laid the items out at their own widths.
+  `index: value` items name their element on any packed array, where they
+  were concatenated in the order written. A struct-level `default:` fills
+  each innermost element of a multi-dimensional packed-array member, which
+  is no simple bit vector type, so `bit [16:0][3:0] m` takes 4'hA seventeen
+  times from `'{default: 8'hAA}`, in module, class-property, array-element
+  and unpacked-struct storage (§6.11.1, §10.9.1, §10.9.2, #771, reported by
+  Ganesh-TNL).
+* Class-member events, `$bits`, assignment widths and compiled methods
+  (#786-#791, PRs #795-#800, contributed by AaronKel). An assigned
+  class-member event names the source's event object, so a trigger through
+  either name wakes `@` and sets `.triggered` on both, and a process
+  already blocked on the old event stays on it (§15.5.5). `$bits` of an
+  empty string is 0 and of a class-member queue its current size
+  (§20.6.2). `return e` and a store into an associative element evaluate
+  `e` in the return or element width, a `real` element excepted (§13.4.1,
+  §11.6.1). A store `s.f = v` through a class handle is no longer dropped
+  after a method with an enum local `s` has run, or while a caller has one
+  (§23.9). A class method gives its interpreted result once compiled, for
+  redeclared string members, string-collection compares, member operand
+  widths and signs, unpacked formals, bare-member stores, `ref` and `inout`
+  copy-backs, shadowed handles, specialized element widths and `&&`, `||`
+  and `?:` whose unselected operand calls a function or `$cast`
+  (§11.4.7, §11.4.11, §13.5.2).
+* A header default that reads a type parameter, `parameter int H =
+  $bits(T)`, folds with this instance's `T`, also for a genvar-sized
+  override `.T(logic [g*2-1:0])` and a struct type parameter; it read the
+  previous instance's type, 0 for the first (§6.20.3, §20.6.2, §27.4, PR
+  core #135 and #803, contributed by chenbhil).
+* In a parameterized class, a formal, return or local typed `bit [W-1:0]`,
+  or by a class typedef of it (`typedef bit [W-1:0] vec_t;`), is as wide
+  as the object's specialization makes it, with the type's signedness, also
+  once the method is compiled hot. A formal kept the actual's 32 bits (and
+  `$bits` read 32), an actual was not evaluated at the formal's width, a
+  typedef formal read 1 bit, a typedef return was not truncated, and a
+  typedef local was 32 bits wide. Each element of a `randc` array now
+  cycles through its values, where it was drawn as `rand` (§8.25, §13.5,
+  §18.4.2, #768, reported by Ganesh-TNL).
+* `randomize()` fails when every weight of a `dist` is 0: an item of
+  weight 0 is not in the set, so `v dist { 5 := 0 }`, `v dist { [0:15] :/
+  0 }` or weights read from variables that are all 0 admit no value, yet
+  the call returned 1 with the first item, also from `std::randomize`
+  (§18.5.4, #770, reported by Ganesh-TNL).
+* `obj.arr[i].rand_mode(0)` on an element of an unpacked rand array keeps
+  that element's value through `randomize()`, and the other constraints see
+  it; the call stopped the run with a false null-handle error. The query
+  form reads the element's mode, and `arr.rand_mode(1)` enables every
+  element again (§18.8, #769, reported by Ganesh-TNL).
+* An array's size can be ordered in a `solve … before` list: `solve sel
+  before arr.size();` failed to parse, and now draws `sel` first and the
+  size in its turn, so the sizes guarded by `sel` hold and `sel` keeps its
+  `dist` weights (§18.5.10).
+* A constant function sizes a cast by a value parameter of its instance,
+  `W'(x)`, so a child's localparam computed with one folds at elaboration
+  for each instance's `W` (§6.24.1, §13.4.3, #763, PR core #130 and #764);
+  an element select of a packed localparam declared in a child module's
+  body keeps the element's width and remaining dimensions instead of
+  reading one bit (§7.4.1, §7.4.5, #766, PR core #131 and #767). Reported
+  and fixed by ds54e.
+* Each row of a nested collection is the collection its declaration names
+  at that depth, keyed by that level's own index type, at every scope. A
+  queue held in an associative array (`int m[int][$]`) kept its element after
+  `pop_front()` or `pop_back()`, and `delete(i)` stopped the run with a false
+  null-handle error; a whole-row assignment `m[k] = q` stored one `x`; `%p`
+  and `foreach` over a queue or dynamic outer level (`int d[][string][$]`)
+  printed each row as a scalar; and a receiver select with a side effect
+  (`m[f()].push_back(x)`) ran four times. A write outside a fixed parent's
+  bounds or past a queue or dynamic row's size is now ignored, and a copied
+  object or a by-value formal keeps every row (§7.4.5, §7.4.6, §7.8,
+  §7.10.1, §12.7.3, §21.2.1.7, #765, PR core #132, #133 and #772–#774).
+  Reported and fixed by philipaxer.
+
+* A queue method on an element of a class's collection of queues of
+  handles, `m[k].push_back(o)` in a compiled method, applies to that queue;
+  it reported a null handle (§7.4.4, §7.10.2.7, #820, PR #821). Reported and
+  fixed by philipaxer.
+* A clockvar bound to an expression in an interface, `output q = q_drv;`,
+  drives and samples that instance's signal, not a same-named net `q`; it
+  drove nothing (§14.3, §14.5, #822, PR core #143 and #826). Reported and
+  fixed by philipaxer.
+* A size cast's width sizes the expression around it: `(9'(c) + s) >
+  8'hff` with 8-bit `c` and `s` sums at 9 bits, where it wrapped to 0, and
+  a parenthesized or computed size, `(W)'(x)`, `(W+1)'(x)` or
+  `$clog2(N)'(x)`, keeps its value, where it was dropped (§6.24.1, §11.6.1,
+  #827, PR core #144 and #828). In compiled code a function call in
+  such an expression is as wide as its return type, and a size cast keeps
+  its operand's signedness, so `(W)'(sa)` of a signed -1 sign-extends.
+  Reported and fixed by davekeeshan.
+* A nonblocking write of one field of an unpacked-struct array element
+  inside an instance, `storage[0].value <= v`, completes; its expansion
+  recursed and the time slot never ended (§10.4.2, #831, PR #832). The same
+  write to an element of a queue or dynamic array wakes the processes that
+  read it. Reported and fixed by davekeeshan.
+* A parameter override list must fit the definition it instantiates,
+  wherever either is written: excess ordered values, a parameter set twice
+  and a name that is not an overridable parameter are errors (§23.10.2,
+  #818, PR core #146), and so is a list mixing ordered and named entries
+  (A.4.1.1, core #150, PR core #151). A parameter in a `generate` region of
+  a module without a parameter port list takes an ordered slot, and its
+  override applies; it kept its default (§23.10.2.1, §27.3). Reported and
+  fixed by chuanseng-ng.
+* A compiled delay expression reads its value: `always #1 a = a + 1;` under
+  `` `timescale 1ns/100ps `` ran away with stall warnings, and `always
+  #(1*2)` ran at the wrong period (§9.4.1, §22.7, PR #835, contributed by
+  ds54e).
+* An element of an inlined function's dynamic-array formal keeps its
+  declared type: a `real` element divided as an integer, so `d[k] / x` read
+  0, and a signed `int` element read as unsigned (§11.3.1, §13.5, PR #836,
+  contributed by ds54e).
+* A compiled process copies a whole unpacked struct member by member, where
+  `always_comb l = t;` left `l` at its default, and an `always_comb` that
+  reads a whole struct re-fires when a member changes, inside instances too
+  (§7.2, §9.2.2.2.1, PR #838, contributed by ds54e). An inlined function's
+  struct local is not taken for a module struct of the same name.
+* A child module that writes a whole unpacked struct to its output port,
+  `assign o = '{x, 7};`, drives the parent, which read the members' defaults
+  (§7.2, §23.3.3, PR core #152 and #839, contributed by ds54e).
+* A header parameter used as a port actual inside its module, `leaf u
+  (.a(VREF));`, creates no implicit 1-bit net and no warning (§6.20, §6.10,
+  PR core #154 and #840, contributed by ds54e).
+* With `solve pkt.psel before pkt.paddr` over fields of a packed-struct rand
+  member, `psel` is drawn over its range; it came up 2 on every draw
+  (§18.5.10, #815, PR #829, contributed by Ganesh-TNL).
+* The members of a function's unpacked-struct result start at their declared
+  defaults: `function s_t f(); f.c = 1; endfunction` returned 0 or x in a
+  member declared `int a = 3` (§13.4.1, §7.2.2).
+* A UDP table row may write its symbols next to each other, `01:0;` or
+  `(01)00:?:0;`, as A.5.3 defines them; such a table was rejected and the
+  primitive became an empty module with an undriven output (§29.3.4, #841,
+  reported by git-hevangel).
+* An out-of-block method of a `$unit` class that writes a member by its bare
+  name elaborates when the top module declares a variable of that name; the
+  use-before-declaration check took the module's variable for the member
+  (§8.24, §23.9, #843, reported by git-hevangel).
+* A class property is the object's storage, whatever module variable shares
+  its name: a nonblocking write in a method, `s.f <= v`, and an element write
+  through a handle, `h.v[1] = x`, wrote the module's `s` or `v` (§8.4,
+  §10.4.2).
+* A clockvar bound to a part-select, `input a = bus[3:0];` or `output o =
+  o_drv[3:0];`, samples that slice at the clocking event and a drive of it
+  writes the slice and leaves the other bits alone; such a clockvar read x
+  and drove nothing (§14.5, #823, reported by philipaxer).
+* The output skew of a renamed clockvar, `output #2 q = q_drv;`, applies to a
+  drive issued between clocking events: the drive took effect at the next
+  clocking event instead of two time units after it (§14.4, §14.16, #824,
+  reported by philipaxer).
+* In a module that is not the top, a member of an element of a packed array
+  of packed structs whose dimension is that module's parameter, `par[i].a`
+  with `s_t [N-1:0] par`, reads and writes the member's bits of element `i`;
+  the declaration was sized against the top's parameters, where `N` was
+  missing or another module's, so a 1-bit first member landed on bit `i` of
+  the whole array (§7.2.1, §7.4.5, §23.10, #816, reported by hernloh).
+* A `localparam` or `parameter` of a packed array of packed structs type in
+  an instantiated module takes its assignment pattern element by element,
+  so `s_t [1:0] P = '{'{a: 8'h33, b: 8'h44}, '{a: 8'h11, b: 8'h22}}` is
+  32'h3344_1122 and `$bits(P)` is 32; the pattern was packed as one struct
+  (§6.20.2, §10.9.1, §10.9.2, #817, reported by hernloh). A header
+  parameter overridden with such a pattern packs the same way.
+* An `always_comb` that writes one element of a packed vector and reads
+  another stays sensitive to the vector: `ds[1] = ds[0] + 1`, `w[7:4] =
+  w[3:0] + 1` and `st[1] = st[i] + 1` never woke when the element they read
+  was driven from outside, because every read of a name the block also
+  writes was dropped (§9.2.2.2.1, #844, PR #845, contributed by auty1395).
+  The rule follows the LRM text: the vector is kept unless the block writes
+  it whole or at a non-constant index, or writes every element it reads;
+  the block's own write does not re-queue it.
+* Inside a class, `sub.rand_mode(0)` on a `rand` class-handle property
+  changes the handle's own mode, as `this.sub.rand_mode(0)` does; it switched
+  off every random variable inside the object instead, so the object's
+  constraints were still checked and `randomize()` failed (§18.8, #846, PR
+  #847, contributed by auty1395). A derived class randomizes the elements
+  of an inherited array or queue of rand handles, and an element switched
+  off with `rand_mode(0)` keeps its object (§18.8, §8.13).
+* A class with a rand associative array is solved jointly, its elements
+  indexed by the stored keys, so `main + sub.sum() == total` beside one no
+  longer fails by repeated guessing (§18.4, §18.5, #848, PR #849, contributed
+  by auty1395). The `foreach` key of such an array is bound at its declared
+  index type, so an `int` key `-3` stays negative, and a string-keyed array
+  is left to the trials without taking the rest of the class with it
+  (§7.8.2).
+* An `inside` or `dist` item written with a unary operator keeps its place
+  in the set: `en inside {!cur}`, `n inside {~k}` and `en dist {cur :/ 2,
+  ~cur :/ 1}` dropped the item, so the first had no solution and the last
+  always drew `cur` (§18.5.4, §11.4.13, #850, PR #851, contributed by
+  auty1395).
+* `$countones` of a whole variable wider than 64 bits is a constraint the
+  solver reads as the sum of its bits, so `std::randomize(m) with
+  { $countones(m) inside {[1:2]}; }` on a 78-bit `m` succeeds (§18.5,
+  §20.9, #852, PR #853, contributed by auty1395).
+* A `ref` dynamic-array formal bound to one row of a fixed array of
+  collections (`item_c rows[2][]`, passed as `rows[1]`) shares that row with
+  the caller, so sizing and filling it in the callee is visible after the
+  call (§13.5.2, #854, PR #855, contributed by auty1395).
+* A subroutine's scalar formal or local hides a same-named collection of a
+  caller or of a subclass: `str.len()` on a `string str` formal read the
+  caller's `str[$]` queue size (§23.9, #856, PR #857, contributed by
+  auty1395). It hides a same-named module-level collection too, as does a
+  class property: a `$unit` function's `str.len()` read the module's
+  `str[$]` size, and `return str` returned the queue (§23.9, §8.10).
+* A class first named through `typedef class C;` resolves to the class, not
+  to the placeholder the forward declaration leaves, so `q[i].label == ""`
+  on a string member compares text and returns 1 or 0 instead of x (§8.27,
+  §6.16, #858, PR #859, contributed by auty1395).
+* A rand sub-object that no constraint of the class reads stays out of the
+  class's joint solve, so a sub-object holding a rand dynamic array no
+  longer sends the class's `sum()` constraint to the trial loop and makes
+  `randomize()` fail (§18.5.9, §18.3, #860, PR #861, contributed by
+  auty1395). A class constraint that reads a rand sub-object's member or
+  array method, `soft sub.v == 7` or `sub.r.sum() == 60`, joins the
+  sub-object's own solve as an in-line item that outranks its class
+  constraints, where the first panicked and the second failed by chance
+  (§18.5.14.1).
+* A rand enum member of an unpacked struct declared in a package draws its
+  named constants only; the member's type was looked up under its bare name
+  and missed (§18.3, #862, PR #863, contributed by auty1395). An enum member
+  of a rand *packed* struct is not restricted, as §18.4 says.
+* The parameter override checks of #818 are pinned from the binary: exit
+  status, the rendered line, `--compile` and `--no-strict`, children in
+  other files, generate blocks, interfaces and binds (§23.10.2, A.4.1.1,
+  PR #866, contributed by chuanseng-ng).
+* An assignment pattern takes the type of its assignment-like context, and
+  a typed pattern `T'{...}` takes `T`, everywhere: a function's `return
+  '{...}`, a subroutine argument, a class property initializer, a cast
+  operand, a conditional operand, a port actual and `==` against a pattern
+  were laid out as a concatenation of the items at their own widths, so
+  `s_t'{1, 0}` was 64 bits and `f() !== 2'b10` (§10.8, §10.9, #813, PR
+  #814 and core #140, contributed by philipaxer). One plan builder lays a
+  pattern over a packed type as bit slices for the interpreter and the
+  bytecode compiler alike; `default:` assigns a value whose type matches the
+  element whole (§6.22.1), a typed pattern of an unpacked type places its
+  items as an untyped one does, and `$bits(T'{...})` is `$bits(T)`. A
+  pattern assigned to a child's output port of a package struct type with a
+  typedef-array member, and a `default:` naming a parameter of the child or
+  a package parameter imported bare, took the port's flattened layout and
+  missed the parameter's declared type, so the value was split by member
+  (§23.3.3, §26.3). A plan is built on every interpreted execution: a loop
+  of interpreted pattern assignments runs about 40% more instructions than
+  before (compiled blocks and methods are unaffected); caching the plan per
+  pattern is the open follow-up.
+* A slice of an unpacked array, `a[l:r]`, `a[b +: w]` or `a[b -: w]`, is
+  read and written as an unpacked array whose elements pair left to right
+  with the other side (§7.4.6, §7.6, #867, reported by git-hevangel): as the
+  source or target of a blocking or nonblocking assignment, slice to slice
+  in opposite directions or overlapping, as a row or part of a row of a
+  two-dimensional array, as an `input` or `output` argument, in `$size`
+  (its element count, not its width in bits), in a continuous assignment
+  (a variable base is followed) and on a port. The target kept its value,
+  took the wrong elements, took them in reverse order or read x, depending
+  on the place. A row of a two-dimensional array (`m[1]`) passed as an
+  argument reads its elements too, and an `always_comb` that reads a whole
+  unpacked array, `s = b`, wakes when an element changes; it never re-ran
+  after time zero (§9.2.2.2.1).
+* A sequential UDP that declares its output `output reg q;` in the body of a
+  non-ANSI header keeps state: it was taken for a combinational UDP and its
+  output stayed x (§29.3.2, A.5.2, #868, reported by git-hevangel). An
+  initial value in the declaration, `output reg q = 1'b1`, gives the start
+  state in either header form, as A.5.2 allows.
+* The array-size check counts an indexed part-select of an unpacked array,
+  `a[b +: w]`, as `w` elements: it took the base and the width for the
+  bounds of a range, so `a[0 +: 6] = b` was rejected ("the arrays have 7
+  and 6 elements"), some real mismatches were accepted and others reported
+  with wrong sizes (§7.4.5, §7.6, §11.5.1, #869, reported by git-hevangel).
+* A method of a nested class defined out of block inside the enclosing
+  class body, `task inner::run(...)` written in `outer`, is linked to the
+  nested class, in a package, through a constructor, as a virtual method and
+  with type parameters; the call ran the empty prototype (§8.24, §8.23, #842,
+  reported by git-hevangel). A nested class whose name collides across
+  packages keeps its qualified spellings.
+* Follow-ups to the recent randomization and argument fixes: a constraint on
+  a selected part of a counted vector counts its bits with the rest
+  (§20.9, #852), a fixed class-row actual and a side-effecting receiver are
+  evaluated once (§13.5.2, #854), a rand sub-object's collections join the
+  parent's solve and its `foreach` indexes the elements, not their bits
+  (§18.5.9, #860), and a package struct member keeps its own enum domain
+  when packages share a typedef name (§18.3, §26.3, #862). Packed and
+  unpacked element reads of an `always_comb` share one dependency collector
+  (§9.2.2.2.1, #844).
+
+* Module data must be declared before it is read as well as before it is
+  written (§6.5, #819). The check includes call arguments, event controls,
+  assertions, declaration dimensions and module-local class bodies, in child
+  definitions as well as the top, while respecting local scopes and
+  hierarchical references. For sources that
+  require the earlier behavior, `--relax-use-before-decl` (or
+  `XEZIM_RELAX_USE_BEFORE_DECL=1`) accepts these references with a warning.
+
+**Performance**
+
+* Constrained randomization of large and chunked arrays with `foreach`
+  constraints is much faster: 2.2× and 125× fewer instructions on the two
+  benchmarks of #876 (§18.5.8.1, #955, contributed by Thomasb81). The
+  rewritten shapes can pick different solutions than before for the same
+  seed. Seeded runs remain reproducible.
+* Binding a scope with many local names is linear in the number of names
+  (§23.9).
+* A package function call no longer copies the parameter table (#920,
+  contributed by auty1395); 33 s to 2.6 s on the reported design.
+* More code runs compiled (#940, contributed by Thomasb81): `repeat`,
+  `forever`, `while` and `do-while` loops in processes, `disable` of an
+  enclosing named block, process status reads, static class properties
+  and methods through handle chains, and methods with type-parameter
+  formals, locals and returns. `randomize()` reuses the translated
+  constraint graph of a class while every value its constraints read is
+  unchanged, solves element-independent members of a rand dynamic array
+  element by element, and reuses the geometry of a constant `foreach`
+  `dist`. Method dispatch and child-process cleanup allocate less.
+* Instances whose parameters differ only in the instances above them share
+  one prepared body. The body cache was keyed on every parameter in the
+  scope, the ancestors' included, so a deep hierarchy formatted a long key
+  and kept a body copy and that key for nearly every instance until
+  elaboration ended (§23.10, #721, reported by amal-khailtash).
+  `XEZIM_COMPILE_PHASES` reports the cache as `[elab-stats]` lines.
+* More class methods compile (#792, PR #804, contributed by AaronKel): a
+  statement the compiler cannot lower runs in the interpreter while the rest
+  of the body stays compiled (`XEZIM_METHOD_STMT_FALLBACK=0` turns this
+  off), compiled-to-compiled calls dispatch directly, `ref` and `inout`
+  scalars included, and a method with a loop compiles on its first call.
+  The #792 testcase at 100,000 calls takes 8.8 s instead of 14.3 s.
+* A parked `wait(cond)` is re-checked only when something it reads may
+  have changed, and class-member event waiters are indexed by event and by
+  process (#793, PR #802, contributed by AaronKel): 2,000 parked watchers
+  take 0.8 s instead of 75.4 s. `XEZIM_GROWTH_TRACE=<ticks>` prints the
+  heap, signal and waiter table sizes over a long run.
+* The class-heap collector traces from the previous survivors and the
+  objects allocated since, so it runs every 20,000 allocations again
+  (§8.29, #794, PR #801, contributed by AaronKel): 400,000 churned objects
+  peak at 261 MB instead of 1,292 MB in the same time.
+* A string without X or Z bits converts to text by whole bytes (PR core
+  #137, contributed by AaronKel).
+* An element of a nested collection is read and written through its
+  declared shape, found with one lookup: 600,000 writes to `int d[][]` take
+  16.0 G instructions instead of 18.2 G, and as many reads 8.2 G instead of
+  14.2 G (§7.4.5, #772).
+* An instance is elaborated against only the package parameters its
+  definition can name, not a copy of the whole package, `$unit` and top
+  parameter table (§23.10, §26.3, #740): with 4,000 package parameters no
+  module names, compiling 1,000 instances took 375.6 G instructions before
+  and 5.7 G after, and 250 instances 96.6 G and 4.0 G. The elaborated design
+  is unchanged for every design under tests/ and examples/. Reported by
+  git-hevangel.
+* A frame local whose type metadata a deeper frame's same-named local
+  displaced gets it back when that frame returns, and only then: the live
+  frames were rescanned after every frame pop below the displacement, so a
+  deep call chain running a loop of calls stalled for hours at one timestamp
+  (§6.21, §13.3.1, #833, reported by Ganesh-TNL). `[PROF]
+  local_meta_reapplies` counts the scans.
+* An edge block that reads or writes one element of an unpacked array by a
+  constant index is re-armed by writes to that element only. Every element
+  of the array armed it, so N blocks each writing one element of a shared
+  array (a generate loop of flops) marked N blocks per element write, N²
+  per clock: 2,000 such blocks spent 23.1 s of a 24.8 s run in the NBA
+  region, now 0.25 s (§9.2.2.4, §9.4.2). A RAM model's dynamic index keeps
+  the whole-array arming.
+* With no top named, a design whose only uninstantiated module stands
+  beside a package, a `$unit` class or another non-instantiable declaration
+  keeps the compilation-unit subroutine bodies in that module alone. The
+  package or class counted as a second root, so every definition got every
+  body again: 200 definitions and a 2,000-arm `$unit` function compiled in
+  2,013 MB, now 56 MB, the same as with `-s top` (§23.3.1, §3.12.1, #834,
+  reported by git-hevangel). Two or more uninstantiated modules still take
+  the eager copy.
+* A member of a struct resolution function's result, the `n.V =
+  res('{...}).V` assign a struct nettype emits for each member, compiles:
+  the function is inlined over one scalar per member (§6.6.7, §7.2, PR #837
+  and core #153, contributed by ds54e). Each settle ran the resolver in the
+  interpreter once per member, over 99% of a charge-pump regulator model's
+  run. A struct with member defaults, or a call whose unused part has a side
+  effect, keeps the call.
+* An instance's parameter scope takes only what its own definition, the
+  definitions it names and the scopes above it spell. The words of every
+  package item and file-scope class, covergroup and typedef were added to
+  every scope and to every prepared body's cache key, so a design whose
+  packages spell most of their parameters gave every instance nearly the
+  whole table again: 1,000 instances with 4,000 package parameters, 99 %
+  spelled, compiled in 76.0 G instructions, now 2.0 G (§23.10, §26.3, #870,
+  reported by git-hevangel). Package items are evaluated where they are
+  declared, so they read the same values.
+* The names a class constraint may read are looked up in the elaborated
+  design as the constraint names them. Every class of every inlined
+  instance copied every signal and parameter name of the design inlined so
+  far into a set, also a class without constraints, so elaboration grew
+  with the square of the instances: 2,000 instances of a module declaring a
+  constrained class compiled in 53.7 G instructions, now 1.4 G (1.2 G
+  without the class) (§18.3, #871, reported by git-hevangel). The names
+  accepted are unchanged.
+* The second-pass lint builds the last segments of the parameter keys and
+  the map of global classes once per run. It split every parameter key for
+  every width identifier and rebuilt the class map for every module:
+  8,000 modules naming their own parameters in part-select widths took
+  110.9 G instructions to compile, now 9.9 G, and 8,000 package classes
+  41.3 G, now 1.7 G (§11.5.1, §8.18, #872, reported by git-hevangel). The
+  verdicts are unchanged.
+* A prepared body's cache key holds only the parameters of its scope that
+  differ from the table, plus a shared bit mask of the ones absent from it,
+  and repeated width bindings of unchanged typedefs are no longer journaled,
+  so a large design keeps one copy of the common scope words instead of one
+  per definition (§23.10, #721). With several uninstantiated modules and no
+  top named, the first in source order carries the compilation-unit
+  subroutine bodies instead of every definition getting a copy (§3.12.1,
+  #834).
+* A read of a declared module memory through a static hierarchical path
+  inside an automatic task binds the memory directly instead of evaluating
+  the instance prefix as a run-time receiver on every access; local, class,
+  struct and typedef names that shadow it keep their meaning.
+* The source line of a span is found by binary search over the line starts
+  of its preprocessed file, taken once. Each lookup counted the newlines
+  before the span, and setup locates every timing check of every cell
+  instance in the cell library's file, so a gate-level netlist took time in
+  the product of its timing checks and the library's size: 20,000 sky130
+  cells against a 19 MB cell library took 55.7 s, now 8.5 s (#898, reported
+  by Blebowski).
+
+**Validation**
+
+* xezim `603c9bf3`, pinned to xezim-core `212dde0`, passes 6,610 default
+  tests with one existing ignored test, plus the two JIT smoke tests and the
+  DPI tests on the nested-scheduler fallback. Core and parser pass 514 and
+  233 tests. Both repositories pass their minimum supported Rust version
+  checks. The release commits change only version numbers and the core pin.
+* Artifacts written by 0.11.4 or earlier are refused with the "recompile
+  with current xezim" message; recompile saved designs.
+* Some `foreach` constraint shapes over large or chunked arrays can pick
+  different solutions than 0.11.4 for the same seed (#955). Runs with one
+  seed remain reproducible.
+
 ### 0.11.4 — class-object reclamation, linear elaboration, class and randomization correctness (October 2026)
 
 **Correctness**

@@ -8,8 +8,14 @@ of options and environment variables is in the
 [debugging](DEBUGGING.md).
 
 * [Running a simulation](#running-a-simulation)
+* [Cocotb Python testbenches](#cocotb-python-testbenches)
+* [VPI assertion integration](#vpi-assertion-integration)
+* [Random seeds and weighted distributions](#random-seeds-and-weighted-distributions)
+* [Memory files](#memory-files)
 * [Waveforms](#waveforms)
+* [Checkpoints](#checkpoints)
 * [Warm design cache](#warm-design-cache)
+* [Diagnosing memory growth](#diagnosing-memory-growth)
 * [Native compilation](#native-compilation)
 * [Reducing a multi-file build](#reducing-a-multi-file-build)
 * [Module-timescale extension](#module-timescale-extension)
@@ -53,10 +59,135 @@ The exit status is 1 for parse and elaboration errors (among them a
 hierarchical name that does not resolve, §23.8), `$fatal`, a run-time error
 that ends the run (a read or call through a null handle in a process, a wait
 on a mailbox that was never constructed, a loop or delta cycle that can never
-let time advance, an SDF file `$sdf_annotate` cannot read), a
-`--dpi-lib` library that cannot be loaded, and an `-s` that names no module
-(`--no-strict-top` falls back to finding tops automatically). `$error` exits 0
-unless `--error-exit` is given.
+let time advance, such as a task that calls itself without waiting, an SDF
+file `$sdf_annotate` cannot read), a `--dpi-lib` library that cannot be
+loaded, and an `-s` that names no module (`--no-strict-top` falls back to
+finding tops automatically). `$error` exits 0 unless `--error-exit` is given.
+A run that Ctrl-C or SIGTERM stopped exits 130 or 143.
+
+Since 0.11.7, a type name that is neither declared nor imported is an error,
+and so are two class definitions of one name in a scope (a forward class
+typedef is not a second definition), two packages of one name, and two
+typedefs of one name with different text. A typedef repeated with identical
+text in another file, and a second definition of an interface, program or
+primitive, are warnings (§3.13).
+
+C and C++ DPI sources can be named with the SystemVerilog files, on the
+command line or in a `-f` file (`xezim add.c t.sv`): xezim compiles them,
+links them into one cached library and loads it like `--dpi-lib`. A compiled
+artifact (`--compile -o design.xzc`) holds the elaborated design only, so name
+the C files again when running it (`xezim design.xzc add.c`); `--compile`
+warns when it leaves them out. See the
+[DPI and VPI guide](dpi-guide.md#c-and-c-sources-in-the-file-list).
+
+## Cocotb Python testbenches
+
+The runner in `contrib/cocotb/xezim_runner.py` supports cocotb 2.0.x and, since
+xezim 0.11.7, 2.1.0; its integration tests cover 2.0.1 and 2.1.0.
+
+From the repository root, make the runner importable and select your binary:
+
+```bash
+export PYTHONPATH="$PWD/contrib/cocotb${PYTHONPATH:+:$PYTHONPATH}"
+export XEZIM_BIN="$PWD/target/release/xezim"
+python run_test.py
+```
+
+A minimal `run_test.py`, with your `dut.sv` and cocotb `test_dut.py` beside it:
+
+```python
+import xezim_runner  # registers the xezim backend
+from cocotb_tools.runner import get_runner
+
+runner = get_runner("xezim")
+runner.build(sources=["dut.sv"], hdl_toplevel="dut", build_dir="sim_build")
+runner.test(hdl_toplevel="dut", test_module="test_dut")
+```
+
+`build()` records the source files and options; `test()` invokes xezim to
+elaborate and simulate them. Use `parameters={"WIDTH": 8}` for parameter
+overrides and `waves=True` for an FST waveform in the build directory.
+
+Macro values follow the installed cocotb version. For a macro that expands
+to the SystemVerilog string literal `"hi"`, use `defines={"MSG": "hi"}` with
+2.0, or `defines={"MSG": '"hi"'}` with 2.1. Version 2.1 takes HDL text as
+written; it does not add quotes. In either version, `None` defines a macro
+without a value. See the [runner documentation](../contrib/cocotb/xezim_runner.py)
+for option and parameter-rebuild behavior.
+
+## VPI assertion integration
+
+Since 0.11.7, VPI clients can discover concurrent assertion objects,
+register callbacks with `vpi_register_assertion_cb`, query assertion coverage,
+and control assertions through `vpi_control`. Build the client against
+`include/vpi_user.h` and `include/sv_vpi_user.h`, then load its shared library:
+
+```bash
+xezim --vpi-lib ./assertion_monitor.so top.sv
+```
+
+Step controls select an attempt by its start time. `vpiAssertionEnableStep`
+takes the assertion handle, a time pointer and `vpiAssertionClockSteps`;
+`vpiAssertionDisableStep` takes only the handle and time pointer after its
+operation code. `vpiAssertionSysKill` discards pending attempts and disables
+new ones while retaining callbacks. `vpiAssertionSysOn` allows new attempts
+to start again; it does not revive discarded attempts.
+`vpiAssertionSysEnd` removes callbacks and ends the assertion system; later
+controls or callback registrations cannot restart it.
+
+This is the Phase 1 interface. Phase 2 action and lock callbacks are not
+supported. Step callbacks report clock-level progress, callback `detail` is
+NULL, and some coverage counts are approximations. See the
+[DPI and VPI guide](dpi-guide.md#classic-vpi-modules---vpi-lib) for the supported
+objects, callback semantics, coverage limits and checkpoint behavior.
+
+## Random seeds and weighted distributions
+
+Use `+seed=<integer>` to reproduce a randomized run. Compare the sequence
+of generated values when checking that a seed changes a run; a histogram
+alone can hide the difference.
+
+For a class variable constrained only by a `dist` list, xezim can deal
+items from a balanced schedule. Each complete schedule contains items in
+their declared weight proportions. The seed changes their order and the
+starting position, so different seeds can produce identical total counts.
+For example, singleton weights `40,20,12,10,8,5,3,2` give counts
+`800,400,240,200,160,100,60,40` over 2,000 successful calls, even though
+the generated sequences differ. This is intentional xezim solver policy,
+not a requirement that SystemVerilog distributions have exact counts.
+
+Schedules belong to an object and variable and are selected using the
+evaluated weights. They are used only when the reduced schedule fits within
+4,096 entries. Other solver paths, including the same distribution combined
+with a separate range constraint, can use independent weighted draws instead;
+their counts need not match the proportions exactly. Adding a redundant
+constraint can therefore change both the sequence and its histogram.
+Values within a range item are sampled, so balanced item counts do not imply
+exact counts for each value inside the range. Do not rely on a particular
+sequence or solver strategy remaining unchanged across releases.
+
+## Memory files
+
+`$readmemh` and `$readmemb` load a memory from a text file, and `$writememh`
+and `$writememb` write one (§21.4, §21.5). The memory can be a fixed-size or
+dynamic unpacked array, a multidimensional array or the subarray a partial
+index leaves (`ram[1]`), an associative array with an integral index type,
+or a class property.
+
+The words of a multidimensional array are in row-major order: the rightmost
+dimension varies fastest, and each dimension runs from its low index to its
+high one, whichever way it is declared. Start and finish addresses and the
+`@` addresses in a file count words in that order, from the low index of the
+leftmost dimension.
+
+`$writemem*` writes one word per line with no `@` address for a fixed-size,
+dynamic or multidimensional array, also when the start address is not the
+lowest one (§21.5.3), so `$writememh("m.hex", m, 2, 3)` writes the two words
+`m[2]` and `m[3]`; read such a file back with the same start address. A
+dynamic array writes the elements its size counts, and an empty one writes an
+empty file. An associative array writes the elements that exist, in index
+order, each as `@<address> <word>`; loading one makes each address in the
+file a key and keeps the keys the file does not name.
 
 ## Waveforms
 
@@ -78,8 +209,32 @@ per-signal trace table. Pass `--wave` to enable `$dumpfile`/`$dumpvars`
 `--fst` and `--xtrace` imply `--wave`. The three formats are cross-checked
 against each other by decoding them.
 
+The scope options above select what to dump; `--wave-suppress <entry>`
+excludes, and one list applies to all three formats. A bare name is a module
+definition: `--wave-suppress mem_bank` drops every instance of `mem_bank` at
+any depth. A dotted name is one hierarchical path, with or without the
+top-module name: `--wave-suppress tb_top.u_blk.u_bank0` drops that instance
+and everything below it. A path can also name an instance array or a generate
+loop (all of its elements, or one as `g_lane[1]`) or a variable (an unpacked
+array with all of its elements, or one element). A bare name that is not a
+module is read as a path below the top module, so `--wave-suppress u_blk`
+works like `--fst-scope u_blk`; `--wave-suppress-module <name>` forces the
+module reading when an instance has the same name as a module.
+`--wave-suppress-file <file>` reads entries from a file.
+
+Excluded signals are dropped while the dump collects its signals, so they
+cost nothing in the header, the identifier tables or the per-step change
+detection. Each entry reports how many signals it removed, and an entry that
+removed nothing is reported with a warning when the whole design was
+selected. An `--fst-scope`, `--xtrace-scope` or `$dumpvars` argument that
+names an excluded scope, or something inside it, dumps what it names; other
+entries still apply inside it. A compiled artifact takes the options when it
+is run.
+
 Ctrl-C (SIGINT) or SIGTERM stops the run at the current time and closes the
-dumps normally; this includes a long loop inside one time slot. If the run
+dumps normally; this includes a long loop inside one time slot. The run then
+exits 130 or 143 (128 + the signal number), as a shell reports a process the
+signal ended, so a harness does not take it for a run that passed. If the run
 cannot stop (a DPI call that does not return), the FST dump is closed at the
 current time after half a second, and the process ends 5 seconds after the
 signal. A second Ctrl-C ends it at once. An FST dump is also written out every
@@ -87,6 +242,45 @@ signal. A second Ctrl-C ends it at once. An FST dump is also written out every
 starts. Each block reaches the file whole or not at all, so after a `kill -9`,
 an out-of-memory kill or a second Ctrl-C, at any moment, the file is readable
 and holds everything up to the last block written.
+
+## Checkpoints
+
+A run can be saved at the end of a time slot and continued later, from the
+same design and the same xezim build:
+
+```bash
+# save at the end of the last slot at or before 2 ms (repeatable)
+xezim <sources> -s <top> --save-at 2ms,warm.ckpt
+
+# continue from it: the output is what the uninterrupted run prints after
+# that slot
+xezim <sources> -s <top> --restore warm.ckpt +test=second
+```
+
+`$save("file")` and `$incsave("file")` save from the design, and
+`$restart("file")` replaces the running state with a saved one; each is served
+at the end of the slot that calls it (IEEE 1800 Annex D). A bare `--save-at`
+time is nanoseconds, like `--max-time`, and the file defaults to `xezim.ckpt`.
+The run continues after a save.
+
+A checkpoint holds every process, variable, net, class object, queue,
+covergroup and random state, and the open files with their positions; a file
+written to is cut back to the length it had at the save. Plusargs are read
+from the restoring command line, so one saved warm-up can start several tests.
+Waveform dumps start afresh after a restore, and the memory of DPI and VPI
+libraries is not saved; a save waits for a slot in which no DPI task is
+suspended in C. A checkpoint of another design or written by another xezim
+build is refused.
+
+Native compilation (`XEZIM_JIT`, `XEZIM_AOT`) may differ between the saving
+and the restoring run, except that a process state machine saved while running
+natively (`XEZIM_PROC_FSM=1` with `XEZIM_AOT=1`) needs `XEZIM_AOT=1` again.
+
+One state is not saved yet: a process forked to call a task, while it is still
+inside that task. A save that meets one fails with `Error: cannot save
+'<file>': ...`, which counts as an error, and the run goes on.
+`XEZIM_CKPT_AUDIT=<file>` appends to `<file>` the names of the simulator
+fields a run changes after setup, the state a checkpoint has to hold.
 
 ## Warm design cache
 
@@ -104,6 +298,36 @@ The default directory is `$XEZIM_CACHE_DIR`, then
 `--cache-dir` for a workload-local cache or `--no-cache` for a cold run. With
 `--verbose`, xezim prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on
 stderr.
+
+## Diagnosing memory growth
+
+For a large design that exhausts memory during compilation, capture a cold
+run with the same sources, top and options as the failing command:
+
+```bash
+XEZIM_OOM_TRACE=memory.jsonl xezim --compile --no-cache -f files.f -s top
+```
+
+Use `--simulate` instead when growth occurs during simulator setup or execution.
+The trace appends JSONL records with the active phase, source location,
+instance, latest table counts and process RSS. Periodic samples continue
+during long phases. RSS is available on Linux; other platforms report `null`.
+Complete records remain readable after a kill, although the last line may
+be incomplete. `XEZIM_OOM_TRACE=1` writes to stderr; `0` disables tracing.
+
+Trace files contain design names and source paths. Keep the raw trace private
+and share redacted phase/count summaries with the tested revisions, command
+options, peak RSS and exit or kill evidence. RSS is process-wide: a rise near
+one source location does not establish which allocation owns the memory.
+See the [tracing guide](DEBUGGING.md#tracing-memory-growth) for record fields
+and commands to inspect the largest jumps.
+
+Leave tracing off for performance measurements and compare equivalent cache
+conditions. Recent memory improvements apply automatically, including shared
+net-initializer targets across child instances; no new switch or source rewrite
+is required. Instance-specific destinations, delays and strengths are preserved.
+The synthetic results in the [README](../README.md#performance) do not establish
+that the original large-design OOM in #721 is resolved.
 
 ## Native compilation
 
@@ -186,7 +410,11 @@ Two properties are worth knowing before relying on it:
 
 Note `--parse` above: the dump is produced before elaboration, so a design whose
 elaboration takes minutes still dumps in seconds. Only the step that appends
-adopted `-v`/`-y` library files needs `--compile` or `--simulate`.
+adopted `-v`/`-y` library files needs `--compile` or `--simulate`. The appended
+text of a library file is the text the build read: it is preprocessed with the
+macros of the design files and of the library files read before it, and the
+macros it defines stay defined for the library files read after it
+(§22.5.1).
 
 ## Module-timescale extension
 
@@ -286,7 +514,9 @@ relaxed run's design. Every switch also has an environment variable,
 | `--relax-casex-inside` | `casex (e) inside`, `casez (e) inside` (§12.5.4) | `case (e) inside` |
 | `--relax-macro-space` | `` ` NAME `` (§22.5.1) | `` `NAME `` |
 | `--relax-nul-bytes` | a NUL byte in the source (§5.3) | white space |
-| `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6) | a cross over an implicit coverpoint of `vif.mode` |
+| `--relax-cross-hier-item` | `cross vif.mode, cp_a;` (§19.6), and `binsof(vif.mode)` in its bin selects (§19.6.1) | a cross over an implicit coverpoint of `vif.mode` |
+| `--relax-use-before-decl` | a reference to module data before its declaration, including in call arguments (§6.5) | a reference to the later declaration, with a warning |
+| `--relax-library-packages` | a package declared in a `-v` library file, which supplies only modules, interfaces, programs and primitives (#937) | a package compiled as if the file were also a source file |
 | `--relax-implicit-static` | `int x = ...;` in a static subroutine (§6.21) | a static variable with that initializer |
 | `--relax-driver-conflicts` | a variable written by conflicting drivers (§6.5, §9.2.2) | a warning instead of an error |
 

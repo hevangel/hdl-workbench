@@ -1,13 +1,13 @@
 //! Declaration parsing (IEEE 1800-2017 §A.2)
 
-use super::Parser;
+use super::{Parser, compact_syntax_list};
 use crate::ast::Identifier;
 use crate::ast::decl::*;
 use crate::ast::stmt::VarDeclarator;
 use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
-impl Parser {
+impl<'a> Parser<'a> {
     pub(super) fn parse_parameter_port_list(&mut self) -> Vec<ParameterDeclaration> {
         let mut params = Vec::new();
         if self.eat(TokenKind::Hash).is_none() {
@@ -44,7 +44,7 @@ impl Parser {
     }
 
     pub(super) fn parse_parameter_declaration(&mut self) -> ParameterDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let local = match self.current_kind() {
             TokenKind::KwParameter => {
                 self.bump();
@@ -62,7 +62,7 @@ impl Parser {
             // §6.20.3: a single `parameter type` may declare several comma-
             // separated type assignments — `parameter type A = int, B = X;`.
             loop {
-                let astart = self.current().span.start;
+                let astart = self.current_span().start;
                 let name = self.parse_identifier();
                 // IEEE 1800-2023 §6.20.2.1: `type T extends Base` constrains the
                 // type argument to a class derived from `Base`. Gated on
@@ -154,7 +154,7 @@ impl Parser {
         };
         let mut assignments = Vec::new();
         loop {
-            let astart = self.current().span.start;
+            let astart = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
@@ -163,6 +163,7 @@ impl Parser {
                 None
             };
             assignments.push(ParamAssignment {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
                 init,
@@ -255,7 +256,7 @@ impl Parser {
     }
 
     pub(super) fn parse_typedef_declaration(&mut self) -> TypedefDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwTypedef);
         if self.eat(TokenKind::KwClass).is_some() {
             let name = self.parse_identifier();
@@ -266,6 +267,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: false, // forward CLASS — resolved via a class decl, not checked here
+                decl: Default::default(),
             };
         }
         // §6.18: KEYWORD-qualified forward form — `typedef struct T;`,
@@ -294,6 +296,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
@@ -309,6 +312,7 @@ impl Parser {
                 dimensions: Vec::new(),
                 span: self.span_from(start),
                 forward: true,
+                decl: Default::default(),
             };
         }
         let data_type = self.parse_data_type();
@@ -321,15 +325,16 @@ impl Parser {
             dimensions,
             span: self.span_from(start),
             forward: false,
+            decl: Default::default(),
         }
     }
 
     pub(super) fn parse_import_declaration(&mut self) -> ImportDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwImport);
         let mut items = Vec::new();
         loop {
-            let item_start = self.current().span.start;
+            let item_start = self.current_span().start;
             let package = self.parse_identifier();
             self.expect(TokenKind::DoubleColon);
             let item = if self.eat(TokenKind::Star).is_some() {
@@ -354,7 +359,7 @@ impl Parser {
     }
 
     pub(super) fn parse_dpi_import(&mut self) -> DPIImport {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwImport);
         self.expect(TokenKind::StringLiteral); // "DPI-C" etc
         let property = match self.current_kind() {
@@ -388,7 +393,7 @@ impl Parser {
     }
 
     pub(super) fn parse_dpi_export(&mut self) -> DPIExport {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwExport);
         self.expect(TokenKind::StringLiteral);
         let mut c_name = None;
@@ -409,16 +414,19 @@ impl Parser {
     }
 
     pub(super) fn parse_timeunits_declaration(&mut self) -> TimeunitsDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut unit = None;
         let mut precision = None;
         if self.eat(TokenKind::KwTimeunit).is_some() {
-            unit = Some(self.bump().text.clone());
+            let tok = self.bump();
+            unit = Some(self.token_text(tok).into_owned());
             if self.eat(TokenKind::Slash).is_some() {
-                precision = Some(self.bump().text.clone());
+                let tok = self.bump();
+                precision = Some(self.token_text(tok).into_owned());
             }
         } else if self.eat(TokenKind::KwTimeprecision).is_some() {
-            precision = Some(self.bump().text.clone());
+            let tok = self.bump();
+            precision = Some(self.token_text(tok).into_owned());
         }
         self.expect(TokenKind::Semicolon);
         TimeunitsDeclaration {
@@ -429,7 +437,7 @@ impl Parser {
     }
 
     pub(super) fn parse_data_declaration(&mut self) -> DataDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let const_kw = self.eat(TokenKind::KwConst).is_some();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         let lifetime = self.parse_optional_lifetime();
@@ -465,7 +473,7 @@ impl Parser {
     pub(super) fn parse_var_declarator_list(&mut self) -> Vec<VarDeclarator> {
         let mut decls = Vec::new();
         loop {
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
@@ -474,20 +482,21 @@ impl Parser {
                 None
             };
             decls.push(VarDeclarator {
+                decl: crate::ast::binding::Bound::UNSET,
                 name,
                 dimensions,
-                init,
+                init: init.map(Box::new),
                 span: self.span_from(start),
             });
             if self.eat(TokenKind::Comma).is_none() {
                 break;
             }
         }
-        decls
+        compact_syntax_list(decls)
     }
 
     pub(super) fn parse_function_declaration(&mut self) -> FunctionDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
@@ -510,23 +519,27 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                // §13.4.2 non-ANSI body ports fill `ports` for arg binding
-                // (ANSI functions already have a non-empty `ports` here).
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    // §13.4.2 non-ANSI body ports fill `ports` for arg binding
+                    // (ANSI functions already have a non-empty `ports` here).
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
@@ -540,16 +553,18 @@ impl Parser {
                 ports[ansi_ports].span,
             ));
         }
+        let items = compact_syntax_list(items);
         FunctionDeclaration {
             lifetime,
             specifier,
             return_type,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -585,19 +600,31 @@ impl Parser {
         ports: &mut Vec<FunctionPort>,
         _strict: &mut Vec<Identifier>,
     ) {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let direction = self
             .parse_optional_direction()
             .unwrap_or(PortDirection::Input);
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         // Optional shared data type (implicit 1-bit when omitted, e.g. `input x;`).
+        // §13.4, A.2.7: a tf_port_declaration takes a data_type_or_implicit,
+        // and a user-defined type may carry packed dimensions (A.2.2.1:
+        // `type_identifier { packed_dimension }`), so `input s_t [1:0] in;`
+        // names the type `s_t`. Look past the bracket groups as a module's
+        // non-ANSI port declaration does: an identifier there is the port
+        // name; `input x [3:0];` is a port `x` with an unpacked dimension.
+        // Taking `s_t` as the port left `in;` behind as an expression
+        // statement, so the body's next declaration was reported as
+        // following a statement (§9.3.1).
         let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
             self.parse_data_type()
-        } else if self.at(TokenKind::Identifier)
-            && matches!(
+        } else if matches!(self.current().kind, TokenKind::Identifier | TokenKind::EscapedIdentifier)
+            && (matches!(
                 self.peek_kind(),
-                TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
-            )
+                TokenKind::Identifier
+                    | TokenKind::EscapedIdentifier
+                    | TokenKind::Hash
+                    | TokenKind::DoubleColon
+            ) || (self.peek_kind() == TokenKind::LBracket && self.dims_then_identifier(1)))
         {
             self.parse_data_type()
         } else if self.at(TokenKind::LBracket) {
@@ -643,7 +670,7 @@ impl Parser {
     }
 
     pub(super) fn parse_task_declaration(&mut self) -> TaskDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwTask);
         let specifier = self.parse_optional_method_specifier();
@@ -660,34 +687,40 @@ impl Parser {
         for p in &ports {
             self.hide_let_name(&p.name.name);
         }
-        while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
-            if matches!(
-                self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
-            ) {
-                let n0 = ports.len();
-                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
-                for i in n0..ports.len() {
-                    let n = ports[i].name.name.clone();
-                    self.hide_let_name(&n);
+        // §13.3/§13.4: declaration clones share this body, including package
+        // and generic-class uses that need no instance rewrite.
+        crate::ast::cache::without_scope_caches(|| {
+            while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+                ) {
+                    let n0 = ports.len();
+                    self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                    for i in n0..ports.len() {
+                        let n = ports[i].name.name.clone();
+                        self.hide_let_name(&n);
+                    }
+                } else {
+                    self.parse_block_item(&mut items);
                 }
-            } else {
-                self.parse_block_item(&mut items);
             }
-        }
+        });
         self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &mut items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
+        let items = compact_syntax_list(items);
         TaskDeclaration {
             lifetime,
             specifier,
             name,
             ports,
-            items,
+            items: items.into(),
             endlabel,
             strict_body_ports,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -736,7 +769,9 @@ impl Parser {
         let mut decls: Vec<(&Identifier, Option<(usize, usize)>)> =
             body_ports.iter().map(|p| (&p.name, None)).collect();
         for (si, it) in items.iter().enumerate() {
-            if let StatementKind::VarDecl { declarators, .. } = &it.kind {
+            if let StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } = &it.kind
+            {
                 decls.extend(
                     declarators
                         .iter()
@@ -792,7 +827,9 @@ impl Parser {
         items.retain_mut(|it| {
             let here = si;
             si += 1;
-            let StatementKind::VarDecl { declarators, .. } = &mut it.kind else {
+            let (StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. }) = &mut it.kind
+            else {
                 return true;
             };
             let mut di = 0;
@@ -883,12 +920,12 @@ impl Parser {
     }
 
     pub(super) fn parse_method_name(&mut self) -> TypeName {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut name = if self.at(TokenKind::KwNew) {
             let tok = self.bump();
             Identifier {
-                name: tok.text.clone(),
-                span: tok.span,
+                name: self.token_text(tok).into_owned(),
+                span: self.token_span(tok),
             }
         } else {
             self.parse_identifier()
@@ -903,8 +940,8 @@ impl Parser {
             let next = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
                 Identifier {
-                    name: tok.text.clone(),
-                    span: tok.span,
+                    name: self.token_text(tok).into_owned(),
+                    span: self.token_span(tok),
                 }
             } else {
                 self.parse_identifier()
@@ -918,6 +955,7 @@ impl Parser {
             scopes,
             name,
             span: self.span_from(start),
+            bound: Default::default(),
         }
     }
     /// The return type of a function declaration or prototype: an explicit
@@ -968,7 +1006,7 @@ impl Parser {
     /// Parse a function prototype (no body, no endfunction). Used for pure virtual.
     /// Syntax: `function [lifetime] [type] name(ports);`
     pub(super) fn parse_function_prototype(&mut self) -> FunctionDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
@@ -989,16 +1027,17 @@ impl Parser {
             return_type,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
             default_args,
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
 
     pub(super) fn parse_task_prototype(&mut self) -> TaskDeclaration {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.expect(TokenKind::KwTask);
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
@@ -1010,9 +1049,10 @@ impl Parser {
             specifier,
             name,
             ports,
-            items: Vec::new(),
+            items: Default::default(),
             endlabel: None,
             strict_body_ports: Vec::new(),
+            decl: Default::default(),
             span: self.span_from(start),
         }
     }
@@ -1026,9 +1066,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.pos + 1)
-                .map(|t| t.text.as_str())
-                .unwrap_or("")
-                == "'";
+                .is_some_and(|t| self.token_text(t) == "'");
         if (self.is_data_type_keyword() || self.at(TokenKind::KwVoid)) && !is_type_cast {
             ParamValue::Type(self.parse_data_type())
         } else if self.at(TokenKind::KwVirtual)
@@ -1068,6 +1106,10 @@ impl Parser {
         if self.eat(TokenKind::LParen).is_none() {
             return args;
         }
+        // Without the `#` this is a constructor's arguments, which may mix.
+        if _has_hash {
+            self.check_param_list_form();
+        }
         if self.at(TokenKind::RParen) {
             self.bump();
             return args;
@@ -1087,7 +1129,7 @@ impl Parser {
                     // `.NAME()` — empty binding; skip without pushing.
                     self.bump();
                 } else {
-                    let start = self.current().span.start;
+                    let start = self.current_span().start;
                     let value = match self.parse_param_value() {
                         ParamValue::Expr(e) => e,
                         ParamValue::Type(dt) => crate::ast::expr::Expression::new(
@@ -1144,18 +1186,28 @@ impl Parser {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                 break;
             }
-            let start = self.current().span.start;
+            let start = self.current_span().start;
             let mut var_kw = self.eat(TokenKind::KwVar).is_some();
             let _const_kw = self.eat(TokenKind::KwConst).is_some();
             if !var_kw && self.at(TokenKind::KwVar) {
                 var_kw = self.eat(TokenKind::KwVar).is_some();
             } // Handle var after const
-            let direction = self.parse_optional_direction().unwrap_or(prev_direction);
+            let explicit_direction = self.parse_optional_direction();
+            let direction = explicit_direction.unwrap_or(prev_direction);
             prev_direction = direction;
             // §13.3: `input var int x` — `var` may follow the direction too.
             if !var_kw && self.at(TokenKind::KwVar) {
                 var_kw = self.eat(TokenKind::KwVar).is_some();
             }
+            // §13.5 (1800-2023): a formal written with neither a data type
+            // nor a direction (`input int a, b`) takes the previous formal's
+            // data type; first, or with a direction, it is `logic`. It was left
+            // untyped, so `b` was not sized like `a` and an import passed it to
+            // C as an svLogic.
+            let inherited_type = ports
+                .last()
+                .filter(|_| explicit_direction.is_none() && !var_kw)
+                .map(|p| p.data_type.clone());
 
             // Handle `virtual interface <name>` port type (legacy form)
             // and the LRM 1800-2017 §25.9 form `virtual <iface_type>` /
@@ -1192,6 +1244,7 @@ impl Parser {
                         scopes: Vec::new(),
                         name: iface_name,
                         span: self.span_from(start),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args: Vec::new(),
@@ -1234,11 +1287,11 @@ impl Parser {
                 // avoid the later `parse_identifier` consuming the `[`.
                 let name = self.parse_identifier();
                 let dimensions = self.parse_unpacked_dimensions();
-                let data_type = DataType::Implicit {
+                let data_type = inherited_type.unwrap_or_else(|| DataType::Implicit {
                     signing: None,
                     dimensions: Vec::new(),
                     span: self.span_from(start),
-                };
+                });
                 let default = if self.eat(TokenKind::Assign).is_some() {
                     Some(self.parse_expression())
                 } else {
@@ -1308,11 +1361,11 @@ impl Parser {
                     // port inline, mirroring the `name [$]` arm above.
                     let name = self.parse_identifier();
                     let dimensions = self.parse_unpacked_dimensions();
-                    let data_type = DataType::Implicit {
+                    let data_type = inherited_type.unwrap_or_else(|| DataType::Implicit {
                         signing: None,
                         dimensions: Vec::new(),
                         span: self.span_from(start),
-                    };
+                    });
                     let default = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
                     } else {
@@ -1340,11 +1393,11 @@ impl Parser {
                     span: self.span_from(start),
                 }
             } else {
-                DataType::Implicit {
+                inherited_type.unwrap_or_else(|| DataType::Implicit {
                     signing: None,
                     dimensions: Vec::new(),
                     span: self.span_from(start),
-                }
+                })
             };
             // An unnamed formal of a prototype: a placeholder name by position.
             let name = if self.prototype_ports
@@ -1356,7 +1409,7 @@ impl Parser {
             {
                 Identifier {
                     name: format!("__arg{}", ports.len()),
-                    span: self.current().span,
+                    span: self.current_span(),
                 }
             } else {
                 self.parse_identifier()
@@ -1381,7 +1434,7 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RParen);
-        ports
+        compact_syntax_list(ports)
     }
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {
@@ -1413,11 +1466,11 @@ impl Parser {
                     // — modeled so a wildcard import only re-exposes nested
                     // imports the package actually EXPORTS (and, for
                     // wildcards, references). `*::*` records package "*".
-                    let start_sp = self.current().span.start;
+                    let start_sp = self.current_span().start;
                     self.bump(); // export
                     let mut items = Vec::new();
                     loop {
-                        let item_start = self.current().span.start;
+                        let item_start = self.current_span().start;
                         let package = if self.at(TokenKind::Star) {
                             self.bump();
                             Identifier {
@@ -1536,6 +1589,7 @@ impl Parser {
                         .declarators
                         .into_iter()
                         .map(|d| VarDeclarator {
+                            decl: crate::ast::binding::Bound::UNSET,
                             // §6.6: an undriven net holds z (a supply net its
                             // constant), where a package variable would start
                             // at its type's default.
@@ -1545,12 +1599,12 @@ impl Parser {
                                     NetType::Supply0 => '0',
                                     _ => 'z',
                                 };
-                                crate::ast::expr::Expression::new(
+                                Box::new(crate::ast::expr::Expression::new(
                                     crate::ast::expr::ExprKind::Number(
                                         crate::ast::expr::NumberLiteral::UnbasedUnsized(fill),
                                     ),
                                     d.span,
-                                )
+                                ))
                             })),
                             name: d.name,
                             dimensions: d.dimensions,

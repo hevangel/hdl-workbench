@@ -8,6 +8,33 @@
 
 use serde::{ser, Serialize, Serializer};
 
+/// One bit per heap slot.
+#[derive(Clone, Default)]
+pub(super) struct SlotBits(Vec<u64>);
+impl SlotBits {
+    pub fn new(len: usize) -> Self {
+        Self(vec![0; len.div_ceil(64)])
+    }
+    pub fn get(&self, i: usize) -> bool {
+        self.0.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
+    }
+    /// Sets bit `i`, returning whether it was clear. Out of range: false.
+    pub fn set(&mut self, i: usize) -> bool {
+        let Some(w) = self.0.get_mut(i / 64) else {
+            return false;
+        };
+        let m = 1 << (i % 64);
+        let was_clear = *w & m == 0;
+        *w |= m;
+        was_clear
+    }
+    pub fn clear(&mut self, i: usize) {
+        if let Some(w) = self.0.get_mut(i / 64) {
+            *w &= !(1 << (i % 64));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct TraceError;
 impl std::fmt::Display for TraceError {
@@ -25,7 +52,7 @@ impl ser::Error for TraceError {
 /// Candidates only: callers must intersect these with allocated heap slots.
 /// False positives retain objects; a serialization error must abort collection.
 pub(super) struct HandleTrace {
-    pub candidates: Vec<bool>,
+    pub candidates: SlotBits,
     found: Vec<usize>,
     value_words: Vec<u64>,
     xz_words: Vec<u64>,
@@ -34,7 +61,7 @@ pub(super) struct HandleTrace {
 impl HandleTrace {
     pub fn new(heap_len: usize) -> Self {
         Self {
-            candidates: vec![false; heap_len],
+            candidates: SlotBits::new(heap_len),
             found: Vec::new(),
             value_words: Vec::new(),
             xz_words: Vec::new(),
@@ -44,23 +71,50 @@ impl HandleTrace {
     pub fn candidate(&mut self, n: u64) {
         if n != 0
             && let Ok(n) = usize::try_from(n)
-            && let Some(mark) = self.candidates.get_mut(n)
+            && self.candidates.set(n)
         {
-            if !*mark {
-                self.found.push(n);
-            }
-            *mark = true;
+            self.found.push(n);
         }
     }
     pub fn drain_candidates(&mut self) -> Vec<usize> {
         let found = std::mem::take(&mut self.found);
         for &h in &found {
-            self.candidates[h] = false;
+            self.candidates.clear(h);
         }
         found
     }
     pub fn trace<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), TraceError> {
         value.serialize(&mut *self)
+    }
+    /// Trace the keys `name[first]` .. `name[first + count - 1]`, as tracing
+    /// each key's text does, without spelling the keys out.
+    pub fn elem_keys(&mut self, name: &str, first: u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(rest) = name.strip_prefix("\u{2}inst")
+            && let Some((owner, _)) = rest.split_once('#')
+            && let Ok(handle) = owner.parse::<u64>()
+        {
+            self.candidate(handle);
+        }
+        // A key with a bracket is no number in any radix; its pieces are
+        // the name's and the index.
+        self.text_pieces(name);
+        for i in first..first + count as u64 {
+            self.candidate(i);
+        }
+    }
+    fn text_pieces(&mut self, text: &str) {
+        for piece in text.split(['.', '[', ']', ':']) {
+            let number = piece
+                .split_once('#')
+                .map(|(owner, _)| owner)
+                .unwrap_or(piece);
+            if let Ok(n) = number.parse::<u64>() {
+                self.candidate(n);
+            }
+        }
     }
     fn text(&mut self, text: &str) {
         if let Some(rest) = text.strip_prefix("\u{2}inst")
@@ -72,24 +126,27 @@ impl HandleTrace {
 
         // Captured handle literals are decimal strings. Other radices remain
         // conservative too; an AST integer carries its base in another field.
-        let digits = text.replace('_', "");
-        for radix in [2, 8, 10, 16] {
-            if let Ok(n) = u64::from_str_radix(&digits, radix) {
-                self.candidate(n);
+        // A parse in any radix needs every byte to be a hex digit, `_` or a
+        // sign, which rejects nearly every identifier without allocating.
+        if text
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() || b == b'_' || b == b'+')
+        {
+            let digits = text.replace('_', "");
+            for radix in [2, 8, 10, 16] {
+                if let Ok(n) = u64::from_str_radix(&digits, radix) {
+                    self.candidate(n);
+                }
             }
         }
         // Object-owned storage and class-handle associative keys can be the
         // only references in a continuation. Include numeric indices as well:
         // without the owner's key type, excluding them would be unsound.
-        for piece in text.split(['.', '[', ']', ':']) {
-            let number = piece
-                .split_once('#')
-                .map(|(owner, _)| owner)
-                .unwrap_or(piece);
-            if let Ok(n) = number.parse::<u64>() {
-                self.candidate(n);
-            }
+        // (Only a piece of decimal digits parses.)
+        if !text.bytes().any(|b| b.is_ascii_digit()) {
+            return;
         }
+        self.text_pieces(text);
     }
     fn finish_value(&mut self) {
         // SV event queues encode the owning object in a packed string. Match
@@ -468,7 +525,6 @@ mod tests {
         stmt::Pattern,
         Span,
     };
-    use std::cell::Cell;
     fn lit(n: u64) -> Expression {
         Expression::new(
             ExprKind::Number(NumberLiteral::Integer {
@@ -476,7 +532,7 @@ mod tests {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: n.to_string(),
-                cached_val: Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             Span::new(600, 601),
         )
@@ -517,10 +573,10 @@ mod tests {
         let mut trace = HandleTrace::new(1000);
         trace.trace(&expr).unwrap();
         for h in 101..=105 {
-            assert!(trace.candidates[h], "missing captured handle {h}");
+            assert!(trace.candidates.get(h), "missing captured handle {h}");
         }
         assert!(
-            !trace.candidates[600] && !trace.candidates[601],
+            !trace.candidates.get(600) && !trace.candidates.get(601),
             "source spans are not references"
         );
     }
@@ -543,7 +599,7 @@ mod tests {
             ))
             .unwrap();
         for h in [123, 456, 789, 321, 654, 655, 656] {
-            assert!(trace.candidates[h]);
+            assert!(trace.candidates.get(h));
         }
     }
 }
@@ -553,6 +609,9 @@ mod tests {
 impl Serialize for super::ProcCont {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use ser::SerializeSeq;
+        if super::checkpoint::active() {
+            return super::checkpoint::serialize_cont(self, serializer);
+        }
         let mut seq = serializer.serialize_seq(None)?;
         let mut frame = Some(self);
         while let Some(cont) = frame {

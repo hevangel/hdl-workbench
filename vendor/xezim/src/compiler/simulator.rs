@@ -15,7 +15,10 @@ use super::{
     bytecode, dispatch, elaborate, fst_sink, interrupt, jit, sdf, stdout_sink, value, vcd_sink,
 };
 
-use super::elaborate::{AlwaysBlock, DpiImportSpec, ElaboratedModule, Signal};
+use super::elaborate::{
+    AlwaysBlock, CollShape, Dim, DpiImportSpec, ElaboratedModule, KeyKind, Signal,
+};
+use super::packed_assignment_pattern_plan::{has_pattern, is_packed, type_name_expr};
 use super::value::{LogicBit, Value};
 use crate::ast::decl::{
     AlwaysKind, ClassConstraint, ConstraintItem, ConstraintRange, CovergroupDeclaration,
@@ -50,10 +53,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use xezim_core::elaborate::resolve_type_width;
 use xezim_core::hasher::{HashMap, HashSet};
+use xezim_core::value::{decode_name_key, encode_name_key};
 
 static SIM_DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -78,6 +83,29 @@ const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
 /// the dumps unfinalized.
 const LOOP_INTERRUPT_POLL_MASK: u64 = 0x3ff;
 
+/// Serde for fixed arrays longer than serde's built-in 32 elements, as a
+/// sequence, for checkpoints.
+mod serde_big_array {
+    use serde::de::{Deserialize, Deserializer, Error};
+    use serde::ser::{Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize, const N: usize>(
+        a: &[T; N],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        a.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>, const N: usize>(
+        d: D,
+    ) -> Result<[T; N], D::Error> {
+        let v = Vec::<T>::deserialize(d)?;
+        let n = v.len();
+        v.try_into()
+            .map_err(|_| D::Error::invalid_length(n, &"a fixed-length array"))
+    }
+}
+
 /// A random stream (IEEE 1800-2023 §18.14 "Random stability").
 ///
 /// §18.14 requires every *object* and every *process* to own an independent,
@@ -86,7 +114,7 @@ const LOOP_INTERRUPT_POLL_MASK: u64 = 0x3ff;
 /// sequence. `StdRng` (ChaCha) has no stable, round-trippable textual state, so
 /// the streams use an explicit SplitMix64 generator: the entire state is one
 /// `u64`, which serialises to 16 hex digits and restores exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SvRng {
     state: u64,
 }
@@ -297,6 +325,11 @@ fn method_tier_threshold() -> u32 {
 /// attempts compilation after that heat reaches the threshold. Unsupported
 /// bodies remain interpreted, and an unset tier retains call-count admission.
 #[inline]
+/// The tier threshold was left at its default (no `XEZIM_METHOD_TIER`).
+fn method_tier_default() -> bool {
+    !method_boost_enabled()
+}
+
 fn method_boost_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("XEZIM_METHOD_TIER").is_some())
@@ -308,11 +341,101 @@ fn method_boost_enabled() -> bool {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-// §6.16 / §6.24.3: string casts emit conversion rather than width resizing.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3064;
+// §18.8 (#846): mode builtins retain their receiver expressions in compiled code.
+// §11.4.10, §11.4.3: shift, `/`, `%` and `**` operands of unknown width keep their loaded width.
+// §8.25: compiled methods take type-parameter formals and locals.
+// §7.5/§7.10: design-scope dynamic-array and queue elements read the live collection.
+// §11.6.1: member element selects size at the declared element width
+// (`coll_elem_widths` plan fact in `expr_max_width`).
+// §11.5.1, §7.4.1: an x/z index into a struct member keeps the element width,
+// and a chain of indices into a call result's member declines.
+// §7.4.1/§7.4.5: a packed select inside an unpacked array's element reads that element.
+// §11.5.1: an x/z literal index into a packed element reads x.
+// §7.4.1: a run-time index into an unpacked array of three or more dimensions declines.
+// §7.4.1: `a[i].m[j][k]` selects elements of a multi-dimensional packed member.
+// §7.4.1: local packed typedefs and selected struct-array members keep their dimensions.
+// §13.4: an inlined function body does not see the caller's unrolled loop constants.
+// §6.21: a subroutine whose static variable carries between calls is not inlined.
+// §13.5.3: function copy-out resolves caller locals and indexed targets after return.
+// §13.4.1: returns inside nested inline calls exit only the innermost callee.
+// §13.5.1 / §8.25: packed method arguments and results retain specialized widths.
+// §8.8: typed constructors compile the named class scope.
+// §6.21: addressed static locals retain shared storage.
+// §25.5: a modport-qualified name resolves to the interface instance's own variable.
+// §8.14: a base static that a derived class redeclares counts as a redeclared member.
+// §7.4.1: a member of an element of an ascending packed array of structs slices from slot 0.
+// §10.9.2: structure replication in scalarized function calls.
+// §6.16: a string-collection element read through a class handle compares as a string.
+// §7.4.2: an index into an array with a negative bound is sign-extended.
+// §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
+// §23.3.2, §7.4: an element of a multidimensional array member of an instance-array element.
+// §6.19.5: enumeration methods take the receiver's declared enumeration.
+// §6.20: procedural parameters retain their own type and declaration kind.
+// Scope-specific combinational dependency resolution (§23.6).
+// Absolute packed references retain declaration geometry (§23.6, §7.4.1).
+// Class aggregate ownership and struct-field constructor typing (§8.8/§8.11).
+// Scoped memory destinations, dynamic rows, combinational time scope, and string-member local shadowing.
+// Explicit event expressions retain function-call operands and result guards.
+// Net typedef metadata and virtual-interface specialization identities.
+// Class-local shadowing keeps numeric comparisons out of string-member admission.
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §13.5, §11.6.1: compiled import calls and calls handed to the interpreter size
+// integral input actuals by their formals; a method with a vif local declines (§25.9).
+// §6.18, §6.16, §13.5.1, §8.9: typedef write-back receivers, string-collection members, unpacked-formal actuals, static collections.
+// §5.7.1, §11.8.2, §11.4.13, §12.5.4: fill operands of real operators fold at one bit; real,
+// fill and negative-member `inside` and non-constant `case inside` items run interpreted.
+// §8.9, §23.9, §6.18, §8.25: bare stores to class-scope shadow names decline; class typedef chains size formals.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional packed range NBAs decline.
+// §26.3: package code reads its own package's parameters, variables and imports, and an
+// inlined package callee its own, ahead of the design's same-named declarations.
+// §13.5.2: a call that declines its output or inout write-back leaves no compiled call
+// behind its interpreter fallback.
+// §6.21, §13.4.2, §7.4.1: a static local that constant selects write whole before a read
+// carries nothing between calls, so its subroutine inlines; a subroutine selecting a variable
+// declared with an ascending or offset range does not inline.
+// §9.3, §13.3: block bodies in shared statement lists, a continuation tree per task call
+// site, and boxed optional delays, initializers and case item patterns (#721).
+// §12.5: an unsigned item makes the entire case comparison unsigned.
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §7.4.1: a cast to a typedef of real and a function returning one are real operands,
+// and a subroutine or block selecting a packed array of a named signed type does not compile.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §11.8.2: preserve integral arithmetic in constant operands of real comparisons.
+// §6.24.1: a signing conversion consumes an unsized fill literal.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds; unfolded select bounds map labels.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §6.21, §13.5.3: output-before-read locals and literal default actuals compile.
+// §6.12.1, §6.24.1, §12.5: `RealToInt` rounds a value that may be real fitted to 64 integral
+// bits; a value stored into a real target converts first; a real `case` runs interpreted.
+// §20.3, §3.14.2.3: a scoped `$realtime` read is a real that is not a constant, and a
+// scoped `$time` read is 64 bits wide. §6.24.1, §7.4.3, §11.5.1: a struct-parameter field
+// sizes its cast, and a part-select after a packed index selects whole elements, clipped to
+// its dimension.
+// Packed word selects inherit the declared dimensions of their bank.
+// §7.4.5: member collection reads that yield unpacked rows use their row storage.
+// §6.24.1: an integer atom cast of an integral operand copies the operand before it is fitted.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3179;
 
 /// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
 /// the per-call hooks (class methods, wait-free tasks, free functions) never
+/// `Simulator::type_param_binding_kind`: a type parameter bound to `string`
+/// or to a class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TypeParamKind {
+    Str,
+    Class,
+}
+
+/// What `Simulator::method_string_frame_begin` added to `string_signals`.
+struct MethodStringFrame {
+    signals: Vec<String>,
+    props: std::rc::Rc<Vec<String>>,
+    prop_mask: u64,
+    prop_more: Vec<usize>,
+}
+
 /// clone a declaration.
 #[derive(Clone, Copy)]
 enum CompiledBodyKind<'a> {
@@ -334,8 +457,7 @@ impl<'a> CompiledBodyKind<'a> {
 }
 
 /// class-perf P3: direct-call eligibility for a compiled (cid, mid).
-#[derive(Clone)]
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum FastCallState {
     /// Not yet decided (no map entry): the plan or compiled block may not
     /// exist yet — the call runs the interpreter route, which builds them;
@@ -349,8 +471,7 @@ enum FastCallState {
     Entry(std::rc::Rc<FastCallEntry>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum FastAccessor {
     None,
     Getter(Box<str>),
@@ -362,7 +483,7 @@ pub(crate) enum FastAccessor {
 /// interpreter's binding loop. Mirrors `try_run_compiled_method`'s seeding
 /// and result clamping, but sources formals from the CALLER's argument
 /// registers.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FastCallEntry {
     block: std::rc::Rc<super::bytecode::CompiledBlock>,
     this_reg: super::bytecode::RegId,
@@ -381,6 +502,10 @@ struct FastCallEntry {
     is_class_result: bool,
     is_void_result: bool,
     accessor: FastAccessor,
+    /// `ref` / `inout` scalar formal positions: their final register value
+    /// is copied back into the caller's argument slot, as the interpreter
+    /// route's write-back temps (`vm_drain_arg_temps`) would.
+    writeback: Box<[usize]>,
 }
 
 /// class-perf P3: is the direct VM->VM dispatch enabled? (XEZIM_FAST_CALLS=0
@@ -495,11 +620,30 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// §9.4.5, §10.9: an item of an intra-assignment pattern, captured when the
+/// statement ran. Read without being taken (a `default:` item is read once
+/// per element); `INTRA_RELEASE_MARKER` frees the items after the store.
+const INTRA_KEPT_MARKER: &str = "$__xz_intra_kept";
+const INTRA_RELEASE_MARKER: &str = "$__xz_intra_release";
 /// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
 /// value stashed in `Simulator::vc_saved[idx]` when a value-change event
 /// control (`@prop` on a non-event class property) was armed. Never
 /// user-visible.
 const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
+/// Internal `$__xz_vc_edge(idx, expr, edge[, iff])`: true once `expr` has made the
+/// requested TRANSITION relative to `Simulator::vc_saved[idx]`. Used by
+/// `@(posedge prop)` / `@(negedge prop)` / `@(edge prop)` when `prop` is a
+/// class property or a procedural local — an edge-qualified event term has no
+/// backing signal, so it is armed as an edge-sensitive value-change wait
+/// (§9.4.2). `edge` is 1 = posedge, 2 = negedge, 3 = any edge, 0 = any
+/// change (an untagged term of an `or` list); an `iff` guard must hold when
+/// it fires. Never user-visible.
+const VC_EDGE_MARKER: &str = "$__xz_vc_edge";
+/// Internal `$__xz_vif_value(expr)`: the identity of the interface instance
+/// the virtual-interface operand `expr` holds (the `iface_handle_token` of the
+/// bound instance, 0 for null). `@(vif)` / `@(vifs[i])` waits for this value
+/// to change (§9.4.2, §25.9). Never user-visible.
+const VIF_VALUE_MARKER: &str = "$__xz_vif_value";
 /// Ends a deferred declaration initializer: `(<target>, ...)` records the
 /// values it gave as their default sampled values (see `sampled_defaults`).
 const SAMPLED_DEFAULT_MARKER: &str = "$__xz_sampled_default";
@@ -624,7 +768,7 @@ pub fn set_delay_mode(mode: u8) {
     DELAY_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn delay_mode() -> u8 {
+pub(crate) fn delay_mode() -> u8 {
     DELAY_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -690,6 +834,38 @@ fn xtrace_options() -> XtraceOptions {
         .unwrap_or_default()
 }
 
+/// `--wave-suppress` / `--wave-suppress-file` / `--wave-suppress-module`: the
+/// waveform EXCLUDE list, shared by the VCD, FST and XTrace dumps.
+///
+/// Process-global for the same reason as `set_dpi_libs`: `simulate_multi`
+/// builds and runs the `Simulator` internally, and the exclusion applies to
+/// every dump format at once, so it is a run-wide setting rather than a
+/// per-format one. `Simulator::new` copies it into the public
+/// `wave_suppress` field, which a library user may also overwrite directly.
+fn wave_suppress_cell() -> &'static Mutex<Vec<String>> {
+    static WAVE_SUPPRESS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    WAVE_SUPPRESS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Set the waveform exclusion list. Each entry is either a hierarchical path
+/// (`tb_top.u_blk.u_bank0`, top-module prefix optional) or a bare module name
+/// (`mem_bank`), which excludes EVERY instance of that module at every depth.
+/// `--wave-suppress-module` entries are passed through with a `module:` prefix,
+/// which forces the module reading for an identifier that is also a path.
+pub fn set_wave_suppress(entries: &[String]) {
+    if let Ok(mut guard) = wave_suppress_cell().lock() {
+        *guard = entries.to_vec();
+    }
+}
+
+/// The exclusion list `Simulator::new` should start from.
+pub(crate) fn configured_wave_suppress() -> Vec<String> {
+    wave_suppress_cell()
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 fn dpi_lib_paths() -> &'static Mutex<Vec<String>> {
     DPI_LIB_PATHS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -739,7 +915,7 @@ fn open_dpi_library(path: &str) -> Result<Library, libloading::Error> {
 }
 
 /// The command that builds the DPI export trampoline (§35.5.4): the host C
-/// compiler (`$CC` when set, else `cc`) producing a position-independent
+/// compiler (`$CC` when set, else `clang`) producing a position-independent
 /// shared object. Only portable flags: the compiler's default target is
 /// already the host, and an x86-only flag such as `-m64` makes a non-x86
 /// compiler reject the command (#282). `$CC` may carry its own leading
@@ -753,7 +929,7 @@ fn dpi_trampoline_cc_command(
     let mut cmd: Vec<std::ffi::OsString> = cc_env
         .map(|v| v.split_whitespace().map(Into::into).collect::<Vec<_>>())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vec!["cc".into()]);
+        .unwrap_or_else(|| vec!["clang".into()]);
     for a in ["-fPIC", "-shared", "-O1"] {
         cmd.push(a.into());
     }
@@ -764,6 +940,10 @@ fn dpi_trampoline_cc_command(
     cmd.push(so.into());
     cmd.push(c.into());
     cmd
+}
+
+pub(crate) fn foreign_libraries_configured() -> bool {
+    !configured_dpi_libs().is_empty() || !configured_vpi_libs().is_empty()
 }
 
 fn configured_dpi_libs() -> Vec<String> {
@@ -827,7 +1007,11 @@ fn parallel_disabled_by_env() -> bool {
 
 fn parallel_serialize_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PARALLEL_SERIALIZE", &FLAG)
+    *FLAG.get_or_init(|| {
+        std::env::var("XEZIM_PARALLEL_SERIALIZE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 macro_rules! sim_dbg_eprintln {
@@ -864,6 +1048,96 @@ macro_rules! vcd_mark {
     }};
 }
 
+/// The bookkeeping of a completed store into `signal_table[id]` (`changed`:
+/// whether the stored value differs from the one it replaced): what
+/// `write_sig!` does once the new value is in the table. A store that edits
+/// the table value in place ends with this, so it leaves the same marks as a
+/// whole-value `write_sig!`.
+macro_rules! write_sig_done {
+    ($self:ident, $id:expr_2021, $changed:expr_2021) => {{
+        let __wsig_id = $id;
+        let __wsig_changed = $changed;
+        // Expression-backed procedural assignments use per-signal
+        // generations as their sensitivity set. Keep the usual no-active-
+        // assignment path to one branch; only real value changes advance
+        // the generation.
+        if __wsig_changed
+            && !$self.active_force_exprs.is_empty()
+            && __wsig_id < $self.active_force_signal_epochs.len()
+        {
+            $self.active_force_signal_epochs[__wsig_id] =
+                $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
+            $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
+        }
+        // Incremental VCD: mark this write dirty (no-op when the dump is off
+        // or the full scan is forced). Superset-safe — the flush re-checks
+        // prev vs cur, so marking an unchanged write costs only a skip.
+        vcd_mark!($self, __wsig_id);
+        // O1 measurement: stamp the signal's last-change phase.
+        if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
+            $self.sig_last_change[__wsig_id] = $self.event_phase;
+        }
+        // Arm only gateable edge blocks that actually read this signal.
+        // The dense bitmap keeps unrelated writes a single cheap branch;
+        // positive hits use the sparse CSR fanout built after compile.
+        if $self.armed_edge
+            && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
+            && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
+        {
+            let (lo, hi) = $self.armed_input_ranges[__wsig_id];
+            for __k in lo as usize..hi as usize {
+                let __bi = $self.armed_input_blocks[__k] as usize;
+                $self.edge_block_armed[__bi] |= EDGE_ARMED;
+            }
+        }
+        // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
+        // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
+        // the borrow stays a direct field access in macro-expanded contexts.
+        if ($self.dirty_edge || $self.dirty_edge_shadow)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
+                $self.edge_pos_seen[__ep as usize] = true;
+                $self.changed_edge_pos.push(__ep as usize);
+            }
+        }
+        // Parked-waiter index: queue a watched signal that changed, for
+        // the next waiter drain and the next snapshot. One length
+        // compare while no waiter is indexed.
+        if __wsig_changed
+            && __wsig_id < $self.event_waiters.watch.len()
+            && $self.event_waiters.watch[__wsig_id] & event_waiters::WATCH_ANY != 0
+        {
+            $self.event_waiters.note_write(__wsig_id);
+        }
+        // §9.2 re-trigger: a blocking write to an edge-sensitive signal
+        // made WHILE an edge block executes must re-run edge detection
+        // for that signal (drain_edge_exec_rescan) — record its position.
+        // One bool load when not inside an edge block.
+        if ($self.in_edge_block || $self.in_edge_cont)
+            && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
+        {
+            let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
+            if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
+                $self.edge_exec_seen[__ep as usize] = true;
+                $self.edge_exec_wrote.push(__ep as usize);
+            }
+        }
+        // §38.36.1 cbValueChange: report the change right away, in the
+        // region of the write. One emptiness check while nothing is
+        // watched. Writes that bypass this macro are caught by the poll
+        // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
+        // The dispatcher takes the raw self-pointer: this macro expands
+        // under live borrows of other fields.
+        if !$self.dpi_value_change_cbs.is_empty()
+            && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
+        {
+            vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
+        }
+    }};
+}
+
 macro_rules! write_sig {
     ($self:ident, $id:expr_2021, $val:expr_2021) => {{
         let __wsig_id = $id;
@@ -875,6 +1149,14 @@ macro_rules! write_sig {
         // sign-extended it (-7). Real values are exempt (is_signed unused) and
         // strings never reach a sized table slot with it consulted.
         if !__wsig_val.is_real && __wsig_id < $self.signal_signed.len() {
+            __wsig_val.is_signed = $self.signal_signed[__wsig_id];
+        }
+        // §6.12/§20.5: a SHORTREAL holds an IEEE binary32 value, so a write
+        // rounds to binary32 (16777216.25 -> 16777216.0). A `real` (binary64)
+        // keeps every bit. Only a real write checks destination precision.
+        if __wsig_val.is_real && $self.shortreal_signals.contains(&__wsig_id) {
+            let __wsig_f = __wsig_val.to_f64() as f32 as f64;
+            __wsig_val = Value::from_f64(__wsig_f);
             __wsig_val.is_signed = $self.signal_signed[__wsig_id];
         }
         // LRM §9.3.1: skip writes to forced signals. The `is_empty` guard
@@ -947,75 +1229,7 @@ macro_rules! write_sig {
                 }
             }
             $self.signal_table[__wsig_id] = __wsig_val;
-            // Expression-backed procedural assignments use per-signal
-            // generations as their sensitivity set. Keep the usual no-active-
-            // assignment path to one branch; only real value changes advance
-            // the generation.
-            if __wsig_changed
-                && !$self.active_force_exprs.is_empty()
-                && __wsig_id < $self.active_force_signal_epochs.len()
-            {
-                $self.active_force_signal_epochs[__wsig_id] =
-                    $self.active_force_signal_epochs[__wsig_id].wrapping_add(1);
-                $self.force_epoch_gen = $self.force_epoch_gen.wrapping_add(1);
-            }
-            // Incremental VCD: mark this write dirty (no-op when the dump is off
-            // or the full scan is forced). Superset-safe — the flush re-checks
-            // prev vs cur, so marking an unchanged write costs only a skip.
-            vcd_mark!($self, __wsig_id);
-            // O1 measurement: stamp the signal's last-change phase.
-            if $self.event_measure && !$self.armed_edge && __wsig_id < $self.sig_last_change.len() {
-                $self.sig_last_change[__wsig_id] = $self.event_phase;
-            }
-            // Arm only gateable edge blocks that actually read this signal.
-            // The dense bitmap keeps unrelated writes a single cheap branch;
-            // positive hits use the sparse CSR fanout built after compile.
-            if $self.armed_edge
-                && ((__wsig_id >> 6) < $self.armed_input_bitmap.len())
-                && ($self.armed_input_bitmap[__wsig_id >> 6] >> (__wsig_id & 63)) & 1 != 0
-            {
-                let (lo, hi) = $self.armed_input_ranges[__wsig_id];
-                for __k in lo as usize..hi as usize {
-                    let __bi = $self.armed_input_blocks[__k] as usize;
-                    $self.edge_block_armed[__bi] |= EDGE_ARMED;
-                }
-            }
-            // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
-            // XEZIM_DIRTY_EDGE/_SHADOW). Inlined here rather than a method call so
-            // the borrow stays a direct field access in macro-expanded contexts.
-            if ($self.dirty_edge || $self.dirty_edge_shadow)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_pos_seen[__ep as usize] {
-                    $self.edge_pos_seen[__ep as usize] = true;
-                    $self.changed_edge_pos.push(__ep as usize);
-                }
-            }
-            // §9.2 re-trigger: a blocking write to an edge-sensitive signal
-            // made WHILE an edge block executes must re-run edge detection
-            // for that signal (drain_edge_exec_rescan) — record its position.
-            // One bool load when not inside an edge block.
-            if ($self.in_edge_block || $self.in_edge_cont)
-                && (__wsig_id as usize) < $self.sig_to_edge_pos.len()
-            {
-                let __ep = $self.sig_to_edge_pos[__wsig_id as usize];
-                if __ep >= 0 && !$self.edge_exec_seen[__ep as usize] {
-                    $self.edge_exec_seen[__ep as usize] = true;
-                    $self.edge_exec_wrote.push(__ep as usize);
-                }
-            }
-            // §38.36.1 cbValueChange: report the change right away, in the
-            // region of the write. One emptiness check while nothing is
-            // watched. Writes that bypass this macro are caught by the poll
-            // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
-            // The dispatcher takes the raw self-pointer: this macro expands
-            // under live borrows of other fields.
-            if !$self.dpi_value_change_cbs.is_empty()
-                && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
-            {
-                vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
-            }
+            write_sig_done!($self, __wsig_id, __wsig_changed);
         }
     }};
 }
@@ -1023,11 +1237,25 @@ macro_rules! write_sig {
 /// Lazy two-state lowering state for one comb entry (see P5 lowering in
 /// bytecode.rs). `Arc` so the eval site can clone the handle out of `self`
 /// before running with `&mut self`.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum TsSlot {
     Untried,
     No,
     Yes(std::sync::Arc<super::bytecode::TwoStateBlock>),
+}
+
+/// §10.3.3 / §28.16: transition bits and rule before driver widening.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct DelayTarget {
+    lo: u32,
+    width: u32,
+    /// §10.3.3 vector assignment, rather than §28.16 gate/scalar rules.
+    vector: bool,
+    /// The fall and turn-off delays of an assignment to a constant bit- or
+    /// part-select, whose net other drivers share; the bits come from the
+    /// select at each update. None for a whole-net target, whose delays are
+    /// in the per-driver maps.
+    select_delays: Option<(Option<u64>, Option<u64>)>,
 }
 
 /// A combinatorial item (continuous assign or always @*/always_comb block)
@@ -1041,6 +1269,11 @@ enum CombItem {
         lhs: Box<Expression>,
         rhs: Box<Expression>,
         delay: u64,
+        /// §10.3.3 / §28.16: the original target before driver widening,
+        /// boxed like the ASTs so the entry stays cache compact.
+        delay_target: Option<Box<DelayTarget>>,
+        // §10.3.3: expressions are evaluated when the right-hand side changes.
+        delay_exprs: Option<Box<[Option<Expression>; 3]>>,
     },
     /// Fast path: direct signal-to-signal copy (assign b = a) with pre-resolved IDs.
     DirectCopy {
@@ -1159,7 +1392,7 @@ enum CombItem {
 ///   re-evaluates the gate, which restores the mask with the current value
 ///   of the masked input in hand (same-delta changes of both inputs are
 ///   read together).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 struct CtlGate {
     /// The gate (`FusedGate::Bin2` with `GateBin::And` / `GateBin::Or`).
     op: FusedGate,
@@ -1178,7 +1411,7 @@ struct CtlGate {
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
 /// bit refs; sequential state and previous-input levels drive edge detection.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct UdpRuntime {
     udp_name: String,
     inst_path: String,
@@ -1321,28 +1554,6 @@ enum ScatterGate {
 // while collecting reads for a PLAIN `always` (star or explicit list),
 // whose sensitivity excludes called-function bodies (only
 // always_comb/always_latch descend into them).
-/// §27.6: hierarchical refs through an UNNAMED generate block's implicit
-/// `genblk<N>` name. Unnamed-branch declarations keep bare names (the
-/// historical leakage other resolution depends on), so `genblk1.x`
-/// resolves by stripping the implicit segments and retrying bare.
-fn strip_genblk_segments(name: &str) -> Option<String> {
-    if !name.starts_with("genblk") && !name.contains(".genblk") {
-        return None;
-    }
-    let stripped: Vec<&str> = name
-        .split('.')
-        .filter(|seg| {
-            !(seg.starts_with("genblk")
-                && seg[6..].chars().all(|c| c.is_ascii_digit())
-                && seg.len() > 6)
-        })
-        .collect();
-    if stripped.is_empty() || stripped.len() == name.split('.').count() {
-        return None;
-    }
-    Some(stripped.join("."))
-}
-
 /// Continuous-assignment targets indexed by leaf name, for the edge-select
 /// alias sharing in `rewrite_edge_select_sensitivities` (built once, on the
 /// first edge term that selects a bit of a vector).
@@ -1466,14 +1677,43 @@ mod edgesel_writers {
             {
                 proc_cont_targets(&b.stmt, &mut forced);
             }
-            for t in module.tasks.values() {
-                for x in &t.items {
-                    proc_cont_targets(x, &mut forced);
+            let mut routine_forced: HashMap<usize, Vec<String>> = HashMap::default();
+            for (k, t) in &module.tasks {
+                let ptr = std::sync::Arc::as_ptr(t.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut f: Vec<&Expression> = Vec::new();
+                    for x in &t.items {
+                        proc_cont_targets(x, &mut f);
+                    }
+                    f.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_task_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
-            for f in module.functions.values() {
-                for x in &f.items {
-                    proc_cont_targets(x, &mut forced);
+            for (k, f) in module.functions.iter() {
+                let ptr = std::sync::Arc::as_ptr(f.items.as_arc()) as usize;
+                let bases = routine_forced.entry(ptr).or_insert_with(|| {
+                    let mut fv: Vec<&Expression> = Vec::new();
+                    for x in &f.items {
+                        proc_cont_targets(x, &mut fv);
+                    }
+                    fv.into_iter().filter_map(base_ident).collect()
+                });
+                let dctx = module.deferred_function_bodies.get(k);
+                for b in bases.iter() {
+                    ix.forced.insert(leaf(b).to_string());
+                    if let Some(dctx) = dctx
+                        && let Some(mb) = dctx.ctx.port_map.get(b).and_then(base_ident)
+                    {
+                        ix.forced.insert(leaf(&mb).to_string());
+                    }
                 }
             }
             for e in forced {
@@ -1499,7 +1739,7 @@ mod edgesel_writers {
                 }
             }
             for (i, p) in module.pending_cont_assign.iter().enumerate() {
-                for t in targets(&p.lhs_source) {
+                for t in targets(&p.source_lhs()) {
                     let Some(b) = base_ident(t) else {
                         continue;
                     };
@@ -1555,9 +1795,23 @@ struct CombEntry {
     defer_at_time0: bool,
 }
 
+impl CombEntry {
+    /// A procedural block that reads a signal it also writes, whose own writes
+    /// must not re-queue it. A continuous assignment re-runs until it settles.
+    fn reads_own_writes(&self) -> bool {
+        matches!(
+            self.item,
+            CombItem::AlwaysBlock { .. } | CombItem::CompiledAlwaysBlock { .. }
+        ) && (self.cold.read_signal_ids.iter()).any(|r| self.cold.write_signal_ids.contains(r))
+    }
+}
+
 /// Cold half of a `CombEntry` — see `CombEntry::cold`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CombEntryCold {
+    /// Lexical instance of a continuous RHS that may enter the interpreter.
+    /// An empty scope selects the top module independently of the waking process.
+    rhs_time_scope: Option<Arc<str>>,
     /// Preferred hierarchical scope for resolving unqualified identifiers.
     scope_hint: Option<String>,
     /// Pre-resolved signal IDs for reads (for fast dependency lookup).
@@ -1577,13 +1831,75 @@ struct CombEntryCold {
     /// compiled form counts with an `Insn::CovHit`). Never cached.
     #[serde(skip)]
     cov: Option<u32>,
+    /// §9.2.2.2: evaluating the entry is observable beyond its outputs
+    /// (see `time0_effects`); it waits for the time-0 start batch.
+    time0_effects: bool,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB028";
+// §9.2.2.2.1 (#844): rebuild dependency tables made before packed-region
+// sensitivity exclusion; their layout is readable but their edges are stale.
+// §9.7 (#940): `Insn::LoadProcessStatus` renumbers the instructions after it.
+// §9.2.2.2: whole-struct reads of a collapsed continuous copy depended on
+// member ids that the collapse left unused; those edges are stale. Reads of
+// an element of an unpacked array of structs, or of the whole array, now
+// depend on its members too.
+// §10.3.3: keep falling and turn-off delays when prepared tables are restored.
+// §10.3.3 / §28.16: retain each delayed entry's original transition target.
+// §10.3.3 / §28.16: and the fall and turn-off delays of a select target.
+// §7.4.1: compiled members of ascending packed arrays of structs slice from slot 0.
+// §10.9.2: scalarized resolver calls expand structure replication.
+// §7.4.2: compiled blocks sign-extend an index into an array with a negative bound.
+// §10.3.2, §13.4, §23.6: a called function's name and frame names are not
+// unresolved reads; whole arrays through an instance-array element, named and
+// top-spelled struct-array actuals depend on their elements and members.
+// §10.9.1, §11.8.1, §7.2.1, §7.4.1, §11.4.14: typed pattern keys, operand signs, packed elements, stream widths.
+// §23.3.2, §7.4: elements of a multidimensional array member of an instance-array
+// element are read and written by the interpreter and depend on their own signals.
+// §7.4.1, §6.20: elements of packed-array members of struct formals and nested
+// callees reading module parameters inline.
+// §12.5.4, §11.4.13: `case inside` with a wildcard, range or real item and `inside` with a
+// real operand, a fill or a negative member run on the interpreter's matcher.
+// §5.7.1, §7.4.1: unsized signed decimal widths with a sign bit; multidimensional
+// packed range nonblocking writes are left to the interpreter.
+// §10.3.2, §9.2.2.1: shared-read batches leave out members with fused branches or jump
+// tables, chain fusion relocates branches within one process class, and an instance's
+// read of an unnamed memory cell stays unresolved.
+// §13.4.1, §26.3: a scope-qualified function's return variable and the name of a callee
+// called through a package or `$unit` are not reads; its body's reads are.
+// §6.21, §13.4.2, §7.4.1: continuous assigns calling a static function whose local constant
+// selects write whole before a read compile; a call selecting an ascending or offset-range
+// variable of its callee stays interpreted.
+// §10.9.1, §26.3: a named assignment pattern key carries its lexically bound type name.
+// §6.18, §6.24.1: a cast to a typedef of real is a real operand of a continuous assignment.
+// §9.2.2.2, §10.3: CombEntryCold::time0_effects; a variable a called function writes is
+// not a read of its caller.
+// §7.10.2, §12.7.1: a for loop storing a queue pop into a variable or array element compiles.
+// §9.2.2.2.1: parameterized instance vectors retain disjoint sensitivity regions.
+// §6.24.1: compiled sign conversions use the self-determined operand width.
+// §10.9.1: packed array default drivers retain their element type.
+// §20.8.1, §7.4.1: `$clog2` of a constant folds, and a select bound that does
+// not fold still maps its label to a physical bit.
+// §20.8.1, §11.6.1: a folded `$clog2` is signed, and folds only a literal or parameter.
+// §7.4.1: unfolded select bounds on a packed multidimensional base run interpreted.
+// §9.4.2.2: an `@*` block that reads a variable it writes with `<=` runs as a
+// process, not as a combinational entry.
+// §6.12.1, §6.24.1, §12.5: `RealToInt` (a new opcode) rounds a value that may be real fitted
+// to 64 integral bits, continuous assignments see which signals are real, a value stored into
+// a real target converts first, and a real `case` runs interpreted.
+// §10.3, §10.10: a continuous assignment of an unpacked concatenation to a fixed array
+// drives each element. §3.14.2.3: scoped time reads of continuous assignments are typed
+// by their result. §6.11.2: a gate-shaped assignment to a 2-state scalar is no fused gate.
+// §6.24.1, §7.4.3, §9.4.2: struct-parameter field casts, part-selects of whole elements after a
+// packed index, and alias nets for event controls on packed-struct members.
+// Packed word selects inherit the declared dimensions of their bank.
+// §9.4.2: a selected member can require a value waiter instead of a comb block.
+// §6.24.1, §9.4.2: integer atom casts keep their operand, and a packed-struct member event
+// tries every scope spelling for its alias net.
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB079";
 
 /// One `comb_dep_edges` element: a dependent entry and the bits of the
 /// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct DepEdge {
     mask: u64,
     entry: u32,
@@ -1599,6 +1915,8 @@ struct PreparedCombCacheRef<'a> {
     time0_idx: &'a [usize],
     time0_deferred: &'a [CombEntry],
     cont_driven: &'a HashSet<usize>,
+    gate_fall_delay_by_id: &'a HashMap<usize, u64>,
+    gate_off_delay_by_id: &'a HashMap<usize, u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1611,17 +1929,20 @@ struct PreparedCombCache {
     time0_idx: Vec<usize>,
     time0_deferred: Vec<CombEntry>,
     cont_driven: HashSet<usize>,
+    gate_fall_delay_by_id: HashMap<usize, u64>,
+    gate_off_delay_by_id: HashMap<usize, u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SimOutput {
     pub time: u64,
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct NbaEntry {
+    /// §10.10: captured elements of a whole unpacked-array assignment.
+    elements: Option<Vec<Value>>,
     lhs: Option<Expression>,
     value: Value,
     resolved_id: Option<usize>,
@@ -1661,8 +1982,7 @@ struct NbaEntry {
     root_frame: Option<(String, Value, Option<String>)>,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct JoinWaiter {
     parent_pid: usize,
     child_pids: HashSet<usize>,
@@ -1683,8 +2003,7 @@ struct JoinWaiter {
 /// IEEE 1800-2023 §9.7: info stored when a process is explicitly suspended
 /// via `process::suspend()`. The process is removed from whatever queue it
 /// was parked in; `resume()` uses this to re-schedule it.
-#[derive(Clone)]
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SuspendedProc {
     /// Continuation statements to run when the process resumes.
     continuation: ProcCont,
@@ -1696,7 +2015,7 @@ struct SuspendedProc {
 }
 
 /// §9.7 `process::await()`: a process blocked waiting for another's termination.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AwaitWaiter {
     target_pid: usize,
     waiter_pid: usize,
@@ -1704,7 +2023,7 @@ struct AwaitWaiter {
 }
 
 /// Header of a two-state stream in `Simulator::ts_arena`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct TsHdr {
     off: u32,
     /// Stream length (13 bits) | executor kind (3 bits, `TS_HDR_KIND_SHIFT`);
@@ -1738,6 +2057,7 @@ impl TsHdr {
 const EDGE_ARMED: u8 = 1;
 const EDGE_HOLD: u8 = 2;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct NbaFast {
     signal_id: usize,
     value: Value,
@@ -1763,7 +2083,7 @@ struct ParallelBlockSlice {
 unsafe impl Send for ParallelBlockSlice {}
 unsafe impl Sync for ParallelBlockSlice {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EdgeSensitiveBlock {
     /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
     /// `Vec<Sensitivity>` (with String name) used to live here too —
@@ -1777,6 +2097,7 @@ struct EdgeSensitiveBlock {
     /// rebuilds the body and keeps it only where a later reader needs it
     /// (see `drop_compiled_edge_block_asts`).
     stmt: Statement,
+    #[serde(skip)]
     lazy: Option<Box<LazyAlways>>,
     kind: AlwaysKind,
     /// Instance scope the block was inlined under, empty for top-level.
@@ -1841,25 +2162,24 @@ enum DeferredAlways {
     },
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SensitivityId {
     signal_id: usize,
     edge: EdgeKind,
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it. Boxed, like
-    /// `value_of`: almost every term has neither, and an inline
+    /// block edge paths carry it but do not yet evaluate it. Shared with
+    /// the other operands of this event expression. An inline
     /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
     /// sensitivity lists on a 64k-cell DRAM).
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -1868,20 +2188,27 @@ struct SensitivityId {
     /// waiter armed. Re-resolved whenever an operand moves without firing,
     /// so the wait follows the index to the element it selects now.
     cell: bool,
+    /// §23.3.3, §10.3.3: how the NAME this term was written with starts at
+    /// time 0 when it is a port formal or an identity net (`assign y = x`)
+    /// collapsed onto its source's id: 0 for a name that is no such alias,
+    /// 1 for a 4-state alias (from x), 2 for a 2-state one (from 0). The
+    /// alias takes the source's time-0 value as an update from that start,
+    /// one the source's own readers never see (§6.8: an initializer is no
+    /// event). See `Simulator::alias_t0_kind`.
+    alias_t0: u8,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Box<Expression>>,
+    iff: Option<Rc<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Box<Expression>>,
+    value_of: Option<Rc<Expression>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct EdgeFanout {
     posedge: Vec<usize>,
     negedge: Vec<usize>,
@@ -1891,8 +2218,7 @@ struct EdgeFanout {
     lsbedge: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 enum EdgeKind {
     Posedge,
     Negedge,
@@ -1926,7 +2252,7 @@ impl EdgeKind {
 #[derive(Debug, Clone)]
 /// A process blocked in `semaphore.get(n)` because the count was below `n`
 /// (IEEE 1800-2017 §15.3.3). Woken by a `put` that raises the count enough.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SemGetWaiter {
     pid: usize,
     /// Keys still required.
@@ -1934,7 +2260,7 @@ struct SemGetWaiter {
     cont: ProcCont,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MailboxGetWaiter {
     pid: usize,
     lvalue: Expression,
@@ -1948,7 +2274,7 @@ struct MailboxGetWaiter {
 /// §15.4.1 — a process blocked on `mailbox.put(v)` because a BOUNDED mailbox is
 /// full. The value is captured at the (blocking) call; when a `get`/`try_get`
 /// frees a slot the value is stored and `cont` is rescheduled.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MailboxPutWaiter {
     pid: usize,
     value: Value,
@@ -1991,8 +2317,7 @@ enum EventListShape {
     NonPlain,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EventWaiter {
     pid: usize,
     /// Simulation time when this waiter parked. Drives the hang report:
@@ -2044,8 +2369,7 @@ struct EventWaiter {
 }
 
 /// §9.4.2: how a waiter re-evaluates its expression terms after it armed.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct WaiterValueCtx {
     /// The name-resolution scope the waiting process armed in. The drain runs
     /// outside that process, and a bare `mem[i]` in a sub-module instance
@@ -2056,6 +2380,55 @@ struct WaiterValueCtx {
     cells: bool,
 }
 
+/// The name-keyed metadata a frame-local's declaration registers: its
+/// typedef, class, declared type, struct members, packed layout and widths,
+/// under the bare name and its `name.member` keys. Two concurrent processes
+/// whose same-named locals differ in type share these tables, so the one
+/// that declared last displaced the other's; `capture_local_meta` keeps a
+/// displaced declaration's entries in `local_meta_cache` and
+/// `reapply_local_meta` installs them again when a process whose frames
+/// claim that declaration runs.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(super) struct LocalMeta {
+    /// A struct's: `name.member` entries belong to it.
+    members: bool,
+    typedef: Option<String>,
+    class: Option<String>,
+    container: Option<String>,
+    type_args: Option<Vec<Expression>>,
+    decl_types: Vec<(String, Rc<DataType>)>,
+    struct_members: Vec<(String, Vec<String>)>,
+    packed_fields: Vec<(String, Vec<(String, u32, u32)>)>,
+    elem_widths: Vec<(String, u32)>,
+    full_dims: Vec<(String, Vec<(i64, i64)>)>,
+    width: Option<u32>,
+    signed: bool,
+    real: bool,
+    string: bool,
+}
+
+/// Where a frame-local's declaration came from: its statement, and the class
+/// and specialization it ran in. Frames running the same declaration register
+/// the same metadata, so the cache of displaced metadata is keyed by it.
+#[derive(Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaOrigin {
+    span: (usize, usize),
+    class: Option<String>,
+    spec: Option<(String, String)>,
+}
+
+/// A frame-local declaration a process has executed: the frame it declared
+/// into, the local's name and its declaration (an index into
+/// `local_meta_origins`). The list rides the process context, not the frame
+/// generation: a fork child shares its parent's frames (§9.3.2), and its
+/// block's `T x;` hides the parent's `U x;` from the child only.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct MetaClaim {
+    frame: u64,
+    name: String,
+    origin: u32,
+}
+
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
 /// class, awaited/triggered as `@m_event` / `->m_event` from a method on
 /// `this`). Unlike a module-scope named event, a class `event` field has no
@@ -2064,28 +2437,154 @@ struct WaiterValueCtx {
 /// pair is a distinct synchronization object (IEEE 1800-2023 §15.5). The key is the
 /// raw `(this_handle, field_name)`; `->`/`@` inside a method both resolve to
 /// the same `this`, so a trigger and a wait on the same object match.
-#[derive(Clone)]
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum InstanceEventKeys {
     One((usize, String)),
     Any(Vec<(usize, String)>),
 }
 
-impl InstanceEventKeys {
-    fn contains(&self, key: &(usize, String)) -> bool {
-        match self {
-            Self::One(own) => own == key,
-            Self::Any(keys) => keys.contains(key),
-        }
-    }
-}
-
-#[derive(Clone)]
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct InstanceEventWaiter {
     key: InstanceEventKeys,
     pid: usize,
     continuation: ProcCont,
+}
+
+/// The parked `@ev` waiters on class-member events, indexed by event and by
+/// pid. A process parked forever on a rarely-fired event (a reset watcher
+/// left behind by `fork ... join_any`) costs nothing per trigger of another
+/// event or per suspension query; entries keep their arrival order, so a
+/// trigger still wakes its waiters in the order they parked.
+#[derive(Default)]
+struct InstanceEventWaiters {
+    entries: BTreeMap<u64, InstanceEventWaiter>,
+    by_key: HashMap<(usize, String), std::collections::BTreeSet<u64>>,
+    by_pid: HashMap<usize, Vec<u64>>,
+    next: u64,
+}
+
+impl InstanceEventWaiters {
+    fn keys_of(w: &InstanceEventWaiter) -> &[(usize, String)] {
+        match &w.key {
+            InstanceEventKeys::One(k) => std::slice::from_ref(k),
+            InstanceEventKeys::Any(ks) => ks,
+        }
+    }
+
+    fn push(&mut self, w: InstanceEventWaiter) {
+        let seq = self.next;
+        self.next += 1;
+        for k in Self::keys_of(&w) {
+            self.by_key.entry(k.clone()).or_default().insert(seq);
+        }
+        self.by_pid.entry(w.pid).or_default().push(seq);
+        self.entries.insert(seq, w);
+    }
+
+    fn contains_pid(&self, pid: usize) -> bool {
+        self.by_pid.contains_key(&pid)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn unlink(&mut self, seq: u64, w: &InstanceEventWaiter) {
+        for k in Self::keys_of(w) {
+            if let Some(set) = self.by_key.get_mut(k) {
+                set.remove(&seq);
+                if set.is_empty() {
+                    self.by_key.remove(k);
+                }
+            }
+        }
+        if let Some(seqs) = self.by_pid.get_mut(&w.pid) {
+            seqs.retain(|&s| s != seq);
+            if seqs.is_empty() {
+                self.by_pid.remove(&w.pid);
+            }
+        }
+    }
+
+    /// Drop every waiter of `pid` (the process was killed or disabled).
+    fn remove_pid(&mut self, pid: usize) {
+        let Some(seqs) = self.by_pid.remove(&pid) else {
+            return;
+        };
+        for seq in seqs {
+            if let Some(w) = self.entries.remove(&seq) {
+                for k in Self::keys_of(&w) {
+                    if let Some(set) = self.by_key.get_mut(k) {
+                        set.remove(&seq);
+                        if set.is_empty() {
+                            self.by_key.remove(k);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_pids<'a>(&mut self, pids: impl IntoIterator<Item = &'a usize>) {
+        for &pid in pids {
+            self.remove_pid(pid);
+        }
+    }
+
+    /// Park every waiter on `from` on `to` instead.
+    fn rekey(&mut self, from: &(usize, String), to: &(usize, String)) {
+        let Some(seqs) = self.by_key.remove(from) else {
+            return;
+        };
+        for seq in &seqs {
+            if let Some(w) = self.entries.get_mut(seq) {
+                match &mut w.key {
+                    InstanceEventKeys::One(k) => *k = to.clone(),
+                    InstanceEventKeys::Any(ks) => {
+                        for k in ks.iter_mut().filter(|k| *k == from) {
+                            *k = to.clone();
+                        }
+                    }
+                }
+            }
+        }
+        self.by_key.entry(to.clone()).or_default().extend(seqs);
+    }
+
+    /// Remove and return, in parking order, every waiter on `key`.
+    fn take_key(&mut self, key: &(usize, String)) -> Vec<(usize, ProcCont)> {
+        let Some(seqs) = self.by_key.remove(key) else {
+            return Vec::new();
+        };
+        let mut woken = Vec::with_capacity(seqs.len());
+        for seq in seqs {
+            if let Some(w) = self.entries.remove(&seq) {
+                self.unlink(seq, &w);
+                woken.push((w.pid, w.continuation));
+            }
+        }
+        woken
+    }
+}
+
+impl serde::Serialize for InstanceEventWaiters {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.entries.values())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for InstanceEventWaiters {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut waiters = Self::default();
+        for w in Vec::<InstanceEventWaiter>::deserialize(d)? {
+            waiters.push(w);
+        }
+        Ok(waiters)
+    }
 }
 
 /// Timing wheel for O(1) near-future event scheduling.
@@ -2096,6 +2595,10 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+/// §14.5: the hidden clocking names of the operand samples of a clockvar
+/// bound to an expression (`__xz_cbop.sum.0`), and the unresolvable net name
+/// the clockvar itself is registered under. Unreachable from SV source.
+const CB_OPERAND_PREFIX: &str = "__xz_cbop.";
 
 /// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
 /// declared skew samples with 1step too (§14.3 default), so the default-input
@@ -2105,8 +2608,7 @@ const CB_SKEW_1STEP: u64 = u64::MAX;
 /// §14.4 explicit input skew `#N` (N > 0): a net's values over the last N
 /// ticks. `changes` holds `(slot, value at the end of that slot)` in time
 /// order, `init` the value before the first recorded slot.
-#[derive(Default)]
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct ClockingHist {
     init: Option<Value>,
     changes: VecDeque<(u64, Value)>,
@@ -2114,6 +2616,128 @@ struct ClockingHist {
 }
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
+
+/// A list of `(pid, item)` entries that also counts each pid's entries, so
+/// "does this process wait here?" is O(1) however many processes wait.
+#[derive(Debug)]
+pub(crate) struct PidVec<T> {
+    items: Vec<(usize, T)>,
+    counts: HashMap<usize, u32>,
+}
+
+impl<T> Default for PidVec<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            counts: HashMap::default(),
+        }
+    }
+}
+
+impl<T> PidVec<T> {
+    pub(crate) fn push(&mut self, entry: (usize, T)) {
+        *self.counts.entry(entry.0).or_insert(0) += 1;
+        self.items.push(entry);
+    }
+
+    pub(crate) fn contains_pid(&self, pid: usize) -> bool {
+        self.counts.contains_key(&pid)
+    }
+
+    fn forget(counts: &mut HashMap<usize, u32>, pid: usize) {
+        if let Some(c) = counts.get_mut(&pid) {
+            *c -= 1;
+            if *c == 0 {
+                counts.remove(&pid);
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, index: usize) -> (usize, T) {
+        let entry = self.items.remove(index);
+        Self::forget(&mut self.counts, entry.0);
+        entry
+    }
+
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&(usize, T)) -> bool) {
+        let counts = &mut self.counts;
+        self.items.retain(|entry| {
+            let k = keep(entry);
+            if !k {
+                Self::forget(counts, entry.0);
+            }
+            k
+        });
+    }
+
+    /// Remove and return, in order, the entries whose `marked` flag is set.
+    pub(crate) fn take_marked(&mut self, marked: &[bool]) -> Vec<(usize, T)> {
+        if !marked.iter().any(|&m| m) {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        let items = std::mem::take(&mut self.items);
+        self.items.reserve(items.len());
+        for (entry, &m) in items.into_iter().zip(marked) {
+            if m {
+                Self::forget(&mut self.counts, entry.0);
+                taken.push(entry);
+            } else {
+                self.items.push(entry);
+            }
+        }
+        taken
+    }
+
+    pub(crate) fn extend(&mut self, entries: impl IntoIterator<Item = (usize, T)>) {
+        for entry in entries {
+            self.push(entry);
+        }
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, (usize, T)> {
+        self.items.iter()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl<T> std::ops::Index<usize> for PidVec<T> {
+    type Output = (usize, T);
+    fn index(&self, index: usize) -> &(usize, T) {
+        &self.items[index]
+    }
+}
+
+impl<T> IntoIterator for PidVec<T> {
+    type Item = (usize, T);
+    type IntoIter = std::vec::IntoIter<(usize, T)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
+
+impl<T: serde::Serialize> serde::Serialize for PidVec<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(s)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for PidVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut v = Self::default();
+        for entry in Vec::<(usize, T)>::deserialize(d)? {
+            v.push(entry);
+        }
+        Ok(v)
+    }
+}
 
 /// A suspended process's remaining work: a shared statement list plus a cursor,
 /// chained to whatever runs after that list is exhausted.
@@ -2390,7 +3014,7 @@ impl ProcCont {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: remaining.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     count.span,
                 );
@@ -2426,7 +3050,7 @@ type EventList = VecDeque<(usize, ProcCont)>;
 /// and the §9.4.2 bit-select re-test both need the values, and taking them from
 /// the leader is what removes the scattered reads. `XEZIM_CLKTREE_PROBE=1`
 /// verifies that equality holds rather than assuming it.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct EdgeGroupMemo {
     generation: u64,
     fires_pos: bool,
@@ -2440,6 +3064,7 @@ struct EdgeGroupMemo {
 
 /// Built-in clock generator: replaces `always #N clk = ~clk` with O(1) toggle.
 /// Eliminates AST cloning and traversal for the most common simulation pattern.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ClockGen {
     signal_id: usize,
     half_period: u64,
@@ -2467,6 +3092,7 @@ struct ClockGen {
 /// every wakeup; PLL models can execute that path millions of times. Keeping
 /// one owned delay/body pair preserves per-iteration delay evaluation without
 /// allocating a new continuation for every clock edge.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FastDelayAlways {
     delay: Expression,
     body: Statement,
@@ -2491,7 +3117,7 @@ struct FastDelayAlways {
 /// `#[repr(C)]` to lock down field order across builds.  Total
 /// size: 16 bytes.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JitNbaSideEntry {
     pub(crate) signal_id: u32,
     pub(crate) _pad: u32,
@@ -2505,6 +3131,7 @@ pub(crate) struct JitNbaSideEntry {
 /// array elements use a sparse retained map: memory-heavy designs can contain
 /// tens of millions of elements while scheduling only a few array NBAs in any
 /// one delta cycle, so a full `4 * num_signals` index is mostly cold metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct NbaFastIndex {
     /// `dense_entries[id]` holds the NBA queue index for a named signal, or
     /// `u32::MAX` if no in-flight entry exists this iter.
@@ -2577,6 +3204,8 @@ impl NbaFastIndex {
 }
 
 mod aggregate_assignments;
+mod pattern_array_items;
+mod intra_pattern_shape;
 mod annex_n;
 mod aggregate_expressions;
 mod aggregate_members;
@@ -2586,6 +3215,8 @@ mod assertions;
 mod assignments;
 mod bytecode_runtime;
 mod calls;
+mod checkpoint;
+mod checkpoint_calls;
 mod class_access;
 mod class_members;
 mod class_methods;
@@ -2610,9 +3241,12 @@ mod dpi_export;
 mod dpi_imports;
 mod dpi_task;
 mod edges;
+mod enum_receivers;
 mod event_bits;
 mod event_loop;
 mod event_stamps;
+mod event_waiters;
+mod stall_progress;
 mod expression_types;
 mod expressions;
 mod file_io;
@@ -2628,6 +3262,7 @@ mod method_types;
 mod module_paths;
 mod named_events;
 mod names;
+mod packed_assignment_patterns;
 mod process_control;
 mod process_scopes;
 mod processes;
@@ -2638,16 +3273,21 @@ mod sensitivity;
 mod settling;
 mod setup;
 mod signal_commits;
+mod signal_width_table;
+pub use signal_width_table::SignalWidths;
 mod statement_assignments;
 mod statements;
 mod sva_until;
 mod system_tasks;
+mod time0_effects;
 mod two_state;
 mod type_metadata;
 mod udp;
+mod unpacked_slices;
 mod value_display;
 mod virtual_interfaces;
 mod waveforms;
+mod ref_aliases;
 
 /// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
 const MEMBER_DIST_MARK: &str = "\u{1}member:";
@@ -2678,9 +3318,16 @@ mod uvm_dpi {
     }
 }
 mod vpi_api;
+mod vpi_value;
+use vpi_value::fill_vpi_value;
+pub use vpi_value::{vpi_get_value, vpi_put_value};
+mod vpi_assert;
 mod vpi_cb;
 mod vpi_model;
 use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
+pub use checkpoint::{
+    set_restore as set_checkpoint_restore, set_save_at as set_checkpoint_save_at,
+};
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
@@ -2817,11 +3464,16 @@ struct PerTickAccum {
     t_process: u64,
     t_snap: u64,
     t_sched: u64,
+    t_clocking: u64,
+    t_cond: u64,
+    t_late: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TimingWheel {
-    wheel: Vec<EventList>,              // circular array of WHEEL_SIZE slots
-    bitmap: [u64; BITMAP_WORDS],        // occupancy bitmap: bit set = slot non-empty
+    wheel: Vec<EventList>, // circular array of WHEEL_SIZE slots
+    #[serde(with = "serde_big_array")]
+    bitmap: [u64; BITMAP_WORDS], // occupancy bitmap: bit set = slot non-empty
     overflow: BTreeMap<u64, EventList>, // far-future events
     /// Number of non-zero bitmap words, so `is_empty` is O(1) instead of a
     /// 64-word compare per tick.
@@ -3348,10 +4000,60 @@ fn note_store_write(bits: u64) {
     STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
 
-/// A write to the string-keyed stores that does not name its target.
+
+/// An event was triggered or re-bound, so every `<event>.triggered` read may
+/// have changed. A stamp is not a property write, so without this a gated
+/// `wait(ev.triggered)` would never re-check; the waiters read the name
+/// `triggered`, which every trigger notes whatever the event's spelling or
+/// alias.
 #[inline]
-fn bump_store_gen() {
-    note_store_write(u64::MAX);
+fn note_event_trigger() {
+    note_store_write(name_bit("triggered"));
+}
+
+/// The `STORE_WRITE_MASK` bits of a runtime signal-map key: those of each
+/// name it is spelled from outside its index brackets (`top.blk.acc`,
+/// `12#m_q[3]`, `Cls::count`), so a write to a module variable does not
+/// re-check every gated waiter. A key with another compiler-generated part
+/// or an escaped identifier names no source spelling the waiters could
+/// share, so it notes every bit. A virtual-interface binding key
+/// (`__vif_local__x`, `__vif_return__`) notes its own spelling only: no
+/// gated condition reads one (`cond_operand_gated` declines vif-bound
+/// names), so a call binding a vif formal need not re-check them all.
+fn signal_key_bits(k: &str) -> u64 {
+    if k.contains('\\') {
+        return u64::MAX;
+    }
+    let b = k.as_bytes();
+    let mut bits = 0u64;
+    let mut depth = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'[' {
+            depth += 1;
+            i += 1;
+        } else if c == b']' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+        } else if depth == 0 && (c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            let run = &k[start..i];
+            if run.starts_with("__")
+                && !run.starts_with("__vif_local__")
+                && !run.starts_with("__vif_return__")
+            {
+                return u64::MAX;
+            }
+            bits |= name_bit(run);
+        } else {
+            i += 1;
+        }
+    }
+    if bits == 0 { u64::MAX } else { bits }
 }
 
 /// The names written since the last call.
@@ -3362,7 +4064,7 @@ fn take_store_writes() -> u64 {
 /// A class object's property map. Reads deref to the plain map; every
 /// mutating entry point notes the property name in `STORE_WRITE_MASK`, so no
 /// write site can be missed by the condition-waiter gate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct PropMap(HashMap<String, Value>);
 
 impl PropMap {
@@ -3384,7 +4086,7 @@ impl PropMap {
 }
 
 /// Class static properties (`Class::prop` keys), noted like `PropMap`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct StaticMap(HashMap<String, Value>);
 
 impl StaticMap {
@@ -3402,7 +4104,7 @@ impl StaticMap {
 /// Lazily built on first element read by
 /// `Simulator::materialize_class_param_array`; `lo`/`hi` preserve bounds;
 /// `default` carries the declared element type for invalid/unknown indices.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClassParamArray {
     lo: i64,
     hi: i64,
@@ -3460,13 +4162,16 @@ type PropOwners = HashMap<String, (String, Arc<super::elaborate::ElaboratedClass
 
 /// Property names some class declares with a given property kind; a name in
 /// none of them skips the per-class checks for that kind.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ClassMemberNames {
     statics: HashSet<String>,
     /// Cheap prefilter for selected static-property accesses.
+    #[serde(with = "serde_big_array")]
     static_first: [bool; 256],
     vif_props: HashSet<String>,
     /// First bytes of the `vif_props` names: a cheap prefilter for the
     /// member-chain checks that ask whether a name can be a vif property.
+    #[serde(with = "serde_big_array")]
     vif_first: [bool; 256],
     /// Every declared method name, of any kind.
     methods: HashSet<String>,
@@ -3487,15 +4192,22 @@ struct ClassMemberNames {
     /// Typedef names (module or class scope) whose target is a class-scoped
     /// type (`typedef R::elem_t et_t;`).
     scoped_typedefs: HashSet<String>,
+    /// Class typedef names whose target is a virtual interface (§25.9).
+    vif_typedef_leaves: HashSet<String>,
     /// Names that may prefix a class-scope reference without being a
     /// class: class parameters and typedef names.
     scope_prefixes: HashSet<String>,
     /// First bytes of the `params` names: a cheap prefilter.
+    #[serde(with = "serde_big_array")]
     param_first: [bool; 256],
     /// Every class type/value parameter name.
     params: HashSet<String>,
     /// Every associative-array property name.
     assoc_props: HashSet<String>,
+    /// Every property some class records a multidimensional collection
+    /// shape for (`prop_coll_shapes`): a prefilter for the declared-shape
+    /// lookup, which a one-dimensional property never needs.
+    shaped_props: HashSet<String>,
     /// Every `string` property name.
     string_props: HashSet<String>,
     /// Every static property and class `localparam` name: the only names
@@ -3523,6 +4235,7 @@ type LoopVarSnapshot = (
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
 /// method of a given runtime class (class tables are fixed at run time).
+#[derive(serde::Serialize, serde::Deserialize)]
 enum MemberCollKind {
     /// A collection member: per-instance (`None`) or a static fixed array of
     /// the named owner class.
@@ -3536,7 +4249,16 @@ enum MemberCollKind {
     Plain { raws: Vec<String>, unbound: bool },
 }
 
-#[derive(Debug, Clone)]
+type PackedAggregateLayout = (Vec<(String, u32, u32)>, u32);
+
+#[derive(Debug)]
+struct ClassPackedLayouts {
+    // Keep the source alive for the lifetime of the pointer-keyed cache.
+    _declaration: Rc<crate::ast::types::StructUnionType>,
+    variants: Vec<(Vec<(String, Value)>, Rc<PackedAggregateLayout>)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClassInstance {
     class_name: String,
     properties: PropMap,
@@ -3566,7 +4288,7 @@ struct ClassInstance {
 
 /// §16.4 a deferred immediate assertion's pending report: the action block
 /// to run when it matures, unless its process resumes first (a flush).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DeferredReport {
     pid: usize,
     kind: crate::ast::stmt::DeferredAssertion,
@@ -3585,6 +4307,12 @@ struct DeferredReport {
     class_context: Option<String>,
     /// §20.12: what an assertion control selects the assertion by.
     ctl: CtlIdent,
+    /// §16.4.2: the `assertion_stats` entry the outcome is counted in when
+    /// the report matures, with its kind tag (0 assert, 1 assume, 2 cover)
+    /// and location. A flushed or superseded report is no attempt.
+    stat_key: usize,
+    stat_kind: u8,
+    stat_loc: (Option<u32>, usize),
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -3595,8 +4323,7 @@ struct DeferredReport {
 /// `name` in `assertion_stats`. Today only the storage + drain are in
 /// place; no producer wires probes up. M9 (SVA elaboration) is the
 /// consumer-side follow-up.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ObservedProbe {
     /// The site's `assertion_stats` key, location and kind tag, so its
     /// outcome lands on the same entry the other assertion paths use.
@@ -3611,8 +4338,7 @@ struct ObservedProbe {
 
 /// §9.4.2: one term in an assertion clocking event, including its last
 /// value. A simple signal keeps its resolved name for the common fast path.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaClockEvent {
     event: EventExpr,
     signal: Option<String>,
@@ -3624,7 +4350,7 @@ struct SvaClockEvent {
 /// any term in its clocking event drives per-cycle evaluation of `body`.
 /// Every clock tick starts one attempt of `node`; `attempts` holds the ones
 /// still in flight (multi-cycle sequences, deferred consequents).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaClockedSite {
     /// Unique identifier (hash of span position) so dedup across
     /// re-executions is cheap.
@@ -3653,6 +4379,13 @@ struct SvaClockedSite {
     past_names: Vec<String>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
+    /// `node` holds an `accept_on` / `reject_on` (§16.12.14), whose
+    /// condition is checked in every time step, not only at the ticks.
+    async_abort: bool,
+    /// §16.12.14: attempts an asynchronous abort settled in a time step
+    /// between ticks, reported at the next tick (or at the end of
+    /// simulation) ahead of that tick's results.
+    settled: Vec<SvaOutcome>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
     /// flight is cancelled and no new one starts. Evaluated with the current
     /// (unsampled) values, as the LRM's asynchronous reset semantics require.
@@ -3662,6 +4395,15 @@ struct SvaClockedSite {
     fired: bool,
     /// Attempts still in flight, oldest first.
     attempts: Vec<SvaState>,
+    /// IEEE 1800-2017 Clause 39 (assertion API): what the VPI reports of
+    /// each attempt in `attempts`, in the same order (`sva_take_meta` pads
+    /// it, so the engine never depends on it). Not saved: an attempt
+    /// restored from a checkpoint reports the restore time as its start.
+    #[serde(skip)]
+    attempt_meta: Vec<SvaAttemptMeta>,
+    /// The same for the attempts in `settled`.
+    #[serde(skip)]
+    settled_meta: Vec<SvaAttemptMeta>,
     /// LRM §16.9.3 `$past(<signal>, N)` per-signal value history.
     /// Each entry is `signal_name → ring of sampled values (index 0 =
     /// this cycle, index N = N cycles ago)`. Refreshed at every clock fire
@@ -3763,8 +4505,7 @@ enum SvaSeq {
 type SvaEnv = Vec<Value>;
 
 /// A §16.10 / §16.11 sequence match item.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaMatchItem {
     /// The assigned local `(slot, width, signed)`; `None` for a subroutine
     /// call run for its side effect.
@@ -3775,16 +4516,14 @@ struct SvaMatchItem {
 /// Sequence automaton: a cycle advances over `Tick` edges; every other edge
 /// is followed within the cycle. The accept state is reached at the cycle a
 /// match ends.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaNfa {
     states: Vec<Vec<SvaEdge>>,
     start: usize,
     accept: usize,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SvaEdge {
     Eps(usize),
     /// Follow when the boolean holds at this cycle.
@@ -3797,8 +4536,7 @@ enum SvaEdge {
     Assign(Vec<SvaMatchItem>, usize),
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SvaCompound {
     /// Both match; ends when the later one ends (§16.9.5).
     And(SvaNfa, SvaNfa),
@@ -3820,8 +4558,7 @@ enum SvaCompound {
 
 /// A sequence in flight: `pcs` are the states waiting for the next cycle,
 /// `subs` the compound edges being followed.
-#[derive(Debug, Clone, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct SvaRun {
     started: bool,
     /// The states waiting for the next cycle, each with its thread's local
@@ -3841,8 +4578,7 @@ impl SvaRun {
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaSubRun {
     /// `(state, edge)` of the `Sub` edge in the enclosing automaton.
     at: (usize, usize),
@@ -3859,8 +4595,7 @@ struct SvaSubRun {
 }
 
 /// A property body compiled for evaluation (§16.12).
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SvaNode {
     /// A sequence used as a property: holds iff it has a match. `strong`
     /// (§16.12.2): an attempt still in flight at the end of simulation fails.
@@ -3883,6 +4618,9 @@ enum SvaNode {
     And(Box<SvaNode>, Box<SvaNode>),
     Or(Box<SvaNode>, Box<SvaNode>),
     Iff(Box<SvaNode>, Box<SvaNode>),
+    /// §16.12.8 `p implies q`: both start at the same tick; holds when `p`
+    /// fails (vacuously, §16.14.8 z) or `q` holds. State: `SvaState::And`.
+    Implies(Box<SvaNode>, Box<SvaNode>),
     /// §16.12.12: arbitrary properties are started at each candidate tick.
     Until {
         left: Box<SvaNode>,
@@ -3893,10 +4631,28 @@ enum SvaNode {
     Eventually(Expression),
     /// §16.12.6 `s_always e`: fails the first tick `e` samples false.
     Always(Expression),
+    /// §16.12.14 `accept_on (cond) body` / `reject_on (cond) body`
+    /// (`accept`), and their `sync_` forms (`sync`): `cond` holding during
+    /// the evaluation of `body` aborts it, with success or failure.
+    Abort {
+        cond: Expression,
+        accept: bool,
+        sync: bool,
+        body: Box<SvaNode>,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(serde::Serialize)]
+/// IEEE 1800-2017 Clause 39: the per-attempt data of the assertion API
+/// (`s_vpi_attempt_info`), kept beside the attempt's evaluation state.
+#[derive(Debug, Clone, Copy, Default)]
+struct SvaAttemptMeta {
+    /// Simulation time (ticks) of the clock tick that started the attempt.
+    start_time: u64,
+    /// Clock ticks the attempt has been evaluated at.
+    clock_steps: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SvaOutcome {
     Pass,
     /// A vacuous success (§16.14.8), including an implication whose
@@ -3906,8 +4662,7 @@ enum SvaOutcome {
 }
 
 /// Per-attempt evaluation state mirroring `SvaNode`.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum SvaState {
     Seq(SvaRun),
     Not(Box<SvaState>),
@@ -3951,11 +4706,18 @@ enum SvaState {
     },
     /// `s_eventually` / `s_always`, with the attempt's local variables.
     Leaf(SvaEnv),
+    /// An abort property's evaluation; `started`: its first tick is past;
+    /// `aborted`: its condition settled it.
+    Abort {
+        body: Box<SvaState>,
+        env: SvaEnv,
+        started: bool,
+        aborted: bool,
+    },
 }
 
 /// One candidate start point of a property-valued until operand.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SvaUntilTick {
     left: SvaState,
     right: SvaState,
@@ -4010,7 +4772,7 @@ impl SvaNfaBuilder {
                 signed: false,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: "1".to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             span,
         )
@@ -4201,9 +4963,10 @@ impl SvaNfaBuilder {
 /// Covergroup handles live above this tag; class handles are plain heap indices.
 const CG_HANDLE_TAG: usize = 1 << 30;
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CovergroupInstance {
+    /// Coverpoints whose declared expression or sample formal is real (§19.5).
+    real_points: HashSet<String>,
     cg_name: String,
     /// The object whose constructor ran `cg = new` (a class-body
     /// covergroup): coverpoint expressions read ITS properties, so sampling
@@ -4291,7 +5054,7 @@ struct CpShape {
 /// Per-source-location running tally for `assert` / `assume` / `cover`,
 /// keyed by `Simulator::assert_stat_key` (source file and span start) so
 /// each distinct source position is tracked once across all executions.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 struct AssertionStat {
     /// "assert" / "assume" / "cover" — one of three kinds
     kind: u8,
@@ -4310,6 +5073,7 @@ struct AssertionStat {
 /// AST continuation chain. Registered only for `always` bodies whose whole
 /// statement tree compiles fallback-free (see `try_register_proc_fsm`).
 /// Two-state form of a process FSM body (see `TwoStateBlock::has_wait`).
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ProcFsmTs {
     block: super::bytecode::TwoStateBlock,
     /// The FSM's own two-state register file, swapped into `ts_regs` for a
@@ -4327,6 +5091,7 @@ struct ProcFsmTs {
     skip_until: u32,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ProcFsm {
     compiled: super::bytecode::CompiledBlock,
     ts: Option<Box<ProcFsmTs>>,
@@ -4355,8 +5120,10 @@ struct ProcFsm {
     is_always: bool,
     /// Roadmap step 13: rustc-native form of the body (XEZIM_AOT=1). The
     /// native fn loads/spills its registers from `native_frame` around each
-    /// suspension; bytecode execution is the fallback when absent.
+    /// suspension; bytecode execution is the fallback when absent. A
+    /// checkpoint leaves it out; a restore reattaches the one setup built.
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     native: Option<super::aot::AotFsmFn>,
     #[cfg(feature = "jit")]
     native_frame: Vec<u64>,
@@ -4364,6 +5131,7 @@ struct ProcFsm {
 
 /// What a Wait insn suspended on: (payload). Paired with the resume pc in
 /// `Simulator::fsm_suspend`.
+#[derive(serde::Serialize, serde::Deserialize)]
 enum FsmWait {
     /// Delay in global ticks (already quantized).
     Delay(u64),
@@ -4371,9 +5139,17 @@ enum FsmWait {
     Edge(u32),
 }
 
+type ClockingOutputDrive = (String, String, Value, Option<Expression>);
+type ClockingCycleDrive = (u64, String, String, Value, Option<Expression>);
+/// §14.5: an expression a clockvar is bound to and its operand nets, each
+/// with the hidden clocking name of its sample.
+type ClockingBoundExpr = (Expression, Vec<(String, String)>);
+type ClockingEdgeDrive = (String, Value, EdgeKind, u64, Option<Expression>);
+
 /// One clocking block's per-tick poll state: its clock resolved to a
 /// signal-table id once (None: fall back to the by-name read), the edge it
 /// advances on, and the level seen on the previous tick.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ClockingTick {
     cb: String,
     clk: String,
@@ -4386,8 +5162,7 @@ struct ClockingTick {
 /// (`begin_formal_dyn` / `commit_formal_dyn`).
 type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
 
-#[derive(Debug, Clone, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
@@ -4454,12 +5229,13 @@ struct ProcessContext {
     current_auto_task: Option<String>,
     /// See `Simulator::task_string_formals`.
     task_string_formals: Vec<TaskFrameStrings>,
+    /// See `Simulator::local_meta_claims`.
+    local_meta_claims: Vec<MetaClaim>,
 }
 
 /// Frame-local string classifications for task formals and scalar locals.
 /// They remain authoritative while other processes change global metadata.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TaskFrameStrings {
     /// `local_gen_stack` generation of the task's frame.
     fgen: u64,
@@ -4470,8 +5246,7 @@ struct TaskFrameStrings {
     others: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct FormalMetadataSnapshot {
     name: String,
     parts: FormalMetaParts,
@@ -4479,10 +5254,9 @@ struct FormalMetadataSnapshot {
 
 /// The name-keyed type metadata of one formal or local (see
 /// `snapshot_formal_parts`).
-#[derive(Debug, Clone, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct FormalMetaParts {
-    declared_type: Option<DataType>,
+    declared_type: Option<Rc<DataType>>,
     packed_fields: Option<Vec<(String, u32, u32)>>,
     packed_element_widths: Vec<(String, u32)>,
     packed_dimensions: Option<Vec<(i64, i64)>>,
@@ -4497,6 +5271,7 @@ struct FormalMetaParts {
 /// inline-enum local can change at run time: they hold while
 /// `Simulator::type_tables_gen` equals `type_gen`, and every use re-derives them
 /// otherwise.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MethodCallPlan {
     /// Keeps the method alive, and with it the address the plan is keyed by.
     _method: Arc<crate::ast::decl::ClassMethod>,
@@ -4521,7 +5296,7 @@ struct MethodCallPlan {
 /// A memoized `method_defining_class` answer: the defining class, the
 /// method, its inherited string property names, and its call plan once built
 /// (see `MethodCallPlan`).
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct MethodDef {
     class: std::rc::Rc<String>,
     method: Arc<crate::ast::decl::ClassMethod>,
@@ -4536,6 +5311,7 @@ struct MethodDef {
 /// `InstTemplate::seed` flag: seed the property with x (`prop_seeds_x`).
 const SEED_X: u8 = 4;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct InstTemplate {
     chain: Vec<Arc<crate::compiler::elaborate::ElaboratedClass>>,
     /// Pre-seeded scalar/handle property map for the chain (cloned in one
@@ -4586,6 +5362,7 @@ impl MethodCallPlan {
 /// hold the entry state for it, which is what an eager snapshot would have
 /// saved — and a name never written has nothing to restore. Every writer of
 /// the six tables calls `meta_note` first.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct MetaFrame {
     plan: std::rc::Rc<MethodCallPlan>,
     /// Positions in `plan.meta_ks` already saved (all of them once `full`).
@@ -4599,6 +5376,7 @@ struct MetaFrame {
 }
 
 /// See `MethodCallPlan`.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PortPlan {
     /// `port_is_plain_scalar` (declaration only).
     plain_scalar: bool,
@@ -4622,13 +5400,15 @@ struct PortPlan {
 enum RetConv {
     /// Not a numeric scalar: the value passes through untouched.
     Keep,
-    /// `real` / `shortreal` / `realtime`.
+    /// Binary64 real and realtime.
     Real,
+    ShortReal,
     /// An integral type; `two_state` for bit, byte, int, ... (§6.11.1).
     Int { two_state: bool },
 }
 
 /// See `MethodCallPlan` (functions only).
+#[derive(serde::Serialize, serde::Deserialize)]
 struct RetPlan {
     /// `method_return_is_string`, when no specialization can change it (type
     /// tables).
@@ -4652,8 +5432,7 @@ struct RetPlan {
 
 /// The name-keyed type metadata a subroutine-local declaration displaced
 /// (see `decl_shadow_log`).
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DeclShadow {
     width: Option<u32>,
     signed: bool,
@@ -4662,9 +5441,45 @@ struct DeclShadow {
     meta: FormalMetadataSnapshot,
 }
 
+/// `Simulator::decl_param_scope`'s state (§23.10).
+#[derive(Default)]
+struct DeclParamScopeCache {
+    /// The prefix asked for last, and whether it owns parameters (when it
+    /// does, the last of `tables` holds its overlay).
+    last: Option<(String, bool)>,
+    /// Per scope: the parameters declared in it or below it, by their name
+    /// relative to the scope (`u.g.L` is `g.L` for `u`), in table order.
+    groups: HashMap<String, std::rc::Rc<[(String, Value)]>>,
+    /// Overlaid copies of the design-wide table, least recently used first,
+    /// at most `DECL_PARAM_TABLES`. Lookups that alternate between hierarchies
+    /// with different outermost scopes (a testbench component and the design
+    /// under test) each keep a copy, instead of taking one hierarchy's groups
+    /// off a single copy and putting the other's on at every move.
+    tables: Vec<DeclParamTable>,
+}
+
+/// How many overlaid parameter tables `decl_param_scope` keeps.
+const DECL_PARAM_TABLES: usize = 4;
+
+/// One overlaid copy of the design-wide parameter table (§23.10).
+struct DeclParamTable {
+    /// The design-wide parameter table with the groups of `applied` on it.
+    table: std::rc::Rc<HashMap<String, Value>>,
+    /// The scopes whose groups `table` holds, outermost first, each with the
+    /// length `undo` had before its group went on.
+    applied: Vec<(String, usize)>,
+    /// What each group write replaced in `table`, in write order, so a group
+    /// comes off again in reverse.
+    undo: Vec<(String, Option<Value>)>,
+}
+
 /// One selected region of a declared packed value (§7.4.1 / §11.5.1).
 struct DeclaredPackedAccess {
     storage: String,
+    /// §23.10: the parameter table the declaration is sized against — the
+    /// instance's own parameters overlaid on the design-wide table when the
+    /// storage lives in an instantiated module; `None` for the top scope.
+    params: Option<std::rc::Rc<HashMap<String, Value>>>,
     is_signed: bool,
     static_target: Option<(String, Option<(String, String)>, String)>,
     offset: u32,
@@ -4683,8 +5498,7 @@ enum DeclaredStaticAccess {
 /// One subroutine activation's displaced declarations, restored when it
 /// returns. `frame_gen` is the activation's local-frame generation; `epoch` the
 /// `nested_run_epoch` at entry.
-#[derive(Debug, Clone)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DeclShadowFrame {
     frame_gen: u64,
     epoch: u64,
@@ -4692,6 +5506,11 @@ struct DeclShadowFrame {
     /// §6.21: fresh names a `string` declaration of this activation added
     /// to `string_signals`, taken back out when it ends.
     fresh_strings: Vec<String>,
+    /// Every FRESH name this activation declared (no metadata to put back):
+    /// the geometry such a declaration registers under the bare name is
+    /// removed when it ends (see `drop_fresh_local_geometry`, #916).
+    #[serde(default)]
+    fresh_names: Vec<String>,
 }
 
 /// §6.21: the scope of a `begin…end` block that declares variables, opened
@@ -4699,8 +5518,7 @@ struct DeclShadowFrame {
 /// live in the enclosing frame under their bare names, so on exit the names
 /// the block declared are removed again and any enclosing variable they
 /// shadowed is put back. Only shadowed names cost a copy.
-#[derive(Debug, Clone, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct BlockScopeSave {
     /// Distinguishes repeated activations of flattened block declarations.
     scope_gen: u64,
@@ -4743,8 +5561,7 @@ struct BlockScopeSave {
 /// Deferred teardown for an inlined blocking task/method call: the work
 /// `exec_task_call` would normally run synchronously after the body, replayed
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
-#[derive(Debug, Clone, Default)]
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct TaskCleanup {
     /// Instance scope an inlined HIERARCHICAL/interface task body resolves
     /// bare names under (`bus.snoop()` → "bus"). Installed at bind and on
@@ -4793,13 +5610,18 @@ struct TaskCleanup {
     pushed_method_this: bool,
     saved_spec: Option<(String, String)>,
     formal_metadata: Vec<FormalMetadataSnapshot>,
+    /// The name-keyed select metadata this activation registered for its
+    /// packed struct and packed array formals, installed again when the
+    /// process resumes (see `Simulator::reinstall_struct_formal_meta`).
+    #[serde(default)]
+    struct_formal_meta: Vec<(String, FormalMetaParts)>,
     /// The method task of a class declared inside a module runs in its
     /// object's instance (see `Simulator::modclass_depth`): the process's
     /// activation scope while this frame is on top.
     modclass: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum DpiRetKind {
     Void,
     Int32,
@@ -4813,7 +5635,7 @@ enum DpiRetKind {
     String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum DpiArgKind {
     Int32In,
     Int32Out,
@@ -4859,7 +5681,7 @@ enum DpiArgKind {
 /// The canonical C element of a DPI open array (IEEE 1800-2017 H.7):
 /// `char`, `short`, `int`, `long long`, `float`, `double`, or a packed
 /// vector as `svBitVecVal` / `svLogicVecVal` words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum DpiOaElem {
     I8,
     I16,
@@ -5136,8 +5958,8 @@ fn hier_prefix(
 ) -> crate::ast::expr::HierarchicalIdentifier {
     let mut p = h.clone();
     p.path.pop();
-    p.cached_signal_id = Cell::new(None);
-    p.cached_resolved_name = std::cell::OnceCell::new();
+    p.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+    p.cached_resolved_name = crate::ast::cache::NameCache::new();
     p
 }
 
@@ -5265,7 +6087,7 @@ mod erased_size {
 }
 
 /// One admitted array.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PackedSeg {
     /// Byte offset of cell 0 in `PackedMem::data`.
     base: usize,
@@ -5301,7 +6123,7 @@ const SEG_FORCED: u8 = 4;
 const PACKED_PAD: usize = 16;
 
 /// Byte arena backing every admitted array (see `PACKED_BASE`).
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PackedMem {
     data: Vec<u8>,
     segs: Vec<PackedSeg>,
@@ -5982,6 +6804,8 @@ enum ClassAggRef {
         /// §7.2.1: a 2-state member of a 4-state struct — its reads and
         /// writes convert x/z to 0.
         two_state: bool,
+        /// §7.2.1: a whole member declared signed reads signed.
+        signed: bool,
     },
     /// Member of an UNPACKED struct — its own cell, keyed `<prop>.<member>`.
     Unpacked { handle: usize, key: String, w: u32 },
@@ -6069,7 +6893,7 @@ enum RandMemberTarget {
 /// IEEE 1800-2017 §21.7.2.1 `var_type` of a dumped object. Every `$var` used to
 /// be hardcoded `wire`, which mislabels every variable in the design and hides
 /// `event` semantics from the viewer entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum VcdVarKind {
     Wire,
     Reg,
@@ -6086,8 +6910,7 @@ enum VcdVarKind {
 /// evaluation. Reads that cannot be mapped to compact signal storage retain a
 /// conservative fallback so class/runtime-map expressions keep their prior
 /// semantics.
-#[derive(Clone)]
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct ActiveForceExpr {
     key: String,
     lvalue: Expression,
@@ -6105,7 +6928,7 @@ struct ActiveForceExpr {
 /// IEEE 1800-2023 §10.6.2: the forced bits of a net under bit/part-select
 /// `force`. `bits[i]` names the piece (forcing expression) and the bit
 /// within it that bit `i` takes; `None` bits follow the net's drivers.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct PartialForce {
     bits: Vec<Option<(usize, u32)>>,
     /// (rvalue, select width, resolution hint) per `force` statement.
@@ -6134,93 +6957,531 @@ impl VcdVarKind {
 /// without scanning the whole map. The `starts_with` full-map scans in the
 /// queue-frame save/restore were 25%+ of a UVM AVIP run.
 ///
-/// Reads go through `Deref<Target = HashMap<..>>`; every mutation that can
-/// add or drop a KEY must go through the inherent `insert`/`remove` below
-/// (inherent methods shadow the deref'd HashMap ones), keeping the index
-/// exact. `get_mut`-style value edits need no index work.
+/// The elements `name[i]` of a queue or dynamic array (a name with a
+/// `name.size` entry) are held in one dense run per name (`ElemRun`) instead
+/// of one map entry each, so removing or inserting an element at the front
+/// moves no other element (§7.10.2). The run is an implementation detail of
+/// the map: every accessor below serves `name[i]` from it exactly as if the
+/// key were a map entry.
+///
+/// There is no `Deref` to the inner map: every read and every mutation goes
+/// through the inherent methods below, which keep the index and the runs
+/// exact.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SignalMap {
     map: HashMap<String, Value>,
+    /// The map-held keys containing `[`, by base name. Run-held elements are
+    /// not listed here.
     elems: HashMap<String, std::collections::HashSet<String>>,
     /// Per base name, a stamp that changes whenever an element key is added
-    /// to or removed from `elems[base]` (absent = no element keys), so a
-    /// derived view of a base's key set can be cached until it changes.
+    /// to or removed from the base (absent = no element keys), so a derived
+    /// view of a base's key set can be cached until it changes.
     elem_gens: HashMap<String, u64>,
     elem_gen_counter: u64,
+    /// The dense element runs, by collection name (`q`, `12#m_q`, `@q#3`,
+    /// `u.q`, a row `aq[3]`).
+    runs: HashMap<String, ElemRun>,
+    /// Elements held in `runs`, so `len()` counts them as keys.
+    run_keys: usize,
+    /// The names in `runs` that contain `[` themselves, by base name: the
+    /// runs whose keys the element index files under another name.
+    nested_runs: HashMap<String, Vec<String>>,
+}
+
+/// The elements `name[start]`, `name[start + 1]`, ... of one collection.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ElemRun {
+    /// Index of `items[0]` (meaningless while `items` is empty).
+    start: u64,
+    items: VecDeque<Value>,
+    /// `name.size` is stored: the name is a queue or dynamic array, and the
+    /// run is kept while empty.
+    sized: bool,
+    /// Map-held keys `name[<index>]` outside the run.
+    strays: u32,
+}
+
+impl ElemRun {
+    #[inline]
+    fn end(&self) -> u64 {
+        self.start + self.items.len() as u64
+    }
+
+    #[inline]
+    fn slot(&self, i: u64) -> Option<usize> {
+        (i >= self.start && i < self.end()).then(|| (i - self.start) as usize)
+    }
+}
+
+/// `name[<n>]` with `<n>` a canonical decimal index: the collection name and
+/// the index. Any other spelling (`a[01]`, `a[-1]`, `a["k"]`, `a[1].f`) is
+/// not an element of a run.
+#[inline]
+fn split_elem_key(k: &str) -> Option<(&str, u64)> {
+    let b = k.as_bytes();
+    let n = b.len();
+    if n < 4 || b[n - 1] != b']' {
+        return None;
+    }
+    let mut i = n - 1;
+    while i > 0 && b[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    let digits = n - 1 - i;
+    if digits == 0 || digits > 9 || i < 2 || b[i - 1] != b'[' {
+        return None;
+    }
+    if digits > 1 && b[i] == b'0' {
+        return None;
+    }
+    let mut v = 0u64;
+    for &d in &b[i..n - 1] {
+        v = v * 10 + (d - b'0') as u64;
+    }
+    Some((&k[..i - 1], v))
 }
 
 impl SignalMap {
+    pub fn new() -> Self {
+        SignalMap {
+            map: HashMap::default(),
+            elems: HashMap::default(),
+            elem_gens: HashMap::default(),
+            elem_gen_counter: 0,
+            runs: HashMap::default(),
+            run_keys: 0,
+            nested_runs: HashMap::default(),
+        }
+    }
+
     fn base_of(k: &str) -> Option<&str> {
         k.find('[').map(|i| &k[..i])
     }
 
+    /// The base name the element index files `name`'s elements under.
+    #[inline]
+    fn outer_of(name: &str) -> &str {
+        Self::base_of(name).unwrap_or(name)
+    }
+
+    #[inline]
+    pub fn get(&self, k: &str) -> Option<&Value> {
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&run.items[s]);
+        }
+        self.map.get(k)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, k: &str) -> bool {
+        self.get(k).is_some()
+    }
+
+    /// Stored keys, run-held elements included.
+    pub fn len(&self) -> usize {
+        self.map.len() + self.run_keys
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every stored key with its value, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, str>, &Value)> + '_ {
+        self.map
+            .iter()
+            .map(|(k, v)| (std::borrow::Cow::Borrowed(k.as_str()), v))
+            .chain(self.runs.iter().flat_map(|(name, run)| {
+                run.items.iter().enumerate().map(move |(s, v)| {
+                    (
+                        std::borrow::Cow::Owned(format!("{}[{}]", name, run.start + s as u64)),
+                        v,
+                    )
+                })
+            }))
+    }
+
+    /// The entries the map itself holds: every key but a run's elements
+    /// (`elem_runs`).
+    pub fn map_entries(&self) -> impl Iterator<Item = (&String, &Value)> + '_ {
+        self.map.iter()
+    }
+
+    /// The element runs: a collection name, the index of its first held
+    /// element and the elements `name[first]`, `name[first + 1]`, ...
+    pub fn elem_runs(&self) -> impl Iterator<Item = (&str, u64, &VecDeque<Value>)> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| !run.items.is_empty())
+            .map(|(name, run)| (name.as_str(), run.start, &run.items))
+    }
+
+    /// Every stored key, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = std::borrow::Cow<'_, str>> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// A key was added under or removed from base `outer`: move its stamp,
+    /// or drop it with the base's last key.
+    fn stamp_base(&mut self, outer: &str) {
+        if self.elems.contains_key(outer) || self.base_has_run_keys(outer) {
+            self.elem_gen_counter += 1;
+            match self.elem_gens.get_mut(outer) {
+                Some(g) => *g = self.elem_gen_counter,
+                None => {
+                    self.elem_gens
+                        .insert(outer.to_string(), self.elem_gen_counter);
+                }
+            }
+        } else {
+            self.elem_gens.remove(outer);
+        }
+    }
+
+    fn base_has_run_keys(&self, outer: &str) -> bool {
+        self.runs.get(outer).is_some_and(|r| !r.items.is_empty())
+            || self.nested_runs.get(outer).is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|n| self.runs.get(n).is_some_and(|r| !r.items.is_empty()))
+            })
+    }
+
+    /// File map-held key `k` in the element index.
+    fn index_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            match self.elems.get_mut(b) {
+                Some(set) => {
+                    set.insert(k.to_string());
+                }
+                None => {
+                    self.elems
+                        .entry(b.to_string())
+                        .or_default()
+                        .insert(k.to_string());
+                }
+            }
+            self.stamp_base(b);
+        }
+    }
+
+    /// Drop map-held key `k` from the element index.
+    fn unindex_key(&mut self, k: &str) {
+        if let Some(b) = Self::base_of(k) {
+            self.unlist_key(k, b);
+            self.stamp_base(b);
+        }
+    }
+
+    /// Take map-held key `k` off base `b`'s list, leaving the stamp alone.
+    fn unlist_key(&mut self, k: &str, b: &str) {
+        if let Some(set) = self.elems.get_mut(b) {
+            set.remove(k);
+            if set.is_empty() {
+                self.elems.remove(b);
+            }
+        }
+    }
+
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-        bump_store_gen();
-        if let Some(b) = Self::base_of(&k) {
-            if !self.map.contains_key(&k) {
-                self.elems
-                    .entry(b.to_string())
-                    .or_default()
-                    .insert(k.clone());
-                self.elem_gen_counter += 1;
-                self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
+        note_store_write(signal_key_bits(&k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(&k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                return Some(std::mem::replace(&mut run.items[s], v));
+            }
+            // A key the map already holds stays there.
+            if run.strays == 0 || !self.map.contains_key(&k) {
+                let adopted = if run.items.is_empty() {
+                    run.start = i;
+                    run.items.push_back(v);
+                    None
+                } else if i == run.end() {
+                    run.items.push_back(v);
+                    None
+                } else if i + 1 == run.start {
+                    run.start = i;
+                    run.items.push_front(v);
+                    None
+                } else {
+                    Some(v)
+                };
+                match adopted {
+                    None => {
+                        let absorb = run.strays > 0;
+                        self.run_keys += 1;
+                        let name = name.to_string();
+                        if absorb {
+                            self.absorb_strays(&name);
+                        }
+                        self.stamp_base(Self::outer_of(&name));
+                        return None;
+                    }
+                    Some(v) => {
+                        run.strays += 1;
+                        self.index_key(&k);
+                        return self.map.insert(k, v);
+                    }
+                }
+            }
+            return self.map.insert(k, v);
+        }
+        if !self.map.contains_key(&k) {
+            self.index_key(&k);
+            if let Some(name) = k.strip_suffix(".size") {
+                let name = name.to_string();
+                let prev = self.map.insert(k, v);
+                self.register_element_run(&name, true);
+                return prev;
             }
         }
         self.map.insert(k, v)
     }
 
-    pub fn remove(&mut self, k: &str) -> Option<Value> {
-        bump_store_gen();
-        let r = self.map.remove(k);
-        if r.is_some() {
-            if let Some(b) = Self::base_of(k) {
-                if let Some(set) = self.elems.get_mut(b) {
-                    set.remove(k);
-                    if set.is_empty() {
-                        self.elems.remove(b);
-                        self.elem_gens.remove(b);
+    /// Store contiguous elements in a run. Only a queue or dynamic array
+    /// with a `.size` key keeps its run after the last element is removed.
+    fn register_element_run(&mut self, name: &str, sized: bool) {
+        if let Some(run) = self.runs.get_mut(name) {
+            run.sized |= sized;
+            return;
+        }
+        let outer = Self::outer_of(name);
+        let mut held: Vec<u64> = match self.elems.get(outer) {
+            Some(set) => set
+                .iter()
+                .filter_map(|k| {
+                    split_elem_key(k)
+                        .filter(|(n, _)| *n == name)
+                        .map(|(_, i)| i)
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        held.sort_unstable();
+        let mut run = ElemRun {
+            sized,
+            strays: held.len() as u32,
+            ..ElemRun::default()
+        };
+        if let Some(&first) = held.first() {
+            run.start = first;
+        }
+        if outer.len() != name.len() {
+            self.nested_runs
+                .entry(outer.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+        self.runs.insert(name.to_string(), run);
+        if !held.is_empty() {
+            self.absorb_strays(name);
+        }
+    }
+
+    /// Move the map-held keys adjacent to `name`'s run into it.
+    fn absorb_strays(&mut self, name: &str) {
+        loop {
+            let Some(run) = self.runs.get(name) else {
+                return;
+            };
+            if run.strays == 0 {
+                return;
+            }
+            // An empty run restarts at the index it last began at.
+            let empty = run.items.is_empty();
+            let above = if empty { run.start } else { run.end() };
+            let below = if empty {
+                None
+            } else {
+                run.start.checked_sub(1)
+            };
+            let mut took = false;
+            for (back, i) in [(true, Some(above)), (false, below)] {
+                let Some(i) = i else { continue };
+                let key = format!("{}[{}]", name, i);
+                if let Some(v) = self.map.remove(&key) {
+                    // The key stays stored: the base's stamp does not move.
+                    self.unlist_key(&key, Self::outer_of(name));
+                    let run = self.runs.get_mut(name).unwrap();
+                    if back {
+                        if run.items.is_empty() {
+                            run.start = i;
+                        }
+                        run.items.push_back(v);
                     } else {
-                        self.elem_gen_counter += 1;
-                        self.elem_gens.insert(b.to_string(), self.elem_gen_counter);
+                        run.start = i;
+                        run.items.push_front(v);
                     }
+                    run.strays -= 1;
+                    self.run_keys += 1;
+                    took = true;
+                }
+            }
+            if !took {
+                return;
+            }
+        }
+    }
+
+    /// Forget `name`'s run once it holds nothing and `name.size` is gone.
+    fn drop_idle_run(&mut self, name: &str) {
+        if self
+            .runs
+            .get(name)
+            .is_some_and(|r| r.items.is_empty() && !r.sized && r.strays == 0)
+        {
+            self.runs.remove(name);
+            let outer = Self::outer_of(name);
+            if outer.len() != name.len()
+                && let Some(names) = self.nested_runs.get_mut(outer)
+            {
+                names.retain(|n| n != name);
+                if names.is_empty() {
+                    self.nested_runs.remove(outer);
                 }
             }
         }
+    }
+
+    pub fn remove(&mut self, k: &str) -> Option<Value> {
+        note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+        {
+            if let Some(s) = run.slot(i) {
+                let last = run.items.len() - 1;
+                let v = if s == last {
+                    run.items.pop_back()
+                } else if s == 0 {
+                    run.start += 1;
+                    run.items.pop_front()
+                } else {
+                    // A hole: the shorter side leaves the run for the map.
+                    let v = run.items.remove(s);
+                    let (lo, moved): (u64, Vec<Value>) = if s <= last / 2 {
+                        let lo = run.start;
+                        run.start = i + 1;
+                        (lo, run.items.drain(..s).collect())
+                    } else {
+                        (i + 1, run.items.drain(s..).collect())
+                    };
+                    run.strays += moved.len() as u32;
+                    self.run_keys -= moved.len();
+                    for (j, mv) in moved.into_iter().enumerate() {
+                        let key = format!("{}[{}]", name, lo + j as u64);
+                        self.index_key(&key);
+                        self.map.insert(key, mv);
+                    }
+                    v
+                };
+                self.run_keys -= 1;
+                self.drop_idle_run(name);
+                self.stamp_base(Self::outer_of(name));
+                return v;
+            }
+            let r = self.map.remove(k);
+            if r.is_some() {
+                run.strays -= 1;
+                self.unindex_key(k);
+                self.drop_idle_run(name);
+            }
+            return r;
+        }
+        let r = self.map.remove(k);
+        if r.is_some() {
+            self.unindex_key(k);
+            if let Some(name) = k.strip_suffix(".size")
+                && let Some(run) = self.runs.get_mut(name)
+            {
+                run.sized = false;
+                self.drop_idle_run(name);
+            }
+        }
         r
+    }
+
+    /// An in-place edit of one stored value, noted under its key's names.
+    pub fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
+        note_store_write(signal_key_bits(k));
+        if !self.runs.is_empty()
+            && let Some((name, i)) = split_elem_key(k)
+            && let Some(run) = self.runs.get_mut(name)
+            && let Some(s) = run.slot(i)
+        {
+            return Some(&mut run.items[s]);
+        }
+        self.map.get_mut(k)
+    }
+
+    /// The runs whose keys the element index files under `outer`.
+    fn runs_under<'a>(&'a self, outer: &'a str) -> impl Iterator<Item = (&'a str, &'a ElemRun)> {
+        self.runs
+            .get(outer)
+            .map(|r| (outer, r))
+            .into_iter()
+            .chain(
+                self.nested_runs
+                    .get(outer)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|n| self.runs.get(n).map(|r| (n.as_str(), r))),
+            )
+            .filter(|(_, r)| !r.items.is_empty())
+    }
+
+    /// Whether every key `name[i]` begins with `prefix`, which ends in `[`.
+    #[inline]
+    fn run_under_prefix(name: &str, prefix: &str) -> bool {
+        name.starts_with(prefix) || (prefix.len() == name.len() + 1 && prefix.starts_with(name))
     }
 
     /// All stored keys beginning with `prefix`, which must end with `[`.
     /// Served from the element index: only the owning base name's keys are
     /// touched, never the whole map. Handles nested-bracket prefixes
     /// (`q[0].f[`) by indexing on the OUTERMOST base and filtering.
+    /// A run's keys come highest index first, so a caller removing them in
+    /// this order shrinks the run from its end.
     pub fn keys_with_elem_prefix(&self, prefix: &str) -> Vec<String> {
         debug_assert!(prefix.ends_with('['));
-        let base = &prefix[..prefix.len() - 1];
-        let outer = Self::base_of(base).unwrap_or(base);
-        self.elems
-            .get(outer)
-            .map(|set| {
-                set.iter()
-                    .filter(|k| k.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.elem_keys_with_prefix(prefix)
+            .map(|k| k.into_owned())
+            .collect()
     }
 
-    /// Keys of every `base[...]` element currently stored, unordered.
+    /// Keys of every `base[...]` element currently stored, unordered (a
+    /// run's keys highest index first, see `keys_with_elem_prefix`).
     pub fn elem_keys(&self, base: &str) -> Vec<String> {
-        self.elems
+        let mut keys: Vec<String> = self
+            .elems
             .get(base)
             .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The index files nothing under a name with a bracket in it.
+        if !base.contains('[') {
+            for (name, run) in self.runs_under(base) {
+                keys.extend(
+                    (run.start..run.end())
+                        .rev()
+                        .map(|i| format!("{}[{}]", name, i)),
+                );
+            }
+        }
+        keys
     }
 
     /// Borrowing form of `keys_with_elem_prefix`: the element keys under
-    /// `prefix` (which must end in `[`) without cloning them.
+    /// `prefix` (which must end in `[`), cloning none of the map-held ones.
     pub fn elem_keys_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = &'a str> + 'a {
+    ) -> impl Iterator<Item = std::borrow::Cow<'a, str>> + 'a {
         let base = &prefix[..prefix.len().saturating_sub(1)];
         let outer = Self::base_of(base).unwrap_or(base);
         self.elems
@@ -6228,6 +7489,16 @@ impl SignalMap {
             .into_iter()
             .flat_map(|set| set.iter().map(|k| k.as_str()))
             .filter(move |k| k.starts_with(prefix))
+            .map(std::borrow::Cow::Borrowed)
+            .chain(
+                self.runs_under(outer)
+                    .filter(move |(name, _)| Self::run_under_prefix(name, prefix))
+                    .flat_map(|(name, run)| {
+                        (run.start..run.end())
+                            .rev()
+                            .map(move |i| std::borrow::Cow::Owned(format!("{}[{}]", name, i)))
+                    }),
+            )
     }
 
     /// The element-key stamp of the outermost base of `prefix` (which ends
@@ -6244,26 +7515,124 @@ impl SignalMap {
     /// `obj`; this replaces a scan of the whole map.
     pub fn any_key_with_prefix(&self, prefix: &str) -> bool {
         let Some(outer) = Self::base_of(prefix) else {
-            return self.map.keys().any(|k| k.starts_with(prefix));
+            return self.map.keys().any(|k| k.starts_with(prefix))
+                || self
+                    .runs
+                    .iter()
+                    .any(|(name, run)| !run.items.is_empty() && name.starts_with(prefix));
         };
         self.elems
             .get(outer)
             .is_some_and(|set| set.iter().any(|k| k.starts_with(prefix)))
+            || self
+                .runs_under(outer)
+                .any(|(name, run)| Self::run_has_key_with_prefix(name, run, prefix))
+    }
+
+    /// Whether a key `name[i]` of the non-empty `run` begins with `prefix`.
+    fn run_has_key_with_prefix(name: &str, run: &ElemRun, prefix: &str) -> bool {
+        if prefix.len() <= name.len() {
+            return name.starts_with(prefix);
+        }
+        let Some(rest) = prefix.strip_prefix(name).and_then(|r| r.strip_prefix('[')) else {
+            return false;
+        };
+        // `rest` has to begin `<index>]`, the whole remainder of a key.
+        let digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+        match &rest[digits..] {
+            "" => (run.start..run.end()).any(|i| i.to_string().starts_with(rest)),
+            "]" => split_elem_key(prefix).is_some_and(|(_, i)| run.slot(i).is_some()),
+            _ => false,
+        }
+    }
+
+    /// Whether `name`'s run holds every element `name[lo]` .. `name[hi - 1]`
+    /// and nothing else is stored under `name[`: no element outside the run,
+    /// and no member, row or size of an element (`name[i].f`, `name[i][j]`,
+    /// `name[i].size`). Then the collection's elements from `lo` on are
+    /// exactly the run's items, in order.
+    pub fn run_covers(&self, name: &str, lo: u64, hi: u64) -> bool {
+        let Some(run) = self.runs.get(name) else {
+            return false;
+        };
+        if run.strays != 0 || run.items.is_empty() || run.start != lo || run.end() < hi {
+            return false;
+        }
+        let outer = Self::outer_of(name);
+        let below = |k: &str| {
+            k.len() > name.len() && k.as_bytes()[name.len()] == b'[' && k.starts_with(name)
+        };
+        !self
+            .elems
+            .get(outer)
+            .is_some_and(|set| set.iter().any(|k| below(k)))
+            && !self
+                .nested_runs
+                .get(outer)
+                .is_some_and(|names| names.iter().any(|n| below(n)))
+    }
+
+    /// Remove element `name[idx]` of a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// above it move down one index. Elements a shrink left behind at or past
+    /// `size` are dropped.
+    pub fn run_remove_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> Option<Value> {
+        note_store_write(signal_key_bits(name));
+        let run = self.runs.get_mut(name)?;
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let v = if idx == lo {
+            run.items.pop_front()
+        } else {
+            run.items.remove((idx - lo) as usize)
+        };
+        self.run_keys -= before - run.items.len();
+        self.stamp_base(Self::outer_of(name));
+        v
+    }
+
+    /// Open a slot at `name[idx]` in a collection of `size` elements whose
+    /// run starts at `lo` (`run_covers(name, lo, size)` holds): the elements
+    /// from `idx` on move up one index, and `name[idx]` keeps its value until
+    /// it is stored. Elements a shrink left behind at or past `size` are
+    /// dropped.
+    pub fn run_open_at(&mut self, name: &str, lo: u64, idx: u64, size: u64) -> bool {
+        note_store_write(signal_key_bits(name));
+        let Some(run) = self.runs.get_mut(name) else {
+            return false;
+        };
+        debug_assert!(run.start == lo && lo <= idx && idx < size && run.end() >= size);
+        let live = (size - lo) as usize;
+        let before = run.items.len();
+        run.items.truncate(live);
+        let s = (idx - lo) as usize;
+        let keep = run.items[s].clone();
+        if s == 0 {
+            run.items.push_front(keep);
+        } else {
+            run.items.insert(s, keep);
+        }
+        self.run_keys = self.run_keys + run.items.len() - before;
+        self.stamp_base(Self::outer_of(name));
+        true
     }
 }
 
-impl std::ops::Deref for SignalMap {
-    type Target = HashMap<String, Value>;
-    fn deref(&self) -> &Self::Target {
-        &self.map
+impl Default for SignalMap {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl std::ops::DerefMut for SignalMap {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        bump_store_gen();
-        &mut self.map
-    }
+/// The single place a whole variable is stored (`Simulator::whole_var_store`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarStore {
+    /// The innermost call frame.
+    Frame,
+    /// The table signal with this id.
+    Table(usize),
 }
 
 /// Mid-exec ts aborts tolerated per block before demotion.
@@ -6284,6 +7653,7 @@ const TS_XBAIL_SLEEP_UNIT: u64 = 256;
 const TS_XBAIL_FORGET: u64 = 1 << 16;
 
 /// A sleeping two-state block: what was swapped out, and where.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct TsSleepRec {
     kind: u8,
     idx: u32,
@@ -6293,22 +7663,32 @@ struct TsSleepRec {
     slot: Option<TsSlot>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 enum CombPlan {
     Unresolved,
     /// Two-state island. The per-eval guard can still bail dynamically
     /// (forces, X inputs); the plan then falls through JIT-then-interp,
     /// exactly like the unplanned dispatch.
     Ts(std::sync::Arc<super::bytecode::TwoStateBlock>),
-    /// Native slot; its function is stored in `comb_jit_fns`.
-    #[cfg(feature = "jit")]
+    /// Native slot; its function is stored in `comb_jit_fns`. Keep the same
+    /// checkpoint discriminants in builds with and without the JIT feature.
     Jit,
     /// Template slot; its function and mapping window are in `comb_tpl_fns`.
-    #[cfg(feature = "jit")]
     Tpl,
     Interp,
 }
 
+/// A `fn_ret_frames` entry: the declaration whose return type a pattern in
+/// `return` takes.
+#[derive(Clone)]
+pub(crate) enum ReturnPatternType {
+    /// A return type no pattern can target.
+    NotPacked,
+    Func(std::rc::Rc<DataType>),
+    Method(Arc<crate::ast::decl::ClassMethod>),
+}
+
+#[derive(serde::Serialize)]
 pub struct Simulator {
     pub signals: SignalMap,
     vpi_port_directions: HashMap<Arc<str>, PortDirection>,
@@ -6316,9 +7696,10 @@ pub struct Simulator {
     forced_signals: HashMap<usize, Value>,
     /// Annex N seed of a no-seed `$random` (§20.15.1); starts at 0.
     annex_n_seed: i32,
-    /// Whether any module array or class member is an associative array
-    /// of collections with recorded rows (see `ensure_assoc_row`).
-    has_assoc_rows: bool,
+    /// Whether any collection of collections is declared (a recorded
+    /// [`CollShape`], or a local registering one at runtime): the one-load
+    /// gate in front of row creation on an element write.
+    has_coll_rows: bool,
     /// §10.6.2 bit/part-select forces on nets, by signal id. Each id is
     /// also in `forced_signals` (so ordinary writes drop) and has a
     /// `partial` `active_force_exprs` entry that re-merges the drivers.
@@ -6326,6 +7707,13 @@ pub struct Simulator {
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
+    /// §10.6.2: the comb entries that write each signal, by entry index in
+    /// table order, for re-driving a released net. Built at the first
+    /// release from `comb_entries` (whose read and write lists are fixed once
+    /// compiled) and dropped whenever that table is replaced; `None` until
+    /// then. The length is the table's when it was built.
+    #[serde(skip)]
+    comb_writer_index: Option<(usize, HashMap<usize, Vec<u32>>)>,
     /// Memoization for `prop_bound_collection`: (class, member) → resolved
     /// raw type name (hierarchy walk), and type name → is-collection verdict
     /// (which otherwise LINEAR-SCANS every class's local typedefs — 5% of an
@@ -6336,11 +7724,31 @@ pub struct Simulator {
     typedef_target_cache:
         std::cell::RefCell<HashMap<String, HashMap<String, Option<crate::ast::types::DataType>>>>,
     collection_dim_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Memoized, structurally-fixed CSP for a rand class. `randomize()` on
+    /// the same class / constraint set / config values re-translated the
+    /// whole constraint graph on every call (csp_vars + csp_split_slices +
+    /// csp_translate are a large constant per call); when the structural and
+    /// config fingerprint is unchanged the post-translate `Csp` is reused
+    /// read-only and only the search (`csp_run`) re-runs against current
+    /// values. The fingerprint includes a hash of every non-rand property
+    /// value the constraints read, so any relevant change rebuilds. Bound the
+    /// table so a long-lived run with many distinct classes can't grow it
+    /// without limit.
+    #[serde(skip)]
+    csp_cache: std::cell::RefCell<HashMap<String, rand_csp::RandCspMemo>>,
     /// Sticky: set the first time a `<base>.` frame marker is created (an
     /// unpacked-struct formal binding, or a struct-return variable via
     /// `unpacked_struct_leaf_keys`); gates `frame_leaf_key_of`'s per-eval
     /// probe.
     any_struct_formal_markers: bool,
+    /// Sticky bits (`REF_PARK_*`): a task has bound a formal with select
+    /// metadata, an aliased leaf of a `ref` struct formal, or a handle
+    /// formal aliased to an element. Each gates the work a process switch
+    /// does for it.
+    ref_park_flags: u8,
+    /// See `Simulator::has_indexed_scopes`.
+    #[serde(skip)]
+    indexed_scopes: std::cell::OnceCell<bool>,
     /// Scratch structs a pattern actual is spread into before its leaves bind
     /// to an unpacked-struct formal (`struct_pattern_leaf_values`). Recycled
     /// like the mailbox shadows.
@@ -6382,6 +7790,30 @@ pub struct Simulator {
     member_coll_cache: std::cell::RefCell<HashMap<String, HashMap<String, MemberCollKind>>>,
     /// Per class: properties that are NOT structs (see `class_prop_struct`).
     class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Shared aggregate declarations per class and exact concrete type bindings.
+    /// Widths still use each object's value-parameter scope (§8.25).
+    #[serde(skip)]
+    #[allow(clippy::type_complexity)]
+    class_prop_struct_cache: std::cell::RefCell<
+        HashMap<
+            String,
+            Vec<(
+                HashMap<String, String>,
+                HashMap<String, Rc<crate::ast::types::StructUnionType>>,
+            )>,
+        >,
+    >,
+    /// Root packed layouts retain their declaration, so pointer keys cannot be
+    /// reused. Each value-parameter specialization gets its own dimensions.
+    #[serde(skip)]
+    class_packed_layout_cache: std::cell::RefCell<HashMap<usize, ClassPackedLayouts>>,
+    #[serde(skip)]
+    aggregate_type_work: [std::cell::Cell<u64>; 2],
+    #[serde(skip)]
+    aggregate_type_generation: std::cell::Cell<u64>,
+    /// Immutable class parameter names; values are always read from the object.
+    #[serde(skip)]
+    class_value_param_names: std::cell::RefCell<HashMap<String, Rc<Vec<String>>>>,
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
@@ -6390,14 +7822,26 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// Bare-name geometry (`packed_full_dims`, `packed_signal_elem_widths`,
+    /// `packed_struct_fields`, a non-plain `var_decl_types` entry) another
+    /// declaration of a carried local's name registered, set aside for the
+    /// fallback's duration and put back after it. See `fb_frame_push`.
+    fb_geom_saves: Vec<FormalMetadataSnapshot>,
+    /// Per carried fallback frame, the `ref` redirections of the compiled
+    /// method's formals it set aside (`fb_frame_push`), restored on pop.
+    fb_unbound_refs: Vec<Vec<(String, Option<Expression>, Option<String>)>>,
     /// `local_stack` depth below each active fallback frame (see
-    /// `fb_frame_push`): a write inside one leaves 2-state fitting to the
-    /// copy-back, since the carried locals' types are not in
-    /// `var_decl_types`.
+    /// `fb_frame_push`). The carried locals' types are not in
+    /// `var_decl_types`, so a write inside one asks `fb_two_state_names`.
     fb_frame_depths: Vec<usize>,
+    /// The carried locals of 2-state type of every active fallback frame,
+    /// innermost last; `fb_two_state_marks` holds where each frame's start.
+    fb_two_state_names: Vec<Arc<str>>,
+    fb_two_state_marks: Vec<usize>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
+    #[serde(skip)]
     param_leaf_index_cell: std::cell::OnceCell<HashMap<String, Vec<String>>>,
     /// Lazily-built leaf (`::`-suffix) index over `module.var_decl_types`
     /// for `declared_collection_elem_class`'s package-qualified fallback.
@@ -6409,6 +7853,7 @@ pub struct Simulator {
     /// the live map, so runtime insertions (formal/foreach metadata,
     /// always keyed by the exact bare name the direct probe already
     /// covers) can neither be missed nor stale-hit.
+    #[serde(skip)]
     var_decl_leaf_index_cell: std::cell::OnceCell<HashMap<String, Vec<String>>>,
     /// Flattened names currently under an active `force` (§10.6) or
     /// procedural continuous `assign` (§10.6.1) whose storage lives only
@@ -6524,6 +7969,12 @@ pub struct Simulator {
     /// Set of signal IDs that are signed.
     signal_signed: Vec<bool>,
     signal_real: Vec<bool>,
+    /// §7.2 unpacked-struct variables for the bytecode compiler's member-wise
+    /// struct copy (`BytecodeCompiler::set_unpacked_structs`).
+    unpacked_struct_leaves: super::bytecode::UnpackedStructLeaves,
+    /// Every signal under each unpacked-struct variable, by the variable's
+    /// name (`build_unpacked_struct_sens`): what a whole-struct read depends on.
+    unpacked_struct_sens: HashMap<String, Vec<usize>>,
     /// Signal ids whose declared type is 2-state (`bit`/`byte`/`int`/…). Per
     /// §6.11.1/§10.7 an implicit conversion of a 4-state RHS into such a target
     /// maps X/Z to 0 — enforced in `fit_value_to_signal`.
@@ -6583,6 +8034,10 @@ pub struct Simulator {
     /// collapsed into a shared id. The dropped connect made them wire-typed
     /// for a dump, and the shared id can't carry per-name typing.
     collapsed_port_children: HashSet<String>,
+    /// §23.3.3, §6.8: whether each renamed input port's formal is 2-state,
+    /// by the formal's path without the top module's prefix (from
+    /// `ElaboratedModule::input_port_actuals`); see `alias_t0_kind`.
+    port_formal_two_state: HashMap<String, bool>,
     /// Set by a `collapse_identity_port_nets` run that reached its fixed
     /// point: the name-map generation it left, the continuous-assign list
     /// (length, buffer) and port-alias count it read, and whether its buffer
@@ -6590,6 +8045,7 @@ pub struct Simulator {
     collapse_settled: Option<(u64, usize, usize, usize, bool)>,
     /// Instantiated always blocks awaiting classification, in order (see
     /// `DeferredAlways`); empty once `classify_always_blocks` has run.
+    #[serde(skip)]
     deferred_always: Vec<DeferredAlways>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
@@ -6598,7 +8054,9 @@ pub struct Simulator {
     /// here. Populated once at construction so `module.signals` can
     /// be freed afterwards.
     signal_type_names: HashMap<usize, String>,
-    pub widths: HashMap<String, u32>,
+    /// Real signal slots that round writes to binary32.
+    shortreal_signals: HashSet<usize>,
+    pub widths: SignalWidths,
     pub signed_signals: HashSet<String>,
     /// Names of ARRAY locals whose packed element geometry
     /// `exec_stmt_var_decl` registered in `packed_full_dims` (so a later
@@ -6632,7 +8090,8 @@ pub struct Simulator {
     prev_val: Vec<u64>,
     prev_xz: Vec<u64>,
     /// Fallback for signals wider than 64 bits where the inline u64 pair
-    /// above can't represent the full state.
+    /// above can't represent the full state. Until its first snapshot a wide
+    /// signal has its full-width all-X baseline implicitly.
     prev_wide: HashMap<usize, Value>,
     /// Snapshot generation counter: bumped every `snapshot_edge_signals`.
     /// (Previously read by `EventWaiter::registered_snap_gen` to guard
@@ -6766,6 +8225,10 @@ pub struct Simulator {
     sva_preponed_slot: Option<u64>,
     /// A site's clock event is recorded (`fired`) and not evaluated yet.
     sva_owed: bool,
+    /// §16.12.14: `sva_advance` runs in a time step without a tick of the
+    /// site, so only asynchronous abort conditions are checked and nothing
+    /// else advances (`sva_abort_step_site`).
+    sva_abort_step: bool,
     /// `sva_post_nba` is running the slot's due cbReadWriteSynch batches.
     sva_post_nba_busy: bool,
     /// LRM §14.3 clocking-block per-cycle input snapshots. Each entry
@@ -6784,13 +8247,18 @@ pub struct Simulator {
     /// LRM §14.3: per-cb metadata. `(clock_signal_name, [(signal_name, is_input)])`.
     /// Populated at compile() from `module.clocking_blocks`.
     clocking_meta: HashMap<String, (String, Vec<(String, bool)>)>,
-    /// LRM §14.4: pending clocking-output drives. `cb_name → [(signal,
-    /// value)]`. `cb.<out_sig> <= val` queues here instead of driving
+    /// §27.6: some clocking block is declared in a generate copy or an
+    /// instance-array element (its key holds a select, `gen[1].cb`), so a
+    /// name with a select (`gen[1].cb.a`) may reach a block. Without one, the
+    /// indexed lookups of member reads are skipped.
+    clocking_in_indexed_scope: bool,
+    /// LRM §14.4: pending clocking-output drives. Each drive retains its
+    /// clockvar name, physical net and value. `cb.<out_sig> <= val` queues here instead of driving
     /// immediately; `tick_clocking_blocks` applies them at the next
     /// posedge of the cb's clock (output skew).
     /// A drive of a SELECT (`cb.v[2] <= 1`) carries its target: the net with
     /// the drive's indices frozen.
-    clocking_output_pending: HashMap<String, Vec<(String, Value, Option<Expression>)>>,
+    clocking_output_pending: HashMap<String, Vec<ClockingOutputDrive>>,
     /// Per-clocking-block previous clock bit (for edge detection).
     clocking_prev_clock: HashMap<String, u8>,
     /// Per-tick clock poll table for `tick_clocking_blocks` (see there).
@@ -6812,18 +8280,56 @@ pub struct Simulator {
     /// slot's edge detection, and the next iteration's snapshot would
     /// otherwise absorb the change and swallow the `@(cb.sig)` event.
     clocking_mirror_dirty: bool,
+    /// Set when `tick_clocking_blocks` drove an edge-skew output, so the
+    /// caller settles and runs one more edge pass: the drive lands after this
+    /// slot's edge detection, and its fan-out must still wake in this slot.
+    clocking_edge_drive_dirty: bool,
     /// §14.16 `cb.out <= ##N v` drives awaiting N further clocking events:
-    /// cb → [(remaining_cycles, net, value)]. Decremented at each edge of that
+    /// cb → [(remaining_cycles, clockvar, net, value, target)]. Decremented at each edge of that
     /// block; applied (with output skew) when it reaches zero.
-    clocking_cycle_pending: HashMap<String, Vec<(u64, String, Value, Option<Expression>)>>,
+    clocking_cycle_pending: HashMap<String, Vec<ClockingCycleDrive>>,
+    /// §14.16.2: clocking select drives waiting for their maturity as
+    /// nonblocking updates: (maturity time, signal). A whole drive of the
+    /// same signal maturing with one queues behind it, so the drives take
+    /// effect in the order they were issued.
+    clocking_select_due: Vec<(u64, usize)>,
+    /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
+    /// resolved net). The snapshot/meta store the NET; reads and drives use
+    /// the clocking name, so they translate through this first.
+    /// §14.16: a clocking OUTPUT clockvar drives a stage of its own when
+    /// the net it is bound to has another driver: (block name, net) →
+    /// stage signal. The clockvar drives the stage, and the stage joins the
+    /// net's other drivers in the resolution fold.
+    clocking_output_stages: HashMap<(String, String), String>,
     /// §14.3 signal RENAMING (`input alias = net;`): cb → (clocking name →
     /// resolved net). The snapshot/meta store the NET; reads and drives use
     /// the clocking name, so they translate through this first.
     clocking_sig_alias: HashMap<String, HashMap<String, String>>,
+    /// §14.5 a clockvar bound to a select of a net (`input a = bus[3:0];`):
+    /// cb → (clocking name → the bound expression). The meta/alias store the
+    /// BASE net; a sample applies the select to the base's sample, a drive
+    /// writes through it (#823).
+    clocking_sig_bound_sel: HashMap<String, HashMap<String, Expression>>,
+    /// §14.5 a clockvar bound to an expression (`input sum = a + 1;`,
+    /// `input i = {op, ra, rb[3:1]};`): cb → (clocking name → (the bound
+    /// expression, each operand net with the hidden clocking name of its
+    /// sample)). Each operand is sampled as a clocking input of its own, with
+    /// the clockvar's skew; the clockvar's sample is the expression evaluated
+    /// over those samples.
+    clocking_sig_bound_expr: HashMap<String, HashMap<String, ClockingBoundExpr>>,
     /// §14.4 per-cb default OUTPUT skew in ticks (absent = #0).
     clocking_out_skew: HashMap<String, u64>,
     /// §14.4 per-signal output-skew overrides: cb → (resolved net → ticks).
     clocking_sig_out_skew: HashMap<String, HashMap<String, u64>>,
+    /// §14.3 edge of a block's `default output negedge` skew.
+    clocking_out_edge: HashMap<String, EdgeKind>,
+    /// §14.3 per-signal skews: cb → (net → edge, or None for a delay-only
+    /// skew that overrides the block's default edge).
+    clocking_sig_out_edge: HashMap<String, HashMap<String, Option<EdgeKind>>>,
+    /// Drives through an edge-skew output, waiting for that edge of the
+    /// block's clock: cb → [(net, value, edge, post-edge delay, select target)]
+    /// in issue order.
+    clocking_edge_out_pending: HashMap<String, Vec<ClockingEdgeDrive>>,
     /// §14.4 per-cb default INPUT skew in ticks (absent = #0).
     clocking_in_skew: HashMap<String, u64>,
     /// §14.4 per-signal input-skew overrides: cb → (resolved net → ticks).
@@ -6866,7 +8372,7 @@ pub struct Simulator {
     /// has sampled — the clocking event, and so its guard, occurs after the
     /// clockvars update. Each entry holds the waiter and the guard of the
     /// term that fired; see `resolve_deferred_clocking_guards`.
-    deferred_clocking_guarded: Vec<(EventWaiter, Box<Expression>)>,
+    deferred_clocking_guarded: Vec<(EventWaiter, Rc<Expression>)>,
     /// LRM §4.4 "reactive region" — drained AFTER the observed region
     /// has fired and BEFORE the postponed region runs. In a strict LRM
     /// implementation this hosts `program`-block procedural code so a
@@ -6880,6 +8386,14 @@ pub struct Simulator {
     /// blocks and every fork child they spawn). They resume in the Reactive
     /// region, after the slot's NBA updates and clocking events.
     program_pids: HashSet<usize>,
+    /// §24.3: the program instance (its scope) of each live program process,
+    /// the program initial procedures still running, and how many of each
+    /// program's are. When a program's initial procedures have all ended,
+    /// its remaining processes end too; when no program process is left, the
+    /// run ends by an implicit `$finish`.
+    program_pid_scope: HashMap<usize, String>,
+    program_initial_pids: HashSet<usize>,
+    program_initials_live: HashMap<String, usize>,
     /// §24.3: program-process continuations woken in the Active region (an
     /// edge, a delay, a join), held for this slot's Reactive region.
     reactive_conts: Vec<(usize, ProcCont)>,
@@ -6952,6 +8466,15 @@ pub struct Simulator {
     /// normal dependency machinery — entry INDICES would go stale across the
     /// topo reorder / lazy materialization of `comb_entries`.
     deferred_proc_entries: Vec<u32>,
+    /// (#1149) One bit per signal id listed in `deferred_proc_entries`, so
+    /// each id is listed once; the drain clears the bits it consumes. An
+    /// entry that re-triggers on every settle (an unresolved read) is
+    /// deferred again on every blocking write of a process, and a long
+    /// time-0 block holds the drain back until its start batch ends.
+    deferred_proc_seen: Vec<u64>,
+    /// (#1149) Whether the `u32::MAX` marker (an entry with no resolvable
+    /// read) is in `deferred_proc_entries`.
+    deferred_proc_unres: bool,
     /// (#t0-comb-defer) Compile-time process starts still unrun in the
     /// time-0 slot. A commercial simulator queues the cont-assign /
     /// port-connect update events that a time-0 process write schedules
@@ -6985,16 +8508,28 @@ pub struct Simulator {
     /// iter (see drain_edge_cascade). Cached at sim init; override via
     /// XEZIM_CASCADE_LIMIT env var.
     cascade_limit: u32,
+    /// True when `XEZIM_CASCADE_LIMIT` was set explicitly: the cascade is then
+    /// cut off at that many generations (opt-in strict mode). When unset, the
+    /// cascade may run past `cascade_limit` generations and is only declared a
+    /// livelock when the signal state recurs (it is cycling, not progressing).
+    cascade_limit_explicit: bool,
     /// SDF delay annotation (None if no SDF loaded).
+    #[serde(skip)]
     pub sdf_annotation: Option<super::sdf::SdfAnnotation>,
     /// min/typ/max selection from the CLI (--sdf-min/typ/max or the
     /// +mindelays/+typdelays/+maxdelays plusargs). A runtime `$sdf_annotate`
     /// honors this; `None` means Typ (the CLI default).
+    #[serde(skip)]
     pub sdf_select: Option<super::sdf::DelaySelect>,
     /// Per-signal delay in sim ticks (0 = no delay). Indexed by signal_id.
     sdf_delays: Vec<u64>,
     /// Pending delayed signal updates: (time, signal_id, value)
-    delayed_updates: Vec<(u64, usize, Value)>,
+    // A mask limits a delayed update to the bits its driver owns (§10.3.3).
+    delayed_updates: Vec<(u64, usize, Value, Option<Value>)>,
+    /// §10.3.3 / §28.16: some net may hold more than one pending update in
+    /// `delayed_updates` (select drivers due at different times, see
+    /// `schedule_delayed_slice_chain`). Cleared when no update is pending.
+    delayed_slice_chains: bool,
     /// §4.9.4: future-time NBA updates (`a <= #d v`). Kept SEPARATE from
     /// `delayed_updates` (gate/CA transport, an ACTIVE-region event at
     /// maturity): these commit in the target slot's NBA region, after that
@@ -7020,6 +8555,18 @@ pub struct Simulator {
     /// by `CombItem::TimingCheck{idx}`).
     timing_checks: Vec<timing_checks::TimingCheckRt>,
     timing_watches: Vec<timing_checks::TcWatch>,
+    /// The conditions of the timing checks, compiled on first use
+    /// (`timing_checks::TcCond`): check `i`'s start at `timing_cond_base[i]`,
+    /// one per condition it has. They depend on the design only, so a
+    /// checkpoint neither holds nor resets them.
+    #[serde(skip)]
+    timing_cond_base: Vec<u32>,
+    #[serde(skip)]
+    timing_conds: Vec<timing_checks::TcCond>,
+    /// Condition evaluations of the timing checks: compiled, interpreted
+    /// (`[PROF] timing_conds`).
+    #[serde(skip)]
+    timing_cond_evals: [u64; 2],
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,
@@ -7032,7 +8579,9 @@ pub struct Simulator {
     /// Armed time-based `$timeskew`/`$fullskew` deadlines: (time, check).
     timing_timers: Vec<(u64, usize)>,
     module: ElaboratedModule,
+    #[serde(skip)]
     dpi_libraries: Vec<Library>,
+    #[serde(skip)]
     dpi_bindings: HashMap<String, DpiBinding>,
     dpi_unsupported: HashSet<String>,
     dpi_unresolved: HashSet<String>,
@@ -7042,13 +8591,20 @@ pub struct Simulator {
     /// Imports whose library binding has been attempted.
     dpi_bind_tried: HashSet<String>,
     /// State of the built-in UVM DPI-C helpers (`uvm_dpi.rs`).
+    #[serde(skip)]
     uvm_dpi: uvm_dpi::UvmDpiState,
     /// Class instance heap (index 0 is null).
     heap: Vec<Option<Box<ClassInstance>>>,
     /// Class reclamation bookkeeping (`heap_gc`): heap length at the last
     /// collection, live objects it left, and running totals.
     class_gc_heap_len: usize,
+    /// Objects live after the last collection, ascending. Handles are only
+    /// ever appended, so these plus the slots from `class_gc_scan_from` on
+    /// are every live object: a collection never walks dead slots.
+    class_gc_survivors: Vec<usize>,
+    class_gc_scan_from: usize,
     class_gc_live: usize,
+    class_gc_live_signals: usize,
     class_gc_released: usize,
     class_gc_runs: usize,
     /// LRM §25.8 virtual-interface bindings.
@@ -7069,7 +8625,12 @@ pub struct Simulator {
     /// Every static property name some class declares as a virtual
     /// interface or through a type parameter (built on first use): the gate
     /// before `bind_static_vif` looks at an assignment.
+    #[serde(skip)]
     vif_capable_statics: std::cell::OnceCell<HashSet<String>>,
+    /// The leaf names of the unpacked variables declared below a scope
+    /// (`arr` of `bus.arr`): the prefilter of `vif_aggregate_canon`.
+    #[serde(skip)]
+    scoped_unpacked_leaves: std::cell::OnceCell<HashSet<String>>,
     /// False once start-up found no such static (`vif_capable_statics`
     /// empty): the one-byte test every blocking assignment makes.
     may_bind_static_vif: bool,
@@ -7139,6 +8700,10 @@ pub struct Simulator {
     /// weighted values (9:1 weights produced ~98:2 instead of 90:10).
     /// Cleared by `exec_randomize` at entry.
     dist_picked_once: HashSet<(usize, String)>,
+    /// The dist items the current trial dealt, as `target inside {item}`:
+    /// the joint solve after a failed trial first keeps each target in its
+    /// item (§18.5.4).
+    dist_dealt: Vec<ConstraintItem>,
     /// IEEE 1800-2017 §18.3/§18.5.12 — the `inside`-range domain of each rand
     /// property of the object currently being solved (exact, signed). The
     /// fixpoint consults it so an affine solve or a `!=` re-pick lands the
@@ -7189,11 +8754,10 @@ pub struct Simulator {
     /// the CALLER specializations alive so value-param resolution can walk up
     /// to them (§13.5.1: args evaluate in the caller's scope).
     spec_scope_stack: Vec<(String, String)>,
-    /// §28.11 gate FALL delays by signal id, from
-    /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
-    /// two-delay `#(rise, fall)` form with differing values.
+    /// §28.16 / §10.3.3 fall delays by driven signal id: a private driver
+    /// stage for a resolved net, otherwise the net itself.
     gate_fall_delay_by_id: HashMap<usize, u64>,
-    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-net turn-off delay,
+    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-driver turn-off delay,
     /// used for a transition to z. Empty unless some assign used the
     /// three-delay form.
     gate_off_delay_by_id: HashMap<usize, u64>,
@@ -7271,6 +8835,19 @@ pub struct Simulator {
     /// `var_class_types`; populated at VarDecl exec time when the
     /// data type is a `TypeReference` whose name is in `module.typedefs`.
     var_typedef_types: HashMap<String, String>,
+    /// The declaration whose name-keyed metadata is installed under each
+    /// frame-local's name (an index into `local_meta_origins`, interned
+    /// through `local_meta_origin_ids`), and the metadata of the declarations
+    /// another one displaced, by name and declaration (see `LocalMeta`). A
+    /// name with a cache entry is contested: only its claims are checked when
+    /// a process runs again, and a swap moves just that name's own entries.
+    local_meta_owner: HashMap<String, u32>,
+    local_meta_origins: Vec<MetaOrigin>,
+    local_meta_origin_ids: HashMap<MetaOrigin, u32>,
+    local_meta_cache: HashMap<String, Vec<(u32, LocalMeta)>>,
+    /// The frame-local declarations the running process's live frames
+    /// executed, outermost first (see `MetaClaim`); part of its context.
+    local_meta_claims: Vec<MetaClaim>,
     /// Names of `string`-typed variables (locals, params, package globals) so
     /// `{a, b}` concatenation involving them is treated as string concat.
     string_signals: HashSet<String>,
@@ -7328,6 +8905,24 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// §18.5.9: the objects of the randomize() call being solved, outermost
+    /// first: the object `randomize()` was called on, then each rand
+    /// sub-object whose own solve is running under it. A sub-object's
+    /// constraint that reads a rand variable of an object earlier in the
+    /// chain through a handle member (`item.addr`, `item` the handle back
+    /// to the enclosing object) belongs to that object's solve.
+    rand_solve_chain: Vec<usize>,
+    /// Set by `randomize_nested_with` for the solve it starts, which then
+    /// extends `rand_solve_chain` instead of starting a chain of its own.
+    rand_solve_nested: bool,
+    /// §18.6.2: the sub-objects of the running call whose `post_randomize`
+    /// waits for the whole call to succeed. A sub-object with an item left
+    /// to an enclosing solve (see `rand_solve_chain`) is done before the
+    /// variables that item constrains have their final values, which its
+    /// `post_randomize` may read (`hist.push_back(item.addr)`).
+    rand_post_deferred: Vec<usize>,
+    /// The solve in progress left an item to an enclosing solve.
+    rand_post_defer_self: bool,
     /// Failed randomize() calls reported so far, per class or
     /// `std::randomize` call site (`rand_fail_warn`).
     rand_fail_reports: HashMap<String, u32>,
@@ -7337,6 +8932,7 @@ pub struct Simulator {
     /// recursive rand-object solve it starts.
     randomize_budget_depth: usize,
     randomize_budget_remaining: u64,
+    #[serde(skip)]
     randomize_budget_deadline: Option<crate::time::Instant>,
     randomize_budget_exhausted: bool,
     /// Active enclosing solves retain only their reachable children's rand state.
@@ -7450,6 +9046,11 @@ pub struct Simulator {
     join_waiters: Vec<JoinWaiter>,
     /// Map from child PID -> parent PID
     process_parents: HashMap<usize, usize>,
+    /// Processes handed up to a grandparent in `process_parents` because
+    /// their own parent finished. They stay its descendants for `disable
+    /// fork` (§9.6.3), but are not its immediate children for `wait fork`
+    /// (§9.6.1).
+    adopted_pids: HashSet<usize>,
     /// Per-process execution context for scheduled class/task processes.
     process_contexts: HashMap<usize, ProcessContext>,
     /// Instance scope (e.g. `"TB.p1"`) for a scheduled process, set from the
@@ -7473,10 +9074,22 @@ pub struct Simulator {
     process_m_label: HashMap<usize, String>,
     /// Where each process came from: the creating construct's source span
     /// and its kind ("initial block", "always block", "fork child", …).
-    /// One insert per process CREATION (never on the activation hot path);
-    /// read only by `report_zero_delay_stall` so a spinning pid can be
-    /// traced back to the RTL construct that spawned it.
+    /// Used by stall/waiter reports, X warnings, value and scheduler traces.
+    /// Terminated fork children release entries after their last diagnostic
+    /// window and native stack unwind, unless deferred diagnostics or a
+    /// checkpoint restart can still need them.
     process_origin: HashMap<usize, (crate::ast::Span, &'static str)>,
+    /// Ordinary deferrals, indexed by this window's stall hits or still on
+    /// a scheduler stack, need only individual lookups at a safe reset.
+    #[serde(skip)]
+    retired_fork_pids: Vec<usize>,
+    /// A native-guard decline needs one sweep at the next safe reset.
+    /// Keep no per-child backlog while imported/exported DPI tasks are live.
+    #[serde(skip)]
+    retired_fork_sweep_needed: bool,
+    #[cfg(test)]
+    #[serde(skip)]
+    retired_fork_reset_visits: usize,
     /// XEZIM_TRACE_SCHED=1|all|<t>|<t0>:<t1> — an ORDERED log of what runs
     /// inside each time slot: the tick header, every clock-generator toggle,
     /// and every process as it is popped from the timing wheel. A race is a
@@ -7518,6 +9131,19 @@ pub struct Simulator {
     /// Parallel to `fn_ret_collection_stack`: the running function returns
     /// an associative array (§13.4).
     fn_ret_assoc_stack: Vec<bool>,
+    /// Parallel to `fn_ret_collection_stack`: the declared width of an
+    /// integral return, the context `return e` evaluates `e` in (§13.4.1:
+    /// as if assigned to the return variable); 0 for other types.
+    fn_ret_ctx_stack: Vec<u32>,
+    /// Parallel to `fn_ret_ctx_stack`: the running subroutine, for the type
+    /// `return '{...}` takes (§10.8, §13.4.1). Empty whenever no function is
+    /// running, which is every checkpoint.
+    #[serde(skip)]
+    fn_ret_frames: Vec<ReturnPatternType>,
+    /// Shared return types of free functions, by return-type span then
+    /// function name, so a call pushes its frame without allocating.
+    #[serde(skip)]
+    fn_ret_types: HashMap<(usize, usize), Vec<(String, std::rc::Rc<DataType>)>>,
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
@@ -7560,12 +9186,15 @@ pub struct Simulator {
     gate_lane_valid: bool,
     /// Paths of instances whose definition is an interface (see
     /// `is_interface_instance`); filled on first use.
+    #[serde(skip)]
     iface_instance_paths: std::cell::OnceCell<std::collections::HashSet<String>>,
     /// Interface instance path by its virtual-interface handle token (see
     /// `iface_handle_token`); filled on first use.
+    #[serde(skip)]
     iface_by_token: std::cell::OnceCell<HashMap<u64, String>>,
     /// See `iface_path_parts`.
     #[allow(clippy::type_complexity)]
+    #[serde(skip)]
     iface_path_parts: std::cell::OnceCell<(HashSet<String>, HashSet<String>)>,
     /// Quiet signals: neither an armed edge-block input nor edge-sensitive,
     /// so a write to one has no side-table work at all. One bit per signal;
@@ -7580,8 +9209,10 @@ pub struct Simulator {
     /// entry, the compiled straight-line function, consulted before the
     /// arena executor.
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     ts_jit: Option<Box<super::ts_jit::enabled::TsJitModule>>,
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     ts_jit_fns: Vec<Option<super::ts_jit::enabled::TsJitFn>>,
     #[cfg(feature = "jit")]
     ts_jit_on: bool,
@@ -7684,6 +9315,7 @@ pub struct Simulator {
     /// preamble tests EVERY bare identifier against that set, so a designs
     /// with any static subroutine local paid a string hash per expression
     /// node; this rejects the overwhelming majority with one array load.
+    #[serde(with = "serde_big_array")]
     static_local_first: [bool; 256],
     /// Persistent-cell keys ("`<cls>::<sub>::<nm>`"/"`<sub>::<nm>`") of all
     /// scalar `static` subroutine locals. A name into `static_local_names`
@@ -7786,12 +9418,29 @@ pub struct Simulator {
     /// `meta_key_bits` of every name in `shadowed_prop_names`: a prefilter that
     /// spares the hot member-access paths a hash per access.
     shadowed_prop_mask: u64,
+    /// §18.5/§8.14: the class that declares each constraint block of the
+    /// randomize() call in progress, keyed by the address of the block's item
+    /// list, for the blocks of a base class of the object when some property
+    /// name is shadowed. Their names resolve in that class, not the object's.
+    /// Empty outside a solve and whenever no name is shadowed.
+    constraint_scopes: HashMap<usize, String>,
+    /// §18.7/§8.14: the declared class of the receiver of the
+    /// `obj.randomize() with {…}` call about to solve, when it is a base of
+    /// the object's class and some name is shadowed: the inline block's names
+    /// resolve in it. Taken by the solve that gathers the block.
+    inline_constraint_scope: Option<String>,
     /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
     /// queue / dynamic-array class properties whose element type is a SIGNED
     /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
     /// elements live in the runtime map with no declared signedness of their
     /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
     signed_class_colls: HashSet<String>,
+    /// Cache of `fit_coll_store_elem`, replaced round-robin from
+    /// `coll_store_fit_next`: (collection store name, the owning object's
+    /// class, `integral_queue_elem` of it).
+    #[allow(clippy::type_complexity)]
+    coll_store_fit_cache: [Option<(String, Option<String>, Option<(u32, bool, bool)>)>; 4],
+    coll_store_fit_next: usize,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
@@ -7881,6 +9530,13 @@ pub struct Simulator {
     edge_parallel_work: Vec<usize>,
     edge_sequential_work: Vec<usize>,
     nba_queue: Vec<NbaEntry>,
+    /// §4.6 b): signals with a nonblocking update waiting in `nba_queue`
+    /// this NBA window, among its first `nba_queue_noted` entries. A later
+    /// whole-signal or element nonblocking update to one of them queues
+    /// behind it instead of taking `nba_fast`, which commits first
+    /// (`nba_behind_queued_partial`). Cleared when the window commits.
+    nba_queued_partial_ids: HashSet<usize>,
+    nba_queue_noted: usize,
     /// §15.5.2 `->> e` nonblocking event triggers: fired when the NBA region
     /// flushes, not in the active region (a same-slot `.triggered` read in an
     /// active/inactive process must still see 0).
@@ -7899,8 +9555,31 @@ pub struct Simulator {
     /// `EVENT_NULL_KEY` marks a null handle. Trigger/`.triggered`/wait_order
     /// all chase this map to the canonical key first.
     event_aliases: HashMap<String, String>,
+    /// §15.5.5: the event OBJECT a class-member event slot `(handle,
+    /// field)` holds once an assignment (`ev = other_ev`) re-bound it, as an
+    /// id shared by every slot holding the same event. A slot absent here
+    /// holds its own event. `event_obj_slots` is the reverse index.
+    event_obj_ids: HashMap<(usize, String), u64>,
+    event_obj_slots: HashMap<u64, Vec<(usize, String)>>,
+    next_event_obj_id: u64,
+    /// The modport names the design declares (`modport_member_dirs`), built
+    /// at setup: a dotted name with no inner segment among them is not
+    /// modport-qualified (§25.5).
+    modport_names: HashSet<String>,
+    /// The static class properties a packed-struct member read can name
+    /// (`collect_static_struct_props`), built at setup.
+    static_struct_props: HashSet<String>,
+    /// The class properties that can hold a `real`
+    /// (`collect_class_real_props`), built at setup.
+    class_real_props: HashSet<String>,
+    /// Every class property name declared `event`, built on first use.
+    class_event_prop_names: Option<std::rc::Rc<HashSet<String>>>,
     /// Fast-path NBA buffer: pre-resolved (signal_id, value) pairs.
     nba_fast: Vec<NbaFast>,
+    /// Pattern target writes collected before scheduling their NBA updates.
+    /// Empty at scheduling boundaries; never part of a checkpoint.
+    #[serde(skip)]
+    pattern_nba_leaves: Option<Vec<(String, Value)>>,
     /// Reverse index: signal_id → most recent index in `nba_fast` for that
     /// signal during the *current* NBA accumulation window. Used by the
     /// partial-range/bit NBA Insns (NbaAssignRange, NbaAssignRangeDyn,
@@ -7924,24 +9603,28 @@ pub struct Simulator {
     /// and `JitModule::try_compile` succeeded at elaboration time, this
     /// holds the native function pointer for the block. `exec_bytecode`
     /// calls it in place of the interpreter loop. None = use interpreter.
+    #[serde(skip)]
     jit_fns: Vec<Option<super::jit::JitFn>>,
     /// Native code for COMB (settle) entries, by comb-entry index. Settle is
     /// ~70% of the loop on DUT-heavy RTL while edge blocks are ~25%, so this
     /// is where the JIT pays. cfg-gated: an earlier runtime-checked version
     /// cost +2.0% in the DEFAULT build from the hot-loop check alone.
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     comb_jit_fns: Vec<Option<super::jit::JitFn>>,
     /// Template-mode native comb fns: `(body, offset into comb_tpl_map_blob,
     /// map len)` per entry. The mapping arrays are HOST-owned (one flat blob)
     /// so the generated crate carries only the bodies — see
     /// `gen_templated_blocks`.
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     comb_tpl_fns: Vec<Option<(super::aot::AotTplFn, u32, u32)>>,
     #[cfg(feature = "jit")]
     comb_tpl_map_blob: Vec<u32>,
     /// Template-mode native EDGE-block fns, same layout as `comb_tpl_fns`.
     /// Checked before `jit_fns` in the edge fast path.
     #[cfg(feature = "jit")]
+    #[serde(skip)]
     edge_tpl_fns: Vec<Option<(super::aot::AotTplFn, u32, u32)>>,
     #[cfg(feature = "jit")]
     edge_tpl_map_blob: Vec<u32>,
@@ -7954,6 +9637,7 @@ pub struct Simulator {
     /// The `JitModule` owns the JIT'd code's memory — it must outlive
     /// all compiled function pointers. Kept on Simulator so the mmapped
     /// code pages stay mapped for the life of the simulation.
+    #[serde(skip)]
     jit_module: Option<super::jit::JitModule>,
     /// True for blocks eligible for parallel execution (no StmtFallback).
     edge_block_parallel: Vec<bool>,
@@ -8034,6 +9718,14 @@ pub struct Simulator {
     /// The cursor is a `u32` (never `usize::MAX`-sentinel — the executor
     /// compares against `keys.len()`).
     foreach_arena: Vec<(Vec<Value>, u32)>,
+    /// Spare register files for the combinational and continuous-assignment
+    /// bytecode a settle evaluates (`enter_private_regs`). A compiled method
+    /// or process loop waiting in an interpreted call keeps its live
+    /// registers in `vm_regs`; a settle that call starts runs on a file of
+    /// its own (§13.4, §8.11). A stack, so evaluations may nest; the files
+    /// hold stale scratch only.
+    #[serde(skip)]
+    vm_regs_pool: Vec<Vec<Value>>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
     /// Source position of every clock generator, for its time-0 rank:
@@ -8047,6 +9739,12 @@ pub struct Simulator {
     t0_pid_ord: HashMap<usize, usize>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
+    /// Initial blocks of module instances queued at time 0 by their pending
+    /// (source-shared) form, by pid: each is materialized for its instance
+    /// when its process starts, so the owned bodies are never all held at
+    /// once. Empty from the end of the time-0 slot on.
+    #[serde(skip)]
+    lazy_initial: HashMap<usize, super::elaborate::PendingInitial>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
     proc_fsm: HashMap<usize, Box<ProcFsm>>,
     /// Resume pc for the next `exec_insns` call (consumed at entry; 0 for
@@ -8100,6 +9798,7 @@ pub struct Simulator {
     /// calls by id, the one running now, and whether that one is unwinding
     /// after a disable.
     dpi_task_names: HashSet<String>,
+    #[serde(skip)]
     dpi_tasks: HashMap<u64, Box<dpi_task::DpiTask>>,
     /// Strings an exported subroutine handed to C (a `string` result or
     /// output), kept until its next call (§35.5.6).
@@ -8159,6 +9858,26 @@ pub struct Simulator {
     /// large) real delay value, keyed by the delay expression's source offset —
     /// warn once per site so a spiking clock names itself without spamming.
     warned_delay_spikes: HashSet<usize>,
+    /// Assignment patterns already warned about an uncovered member.
+    #[serde(skip)]
+    warned_uncovered_patterns: HashSet<(usize, usize)>,
+    /// Names the storage of each typed pattern value held at once.
+    #[serde(skip)]
+    typed_pattern_seq: u64,
+    /// §6.19.5: the enumeration a type name denotes, for method receivers
+    /// (`enum_receivers`), valid for `type_tables_gen` of the second field.
+    #[serde(skip)]
+    enum_recv_cache: HashMap<String, Option<std::rc::Rc<enum_receivers::EnumRecvType>>>,
+    #[serde(skip)]
+    enum_recv_cache_gen: u64,
+    /// §13.5: the slice actuals of the `output`, `inout` and `ref` array
+    /// formals of the calls running now, by caller key (`bind_slice_array_arg`):
+    /// each formal index and the slice element it copies back to.
+    #[serde(skip)]
+    slice_arg_targets: HashMap<String, Vec<(i64, Option<String>)>>,
+    /// Numbers the caller keys of `slice_arg_targets`.
+    #[serde(skip)]
+    slice_arg_seq: u64,
     /// PIDs whose first-at-time-0 variable `#(expr)` delay evaluated to 0 and
     /// was deferred once past the time-0 settle (so the period signal — e.g. a
     /// real cont-assign feeding `always #(p/2) clk=~clk` — settles before the
@@ -8190,6 +9909,8 @@ pub struct Simulator {
     >,
     /// SV-2023: PIDs killed by `disable fork` — skip dispatch on these.
     killed_pids: HashSet<usize>,
+    /// Next simulated time `growth_trace` prints at.
+    growth_trace_next: u64,
     /// §9.7 `process` class: PIDs that have completed execution (child_finished).
     finished_pids: HashSet<usize>,
     /// §9.7 `process` class: PIDs explicitly suspended via `suspend()`. The
@@ -8231,6 +9952,9 @@ pub struct Simulator {
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
     ref_redirect_hot: bool,
+    /// §13.5.2: callee frames aliasing a property of each pinned object
+    /// (see `ref_pins_acquire`); the pin variable lives while this is > 0.
+    ref_pin_users: HashMap<usize, u32>,
     /// §19.7.1 `cg::type_option.<field>` per covergroup TYPE (weight, goal,
     /// comment, strobe, merge_instances), seeded from the body's
     /// `type_option.f = v;` items on first access.
@@ -8239,6 +9963,13 @@ pub struct Simulator {
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
     /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
     hint_key_scratch: std::cell::RefCell<String>,
+    /// `decl_param_scope`'s state: the parameters under each scope, and the
+    /// overlaid parameter tables it hands out. A select loop over one
+    /// instance's signal rebuilds nothing, and a move to another instance
+    /// changes only the scopes the two do not share instead of copying the
+    /// table.
+    #[serde(skip)]
+    decl_param_scope_cache: std::cell::RefCell<DeclParamScopeCache>,
     /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
     vif_key_scratch: std::cell::RefCell<String>,
     /// §8.25: specialization-argument texts already folded to their value
@@ -8247,18 +9978,22 @@ pub struct Simulator {
     spec_frag_fold_cache: RefCell<HashMap<String, Option<String>>>,
     /// The leaf name of every design parameter key (`LP` of `tb.LP`), built
     /// on first use: the gate before a scoped parameter lookup.
+    #[serde(skip)]
     param_leaf_names: std::cell::OnceCell<HashSet<String>>,
     /// §6.22.1: canonical type text of each design-level unpacked typedef
     /// (`int[$]`) -> the typedef that stands for that type in
     /// specialization keys (built on first use; see `unpacked_typedef_rep`).
+    #[serde(skip)]
     unpacked_typedef_reps: std::cell::OnceCell<HashMap<String, String>>,
     /// Every typedef name (design or class scope, bare and qualified) that
     /// carries unpacked dimensions or aliases one that does: the cheap gate
     /// of `unpacked_typedef_rep`.
+    #[serde(skip)]
     unpacked_typedef_names: std::cell::OnceCell<HashSet<String>>,
     /// Reused buffer for `frame_leaf_key_of`'s marker probe.
     marker_key_scratch: String,
     /// See `lvalue_root_is_unpacked_struct_prop`.
+    #[serde(skip)]
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `struct_root_possible`.
     struct_root_names: HashSet<String>,
@@ -8266,16 +10001,19 @@ pub struct Simulator {
     /// See `multidim_members_possible`.
     multidim_members: Option<bool>,
     /// See `struct_prop_name_possible`.
+    #[serde(skip)]
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Member names that appear as dynamic/queue/associative members of a
     /// struct type a class property (or a type-parameter binding, which can
     /// only name a typedef) can resolve to — the cheap gate in front of
     /// `class_struct_coll_name`'s receiver walk.
+    #[serde(skip)]
     struct_coll_member_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// §7.4.5: names whose ELEMENTS are collections — variables declared as
     /// a fixed array of queues / dynamic / associative arrays (`int q3[3][$]`)
     /// and struct members declared that way (`T sp[4][$]`). Gates the
     /// whole-collection assignment of a selected element (`q3[0] = q3[1]`).
+    #[serde(skip)]
     indexed_coll_roots: std::cell::OnceCell<HashSet<String>>,
     /// Bit `len % 64` per name in `indexed_coll_roots` (0: none), so the
     /// common miss costs no hashing.
@@ -8291,6 +10029,16 @@ pub struct Simulator {
     /// collections, keyed by the local's storage; dropped with it (see
     /// `declare_local_coll_array`, `cleanup_dyn_storage`).
     local_coll_elems: HashMap<String, Vec<String>>,
+    /// §7.4.5: the declared shape of the local being declared, registered
+    /// under the per-call storage key `declare_local_dyn` gives it.
+    pending_local_shape: Option<CollShape>,
+    /// Whether a subroutine-local collection of collections was declared,
+    /// which the indexed-collection gates then also look up per frame.
+    local_coll_rows_live: bool,
+    /// Declared shapes of subroutine locals under their per-call keys
+    /// (`@l#n`), apart from `module.coll_shapes`: one entry per call comes
+    /// and goes, which in the large module table forced rehashes.
+    local_coll_shapes: HashMap<String, CollShape>,
     /// Declared associative tails of dynamic roots and their scoped rows.
     dynamic_assoc_dims: HashMap<String, Vec<crate::ast::types::UnpackedDimension>>,
     /// `(callee member, caller member)` collection copy-backs of the dynamic
@@ -8301,6 +10049,7 @@ pub struct Simulator {
     /// `stage_ret_struct_colls`), for the caller's assignment to copy.
     pending_ret_struct: Option<String>,
     /// See `class_member_names`.
+    #[serde(skip)]
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
     /// Every bare name a `__vif_local__` key was ever created for (never
     /// shrinks): a name outside it has no such key.
@@ -8308,6 +10057,14 @@ pub struct Simulator {
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// `class_is_a` answer cache: (derived, base) -> bool.
+    class_is_a_cache: std::cell::RefCell<HashMap<(String, String), bool>>,
+    /// `resolve_interface_port` answer cache: raw name -> bound string.
+    interface_resolve_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// `canonicalize_spec_sig` cache: (class_name, sig) -> canonical signature.
+    spec_sig_cache: std::cell::RefCell<HashMap<(String, String), String>>,
+    /// Whether any class definition in the design has an N-D array property.
+    has_any_array_nd_properties: std::cell::Cell<Option<bool>>,
     /// `class_has_method` answers by class then method (see there).
     has_method_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// See `member_string_keyed_unbound`.
@@ -8318,6 +10075,7 @@ pub struct Simulator {
     method_def_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<MethodDef>>>>,
     /// Every covergroup key and its leaf after the last `::` or `.` (see
     /// `covergroup_def_for`).
+    #[serde(skip)]
     covergroup_leaf_names: std::cell::OnceCell<HashSet<String>>,
     /// Class -> the `string_properties` of it and its ancestors, in chain
     /// order (a method call marks them in `string_signals`).
@@ -8337,6 +10095,36 @@ pub struct Simulator {
     /// then property; `None` marks a width the instance's bindings decide.
     #[allow(clippy::type_complexity)]
     prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
+    #[serde(skip)]
+    struct_member_offset_memo: std::cell::RefCell<HashMap<(String, String), (u32, u32)>>,
+    #[serde(skip)]
+    packed_struct_member_memo: std::cell::RefCell<
+        HashMap<
+            (String, u32, u32, String),
+            Option<(u32, u32, bool, crate::ast::types::DataType, Vec<(i64, i64)>)>,
+        >,
+    >,
+    /// Per-(handle, prop) cache of `class_prop_packed_dims` and
+    /// `class_prop_signed_of`: a class property's packed-dimension / signed
+    /// status is a per-object invariant, but the helpers walk the class
+    /// hierarchy per call (per foreach element) with identical arguments.
+    #[serde(skip)]
+    class_prop_dims_memo: std::cell::RefCell<HashMap<(usize, String), Option<Vec<(i64, i64)>>>>,
+    #[serde(skip)]
+    class_prop_signed_memo: std::cell::RefCell<HashMap<(usize, String), bool>>,
+    /// Per-randomize cache of resolved `dist` geometries in foreach fast
+    /// paths, keyed by the object, the constraint item (address and source
+    /// span) and its item count. Cleared by each `randomize()`; only a `dist`
+    /// whose bounds and weights read no `foreach` index, no rand variable and
+    /// call nothing is memoized (`dist_memo_eligible`), as only those stay
+    /// constant through one solve.
+    #[serde(skip)]
+    dist_geometry_memo: std::cell::RefCell<
+        HashMap<
+            (usize, usize, usize, usize, usize),
+            crate::compiler::simulator::inline_constraints::ResolvedDist,
+        >,
+    >,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
@@ -8353,9 +10141,20 @@ pub struct Simulator {
     meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Declaration-scope typedefs before a procedural typedef shadows a name.
+    /// The tables share storage until a write (§6.18, §23.9).
+    declaration_typedefs: Option<(
+        super::elaborate::TypedefTable,
+        super::elaborate::SharedMap<DataType>,
+    )>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
     /// type tables at run time (see `MethodCallPlan`).
     type_tables_gen: u64,
+    /// Packed struct layouts of named formal types by qualified type name,
+    /// each with the `type_tables_gen` it was built under. Laying out a
+    /// `pkg::T` struct copies the whole parameter table to see the
+    /// package's names bare, too costly to repeat on every call.
+    formal_struct_layouts: HashMap<String, (u64, Option<Vec<(String, u32, u32)>>)>,
     /// Emptied `local_type_stack` overlay pairs, reused by `push_local_frame`
     /// (capacity kept, contents cleared) instead of allocating a map pair for
     /// every activation that records a class/typedef-typed name.
@@ -8422,6 +10221,10 @@ pub struct Simulator {
     /// -> treated as loop-hot (compiles) instead of compiling any short loop
     /// on first call.
     compiled_method_loop_heat: HashMap<(u32, u32, u32), u64>,
+    /// Per (class, method, spec): does the body contain a loop? Such a
+    /// method compiles on its first call under the default tier: one call
+    /// can run many iterations, so a call count says little about its cost.
+    compiled_method_has_loop: HashMap<(u32, u32, u32), bool>,
     /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
     /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
     /// the plan / block caches fill; `Never` is a permanent decline
@@ -8462,10 +10265,10 @@ pub struct Simulator {
     /// (pid + continuation whose first stmt is the Wait) and is re-checked in a
     /// fixpoint after the same-time batch drains, suspending until the
     /// condition genuinely flips instead of falsely proceeding.
-    condition_waiters: Vec<(usize, ProcCont)>,
+    condition_waiters: PidVec<ProcCont>,
     /// Waiters from `condition_waiters` whose conditions became true upon
     /// blocking writes, recorded in write-satisfaction order (§9.7.4).
-    ready_condition_waiters: Vec<(usize, ProcCont)>,
+    ready_condition_waiters: PidVec<ProcCont>,
     /// Ident/member names read by the wait condition of each parked waiter.
     cond_waiter_reads: HashMap<usize, HashSet<String>>,
     /// Wait condition expression for each parked waiter.
@@ -8492,7 +10295,7 @@ pub struct Simulator {
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
-    inactive_queue: Vec<(usize, ProcCont)>,
+    inactive_queue: PidVec<ProcCont>,
     /// Processes waiting for the NBA region to commit (e.g.
     /// `uvm_wait_for_nba_region`: `nba <= next_nba; @(nba)` where `nba` is a
     /// procedural variable). Resumed in `run_one_tick` after all active +
@@ -8502,6 +10305,28 @@ pub struct Simulator {
     /// proceeds). The condition-waiter fixpoint uses it to detect "no progress
     /// this round" and stop (genuine stall).
     cond_progress: u64,
+    /// Parked `wait(cond)` waiters a drain rescheduled to re-evaluate
+    /// (`[PROF] condition_waiter_rechecks`).
+    cond_waiter_rechecks: u64,
+    /// Compiled-to-compiled calls dispatched directly (`vm_try_direct_call_from`),
+    /// without the interpreter's binding (`[PROF] vm_direct_calls`).
+    vm_direct_calls: u64,
+    /// Queue elements a `pop_front`, `push_front`, `insert` or `delete`
+    /// moved one at a time by name, because the queue's elements are not a
+    /// single run of plain values (`[PROF] queue_elem_moves`).
+    queue_elem_moves: u64,
+    /// Stores to an element or member of a packed vector wider than 64 bits
+    /// that read the whole vector out and stored it back instead of editing
+    /// it in place (`[PROF] select_store_copies`).
+    select_store_copies: u64,
+    /// Checks of the running process's claims for displaced local metadata
+    /// (`reapply_local_meta`, `[PROF] local_meta_reapplies`), the displaced
+    /// declarations installed again (`[PROF] local_meta_swaps`), and the
+    /// captures that scanned the tables for a struct local's `name.member`
+    /// keys (`[PROF] local_meta_scans`, one per declaration at most).
+    local_meta_reapplies: u64,
+    local_meta_swaps: u64,
+    local_meta_scans: u64,
     /// SV-2023: blocked mailbox `get`/`peek` proxies keyed by mailbox handle.
     /// Each waiter records the suspended process pid, the destination lvalue
     /// expression to receive the value, and the post-get continuation
@@ -8558,12 +10383,20 @@ pub struct Simulator {
     /// (i.e. the event has been triggered in the same time slot as the
     /// query). EventTrigger handler stamps this.
     event_triggered_time: EventStampStore,
-    /// Processes waiting for signal edge events (@(posedge clk), etc.)
-    event_waiters: Vec<EventWaiter>,
+    /// Processes waiting for signal edge events (@(posedge clk), etc.),
+    /// with the per-signal index a drain picks the ones to examine by.
+    event_waiters: event_waiters::EventWaiters,
+    /// `XEZIM_WAITER_INDEX` (default on, and only with the dirty-driven
+    /// edge scan, whose write notes it shares): a drain examines the
+    /// waiters whose signals were written, not every parked waiter.
+    waiter_index_on: bool,
+    /// `XEZIM_WAITER_INDEX_SHADOW=1`: examine every waiter anyway and stop
+    /// on one the index would have skipped although its signal moved.
+    waiter_index_shadow: bool,
     /// Processes parked on a class-field named event (`@m_event` inside a
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
-    instance_event_waiters: Vec<InstanceEventWaiter>,
+    instance_event_waiters: InstanceEventWaiters,
     /// Monotonic epoch bumped each time a LATE-region resume (Re-NBA waiters,
     /// reactive initials, deferred clocking continuations) runs a continuation
     /// inline. The run_one_tick tail watches it to know those resumes produced
@@ -8611,8 +10444,10 @@ pub struct Simulator {
     /// dump changes which loops can compile (see `for_loop_needs_ast`).
     wave: bool,
     vcd_file: Option<String>,
+    #[serde(skip)]
     vcd_writer: Option<super::vcd_sink::VcdSink>,
     /// Optional in-memory VCD destination installed by browser embedders.
+    #[serde(skip)]
     vcd_writer_override: Option<super::vcd_sink::DumpWriter>,
     /// Per-traced-signal table: (signal_table index, output id code). Built
     /// once at dump start; the per-cycle loop walks just this vector instead
@@ -8632,9 +10467,23 @@ pub struct Simulator {
     /// strings are ABSOLUTE (they include the top module); `dump_filter_prefixes`
     /// rewrites them to the top-RELATIVE form the signal table uses.
     vcd_filter_scopes: Vec<String>,
+    /// `$dumpvars` named arguments but not one of them was a usable name, so
+    /// the VCD dump must select NOTHING. An empty `vcd_filter_scopes` means
+    /// "no filter" = the WHOLE design, so "select nothing" has to be said out
+    /// loud; without this a `$dumpvars` whose arguments all failed to parse
+    /// failed open into a whole-design dump. Set by `$dumpvars`, cleared by
+    /// `$vcdpluson` and by any `$dumpvars` that kept at least one argument.
+    vcd_dump_none: bool,
     /// §21.7.1.4 `$dumpvars` depth argument: 0 = every level below the given
     /// scope, N = N levels starting at it.
     vcd_dump_depth: u32,
+    /// §21.7.1.2: the `(scopes, depth)` selections of the `$dumpvars` calls
+    /// executed before the latest one at the time the dump started. Each call
+    /// adds its objects to the dump (`vcd_filter_scopes` and `vcd_dump_depth`
+    /// hold the latest call's).
+    vcd_earlier_selections: Vec<(Vec<String>, u32)>,
+    /// The simulation time the VCD dump started at (`u64::MAX` before).
+    vcd_start_time: u64,
     /// §21.7.2.1 var type per `vcd_trace` entry (parallel vector). Drives both
     /// the `$var` declaration and the runtime record shape (an `event` emits a
     /// bare `1<id>` pulse, a `real` an `r<decimal>` record).
@@ -8683,6 +10532,7 @@ pub struct Simulator {
     bsp_shadow_checks: u64,
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
     /// write; runs its own background writer unless XEZIM_DUMP_INLINE=1.
+    #[serde(skip)]
     stdout_sink: Option<super::stdout_sink::StdoutSink>,
     /// XTrace dump state. Independent from VCD — can run alongside.
     /// Set `xtrace_file` to enable. Emits the XTrace v1.0 "minimal" profile:
@@ -8692,6 +10542,7 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for XTrace. When non-empty, only
     /// signals matching one of these (exact, or `<scope>.` prefix) are dumped.
     pub xtrace_scopes: Vec<String>,
+    #[serde(skip)]
     xtrace_writer: Option<super::vcd_sink::VcdSink>,
     /// Per-traced-NET table: (signal_table index, XTrace signal id). One entry
     /// per backing net — an aliased name (§9.2 `alias=`) has its own id in the
@@ -8741,14 +10592,54 @@ pub struct Simulator {
     /// Optional hierarchical scope filters for FST (same semantics as
     /// `--xtrace-scope`): keep signals whose name equals or sits under a scope.
     pub fst_scopes: Vec<String>,
+    /// `$fsdbDumpvars` named arguments but not one of them was a usable name:
+    /// the FST dump must select nothing rather than fail open into a
+    /// whole-design dump. Same purpose as `vcd_dump_none`; see there.
+    pub fst_dump_none: bool,
+    /// The waveform EXCLUDE list (`--wave-suppress`), applied by every dump
+    /// format from one matcher — see `waveforms::WaveSuppressor`. Entries are
+    /// hierarchical paths or module names, resolved against the elaborated
+    /// instance tree at dump time.
+    pub wave_suppress: Vec<String>,
     /// The FST body writer (post-header phase). `None` until `fst_start_dump`.
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
+    #[serde(skip)]
     fst_writer: Option<super::fst_sink::FstSink>,
     /// Named-cast targets resolvable at COMPILE time: name -> (width,
     /// signed). Built once at construction; handed to every bytecode
     /// compiler so `type'(expr)` compiles instead of falling back.
     cast_widths: HashMap<String, (u32, bool)>,
+    /// §7.4.1: variables declared as a packed array of a named signed type
+    /// (`lane_t [0:8] x`), with the number of selects that reaches that
+    /// element type (see `bytecode::signed_named_packed_elem_depth`). Built
+    /// at construction from the declared types; empty in most designs, which
+    /// keeps the element-read check to one length test.
+    #[serde(skip)]
+    packed_named_signed: HashMap<String, usize>,
+    /// The same for class properties, by property name: the names some
+    /// class declares as a packed array of a named signed type.
+    #[serde(skip)]
+    packed_named_signed_props: HashMap<String, usize>,
+    /// The `Index` expression whose signed element read is in progress (its
+    /// address), so the re-entrant evaluation reads the slice itself.
+    #[serde(skip)]
+    packed_named_sign_guard: usize,
+    /// §7.4.1: whether the design declares a signed integral type by name
+    /// at all. Only then can a subroutine or block variable be a packed
+    /// array whose elements are signed, so only then does an element select
+    /// of one consult its declaration.
+    packed_named_signed_types: bool,
+    /// §7.2, §7.4.1: names of structure members that are packed arrays of a
+    /// named signed type (see its construction).
+    packed_named_signed_members: HashSet<String>,
+    /// The arithmetic or bitwise operand (its address) being evaluated
+    /// whose parent operator found no context-determined shift in it
+    /// (`has_context_shift`), so its own operator does not scan its operands
+    /// again: each level of a chain `a ^ b ^ ...` scanned the whole chain
+    /// under it.
+    #[serde(skip)]
+    shift_free_operand: usize,
     /// `module.functions` holds each `FunctionDeclaration` by value, so the
     /// obvious `get(name).cloned()` deep-copies a whole function AST — body,
     /// statements and all — on EVERY call. On a design that calls a function
@@ -8761,6 +10652,14 @@ pub struct Simulator {
     /// method compiler (free-function calls). Built lazily on the first
     /// class-method compile; cloned per call site by Rc only.
     free_fn_table: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
+    /// `class_handle_member_types` over every class, shared by method
+    /// compiles; cleared with `compiled_method_admission` when a class is
+    /// added.
+    class_handle_member_types_cache: Option<std::rc::Rc<HashMap<String, HashMap<String, String>>>>,
+    /// Every class-scoped enum literal as `Class::MEMBER` -> value
+    /// (`class_enum_member`), for compiled method bodies that name another
+    /// class's literal (`pdata::NONE`). Built on first use.
+    class_scoped_enum_cache: Option<std::rc::Rc<HashMap<String, Value>>>,
     /// DPI import function prototypes by SV name, built once on the first
     /// method compile (see `dpi_import_fd_table`).
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
@@ -8797,6 +10696,7 @@ pub struct Simulator {
     elem_dotted_bases: RefCell<Option<HashSet<String>>>,
     /// Per-net trace: (signal-table index, (FST handle, immutable encoding width)).
     /// A zero encoding width denotes a real; fixed vectors use at least one.
+    #[serde(skip)]
     fst_trace: Vec<(usize, (FstSignalId, u32))>,
     /// Signal id → `fst_trace` slots, for the shared incremental dirty-set
     /// change detection (see the `dump_dirty` field docs). Empty ⇒ full scan.
@@ -8805,6 +10705,7 @@ pub struct Simulator {
     fst_prev_signals: Vec<Value>,
     /// SV event objects are pulses rather than levels, so they are kept out of
     /// `fst_trace` and emitted once for each trigger.
+    #[serde(skip)]
     fst_events: Vec<(usize, FstSignalId)>,
     /// Last emitted trigger time for each `fst_events` entry.
     fst_event_last: Vec<u64>,
@@ -8824,6 +10725,11 @@ pub struct Simulator {
     /// them into the real NBA queue. So the BSP driver must route these through
     /// the full `&mut self` path. Built alongside comb_level.
     comb_has_nba: Vec<bool>,
+    /// Per comb entry: it reads a signal it also writes (a packed vector
+    /// whose reads survive write exclusion), so its own writes must not
+    /// re-queue it. Other drivers of the vector still do. Rebuilt with the
+    /// levels and whenever its length differs from `comb_entries`.
+    comb_self_exempt: Vec<bool>,
     /// Per comb entry: evaluable by the static isolated path (no `&mut self`,
     /// disjoint writes) — not AST, no NBA, no unsupported insn. Only par_safe
     /// entries run on worker threads in the parallel BSP level dispatch.
@@ -8888,6 +10794,10 @@ pub struct Simulator {
     comb_time0_deferred: Vec<CombEntry>,
     /// Latches once the deferred empty-sensitivity always_comb blocks fired.
     comb_time0_deferred_done: bool,
+    /// §9.2.2.2: the entries with time-0 effects and the items taken out of
+    /// them (a `Noop` stands in) until every process has started; see
+    /// `hold_time0_effect_entries`.
+    comb_time0_held: Vec<(usize, CombItem)>,
     /// Reverse index: signal_id → list of comb_entry indices that read
     /// this signal. CSR layout — `comb_dep_entries[comb_dep_offsets[id]
     /// .. comb_dep_offsets[id+1]]` gives the dependents of signal `id`.
@@ -8962,6 +10872,7 @@ pub struct Simulator {
     /// The settle takes `comb_entries` out of `self` for its duration; this
     /// is a view of the taken vector so `ts_fallback_scope` can still read
     /// an entry's scope hint. Null outside the settle.
+    #[serde(skip)]
     settle_entries_view: (*const CombEntry, usize),
     /// Census: x-read bails per comb entry (count, executor kind).
     #[cfg(feature = "opcode-census")]
@@ -9139,6 +11050,11 @@ pub struct Simulator {
     /// While this is non-zero, procedural comb entries triggered mid-process
     /// are parked in `deferred_comb` and run at the process's exit instead.
     proc_depth: u32,
+    /// Nesting of `run_process_stmts` activations on the native stack. A
+    /// process that calls a task which can wait but does not resumes the
+    /// caller from inside the callee's activation, so a call chain that never
+    /// waits nests one level per call (see `process_nesting_exceeded`).
+    stmts_depth: u32,
     /// (comb entry index, outputs it produced) for procedural entries that ran
     /// while a process was mid-flight. Checked for clobbering at process exit.
     deferred_comb: Vec<(usize, Vec<(usize, Value)>)>,
@@ -9402,6 +11318,15 @@ pub struct Simulator {
     /// processes (`pid`s) executing the same shared AST node reuse one frame.
     #[allow(clippy::type_complexity)]
     blocking_cont_cache: HashMap<(usize, u8), (Arc<[Statement]>, Arc<[Statement]>)>,
+    /// Computed once from the design and checkpoint command-line options.
+    share_task_frames: bool,
+    /// Structural continuation eligibility, computed once per declaration. Holding the
+    /// declaration keeps its address valid; no statement body is cloned here.
+    task_frame_eligibility: HashMap<usize, (std::rc::Rc<TaskDeclaration>, bool)>,
+    /// See `task_body_frame`.
+    #[allow(clippy::type_complexity)]
+    task_frame_cache:
+        HashMap<(usize, usize, usize), (std::rc::Rc<TaskDeclaration>, Option<Arc<[Statement]>>)>,
     /// See `class_task_body_frame`.
     #[allow(clippy::type_complexity)]
     class_task_frame_cache:
@@ -9418,6 +11343,15 @@ pub struct Simulator {
     /// Process activations at the current timestamp — the accurate signal for
     /// "who is spinning" (the event queue's own pid_counts is reset per drain).
     stall_pid_hits: HashMap<usize, u64>,
+    /// Last sampled functional data/control state of each pid's guard window.
+    stall_pid_state: HashMap<usize, u64>,
+    /// Last outer-loop state sample; zero means no sample in this timestamp.
+    stall_state0: u64,
+    /// True when `XEZIM_STALL_LIMIT` was set explicitly: the guard is then a
+    /// hard per-process activation cap (opt-in strict mode). When unset, the
+    /// guard is progress-aware and only trips when a full window of
+    /// activations recurred in the same functional data and control state.
+    stall_limit_explicit: bool,
     /// Delta cycles allowed at one timestamp before the run is declared a
     /// zero-delay livelock. Generous by default (real designs settle in a
     /// handful); tune with XEZIM_STALL_LIMIT, 0 disables the check.
@@ -9461,6 +11395,7 @@ pub struct Simulator {
     prof_entry_counts: Vec<u64>,
     /// `--profile` sampler thread (see `prof_sampler`); `prof_cur` is the
     /// slot the simulation thread publishes its current construct into.
+    #[serde(skip)]
     prof_sampler: Option<crate::compiler::prof_sampler::ProfSampler>,
     prof_cur: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// XEZIM_CONE: entry is a member of a mergeable chain (static analysis).
@@ -9512,10 +11447,12 @@ pub struct Simulator {
     /// Raw C-string pointers parallel to `vpi_arg_cstrings`. The first
     /// entry is the binary name (xezim), the rest are CLI args + plusargs
     /// concatenated. Pointers stay stable across the simulator lifetime.
+    #[serde(skip)]
     vpi_argv: Vec<*mut std::ffi::c_char>,
     /// Cache of DPI scope handles keyed by hierarchical scope name.
     /// Each value is a `Box<DpiScope>` raw pointer handed out to C code
     /// via `svGetScopeFromName` and recovered in `svGetNameFromScope`.
+    #[serde(skip)]
     dpi_scopes: HashMap<String, *mut std::ffi::c_void>,
     prof_psettle_calls: u64,
     prof_psettle_deferred: u64,
@@ -9527,12 +11464,18 @@ pub struct Simulator {
     /// Every collection/array member name declared by ANY class — the cheap
     /// pre-filter for chained-handle member resolution (see
     /// `instance_assoc_member`). Built once on first use.
+    #[serde(skip)]
     chained_coll_member_names: std::cell::OnceCell<HashSet<String>>,
     /// §18.5.7 foreach solving: the `inside {…}` ranges the current body
     /// imposes on the element being solved (indices bound), so a relational
     /// repick (`arr[i] > arr[i-1]`) lands INSIDE the declared range instead of
     /// anywhere in the element's full domain.
     elem_inside_hint: Vec<(i64, i64)>,
+    /// §18.5.8.1: the `<` / `<=` / `>` / `>=` bounds the current foreach
+    /// body puts on the element being solved (`arr[i] OP bound`), for the
+    /// modulo repair's draw.
+    #[serde(skip)]
+    elem_rel_bound: Vec<(crate::ast::expr::BinaryOp, Value)>,
     /// Set after several trials failed a strict foreach check: relational
     /// repicks take the BOUND value (minimal/maximal feasible) instead of a
     /// uniform draw, so a globally coupled monotone chain (`g[i][j][k] >
@@ -9541,7 +11484,17 @@ pub struct Simulator {
     rand_tight_mode: bool,
     /// VPI callback registry (§38.36, `vpi_cb.rs`). Untouched unless a VPI
     /// client registers callbacks.
+    #[serde(skip)]
     vpi_cb: Box<vpi_cb::VpiCbState>,
+    /// Assertion callback registry (IEEE 1800-2017 Clause 39,
+    /// `vpi_assert.rs`). Untouched unless a VPI client registers assertion
+    /// callbacks.
+    #[serde(skip)]
+    vpi_assert: Box<vpi_assert::VpiAssertState>,
+    /// An assertion callback is registered: the gate every assertion hook
+    /// tests first, so a run without them pays one load and branch.
+    #[serde(skip)]
+    vpi_assert_on: bool,
     /// Bit `r` set while a callback of reason `r` is registered (plus
     /// `vpi_cb::MASK_PENDING`): the gate every callback hook tests first, so
     /// a run without VPI callbacks pays one load and branch per hook site.
@@ -9562,16 +11515,40 @@ pub struct Simulator {
     /// Reading this field is disjoint from those borrows. Without it the
     /// macro used to install a NULL `ACTIVE_SIMULATOR`, so a callback that
     /// called back into VPI aborted the process.
+    #[serde(skip)]
     vpi_self_ptr: *mut Simulator,
     /// Open file handles for $fopen/$fwrite/$fclose, keyed by an internal
     /// channel id derived from the MCD/FD value (see `resolve_channel_key`):
     /// MCD channels use their bit number (1..=30), FD channels use the raw FD
     /// value (0x8000_0000+). FD STDOUT/STDERR/STDIN and MCD bit 0 are never
     /// inserted — they are handled inline at write time.
+    #[serde(skip)]
     file_handles: HashMap<i32, sv_file::SvFile>,
     /// Present only for an embedder that explicitly installs a project VFS.
     /// None preserves native path-based file behavior.
+    #[serde(skip)]
     virtual_files: Option<sv_file::VirtualFileSystem>,
+    /// `$save`/`$incsave`/`$restart` requests for the end of this slot.
+    #[serde(skip)]
+    checkpoint_ops: Vec<checkpoint::CheckpointOp>,
+    /// A save was requested, or the design can call `$restart` (Annex D.9).
+    /// Origins are not checkpointed: retain them even for an external save.
+    #[serde(skip)]
+    checkpoint_requested: bool,
+    /// `--save-at` times still ahead, in ticks, earliest first.
+    #[serde(skip)]
+    checkpoint_save_at: Vec<(u64, String)>,
+    /// The state came from a checkpoint: the event loop resumes it as is
+    /// instead of starting time 0.
+    #[serde(skip)]
+    checkpoint_restored: bool,
+    /// A `--restore` is pending: the time-0 settle in `compile` runs blocks
+    /// whose output the checkpoint's run already printed.
+    #[serde(skip)]
+    checkpoint_muted: bool,
+    /// `XEZIM_CKPT_AUDIT`: the fields seen changed since setup.
+    #[serde(skip)]
+    checkpoint_audit: Option<Box<checkpoint::audit::Audit>>,
     /// Some handle holds buffered `$fwrite` output (see `flush_file_writes`).
     file_writes_pending: bool,
     /// §21.3.5 (measured): `$feof` is a STICKY flag set when a read
@@ -9638,6 +11615,7 @@ pub struct Simulator {
     /// own statics); None for every other class. See `modclass_static_inst`.
     modclass_insts: RefCell<HashMap<String, Option<std::rc::Rc<Vec<String>>>>>,
     /// Whether any such class exists (see `any_multi_modclass`).
+    #[serde(skip)]
     multi_modclass: std::cell::OnceCell<bool>,
     /// Whether any class is declared inside a module other than the top
     /// (computed on first use): without one, `modclass_instance` is None.
@@ -9672,8 +11650,29 @@ pub struct Simulator {
     /// registered its waiter — the trigger would be lost. Queue them and
     /// re-fire at the end of the time-0 active region.
     pending_t0_triggers: Vec<String>,
+    /// §23.3.3: the time-0 update of each input port renamed to a whole
+    /// actual signal (see `record_time0_port_edges`): the instance, the
+    /// actual's id, the port's value before the update and the actual's
+    /// value after the pre-process settle (raw v, x).
+    time0_port_edges: Vec<(String, usize, (u64, u64), (u64, u64))>,
+    /// §10.3.3: the ids a collapsed alias name (see `SensitivityId::alias_t0`)
+    /// maps to whose value the pre-process settle left alone, with that
+    /// value (raw v, x): the alias's time-0 update ends there.
+    time0_alias_edges: Vec<(usize, (u64, u64))>,
+    /// Edge blocks a time-0 alias or port update woke before any process
+    /// ran. One that fires on its own at time 0 leaves the list (it runs
+    /// once, as in the reference simulator); the rest run from
+    /// `deliver_time0_port_edges`.
+    edge_t0_pending: Vec<usize>,
+    /// Edge blocks the next edge pass runs although no signal they watch
+    /// changed: those a time-0 port update wakes.
+    edge_forced_fire: Vec<usize>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
+    /// A combinational entry is being evaluated outside the settle
+    /// (`release_time0_held`): its deferred assertion reports are the
+    /// block's, as in the settle (`queue_deferred_assert`).
+    comb_direct_eval: bool,
     /// Call-site (expression span start) → per activation scope (see
     /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
     /// child module shares the call's span, so the scope tells them apart.
@@ -9694,7 +11693,7 @@ pub struct Simulator {
 }
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct SampledWatch {
     /// A simple clock id, or usize::MAX when `clock_events` supplies it.
     clk_id: usize,
@@ -9748,7 +11747,7 @@ static EMPTY_NAME: &str = "";
 /// mark (code 3); inter-arrival samples feed code 2; per-job waits feed codes
 /// 4/5/6. `i64::MIN`/sentinels encode "no sample yet" (the LRM leaves these
 /// stats implementation-defined; many tools report -1 in that case).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct StochasticQueue {
     q_type: i64,
     max_length: i64,
@@ -9797,8 +11796,7 @@ where
 /// registration restore, the caller's queue stays unregistered after the
 /// nested call returns, so its later `delete()` and element reads become
 /// silent no-ops (IEEE 1800-2023 §6.21 automatic-variable per-invocation storage).
-#[derive(Clone, Default, Debug)]
-#[derive(serde::Serialize)]
+#[derive(Clone, Default, Debug, serde::Serialize, serde::Deserialize)]
 struct QueueLocalSave {
     signals: Vec<(String, Value)>,
     arrays_entry: Option<(i64, i64, u32)>,
@@ -11687,7 +13685,11 @@ pub extern "C" fn vpi_chk_error(error_info_p: *mut s_vpi_error_info) -> std::ffi
         info.message = vpi_err_scratch(&msg);
         info.product = b"xezim\0".as_ptr() as *mut std::ffi::c_char;
         info.code = b"\0".as_ptr() as *mut std::ffi::c_char;
-        info.file = std::ptr::null_mut();
+        // §38.3: every string field points at a string. An error has no
+        // source file, so `file` is empty rather than NULL: cocotb logs
+        // `file` and `product` as C strings, and a NULL `file` crashed it
+        // on the first error it checked.
+        info.file = b"\0".as_ptr() as *mut std::ffi::c_char;
         info.line = 0;
     }
     level
@@ -11899,560 +13901,6 @@ fn vpi_str_scratch(s: &str) -> *mut std::ffi::c_char {
         buf.push(0);
         buf.as_mut_ptr() as *mut std::ffi::c_char
     })
-}
-
-/// Read a signal value via VPI.
-///
-/// On any failure — bad handle, out-of-range signal, or a format xezim
-/// cannot supply — sets `value_p->format` to `vpiSuppressVal` and writes
-/// nothing else. IEEE 1800-2017 §38.16 makes that the caller's only way
-/// to detect the failure, and `vpi_get_value` returns `void`, so there is
-/// nowhere else to say so.
-///
-/// This used to handle exactly two formats and silently ignore the rest.
-/// `vpiVectorVal` was among the ignored ones, which is the format
-/// HDL backdoor read routines use: `vpi_get_value` returned success having
-/// written nothing into the caller's buffer.
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_get_value(handle: *mut std::ffi::c_void, value_p: *mut s_vpi_value) {
-    if value_p.is_null() {
-        return;
-    }
-    let vp = unsafe { &mut *value_p };
-    let Some(h) = (unsafe { vpi_deref(handle) }) else {
-        vpi_error(vpi::ERROR, "vpi_get_value: null handle".into());
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    };
-    // VPI object model (vpi_model.rs): expressions, constants, and the
-    // objects that have no value.
-    if matches!(h.kind, VpiKind::Obj | VpiKind::Scope) || h.type_code == vpi_model::c::NAMED_EVENT {
-        let _ = try_active_sim("vpi_get_value", |sim| vpi_model::get_value(sim, h, vp));
-        return;
-    }
-    // A constant argument carries its own value and needs no simulator.
-    if h.kind == VpiKind::Constant {
-        let ok = match &h.value {
-            Some(v) => fill_vpi_value(v, 0, Some(h.type_code), vp),
-            None => false,
-        };
-        if !ok {
-            vpi_error(
-                vpi::ERROR,
-                format!(
-                    "vpi_get_value: cannot supply format {} for a constant",
-                    vp.format
-                ),
-            );
-            vp.format = vpi::SUPPRESS_VAL;
-        }
-        return;
-    }
-    // Modules, memories, iterators and call handles have no readable value.
-    if matches!(
-        h.kind,
-        VpiKind::Module
-            | VpiKind::Iterator
-            | VpiKind::Memory
-            | VpiKind::SysTfCall
-            | VpiKind::UserSystf
-            | VpiKind::ModPath
-            | VpiKind::Tchk
-            | VpiKind::InterModPath
-            | VpiKind::Callback
-    ) {
-        vpi_error(
-            vpi::ERROR,
-            "vpi_get_value: this object has no readable value".into(),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-        return;
-    }
-    let sig_id = h.signal_id;
-
-    let ok = try_active_sim("vpi_get_value", |sim| {
-        let val = if h.kind == VpiKind::Slice {
-            match vpi_slice_read(sim, h) {
-                Some(v) => v,
-                None => return false,
-            }
-        } else {
-            match vpi_api::cell_value(sim, sig_id) {
-                Some(v) => v,
-                None => return false,
-            }
-        };
-        let current_time = sim.time;
-        // vpiStrengthVal reports the driving strength of a net.
-        vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
-        let ok = fill_vpi_value(&val, current_time, Some(h.type_code), vp);
-        vpi_api::clear_strength_hint();
-        ok
-    })
-    .unwrap_or(false);
-
-    if !ok {
-        // vpiSuppressVal is the only failure channel this function has, and a
-        // caller that never checks `format` needs vpi_chk_error to notice.
-        vpi_error(
-            vpi::ERROR,
-            format!("vpi_get_value: cannot supply format {}", vp.format),
-        );
-        vp.format = vpi::SUPPRESS_VAL;
-    }
-}
-
-/// Render `val` into `vp` using `vp.format`. Returns false when the
-/// format cannot be supplied; the caller then sets `vpiSuppressVal`.
-///
-/// Shared by `vpi_get_value` and the value-change dispatcher, so a
-/// callback sees its trigger object's value in exactly the format a
-/// direct read would have produced.
-fn fill_vpi_value(
-    val: &Value,
-    _current_time: u64,
-    obj_type_code: Option<std::ffi::c_int>,
-    vp: &mut s_vpi_value,
-) -> bool {
-    {
-        // vpiObjTypeVal: the simulator picks the object's natural format
-        // and reports which one it chose in `format` (§38.15).
-        let mut format = vp.format;
-        if format == vpi::OBJ_TYPE_VAL {
-            format = vpi_api::obj_type_format(val, obj_type_code);
-            vp.format = format;
-        }
-        // §38.15: a real object is converted to an integer, rounded as
-        // §6.12.2 specifies, for every format but vpiRealVal and vpiStringVal.
-        let rounded;
-        let val = if val.is_real && !vpi_api::format_keeps_real(format) {
-            rounded = vpi_api::real_to_integer(val);
-            &rounded
-        } else {
-            val
-        };
-
-        match format {
-            vpi::INT_VAL => {
-                // PLI_INT32: the low 32 bits, X/Z read as 0, a signed value
-                // sign-extended. Callers that need the full width must use
-                // vpiVectorVal; vpiSize tells them whether they do.
-                let n = if val.is_signed {
-                    val.to_i64().unwrap_or(0) as u64
-                } else {
-                    val.to_u64().unwrap_or(0)
-                };
-                vp.value.integer = (n & 0xFFFF_FFFF) as u32 as std::ffi::c_int;
-            }
-            vpi::REAL_VAL => vp.value.real = val.to_f64(),
-            vpi::SCALAR_VAL => {
-                vp.value.scalar = match val.get_bit_code(0) {
-                    0 => vpi::SCALAR_0,
-                    1 => vpi::SCALAR_1,
-                    2 => vpi::SCALAR_X,
-                    _ => vpi::SCALAR_Z,
-                };
-            }
-            vpi::VECTOR_VAL => {
-                let ptr = VPI_VEC_SCRATCH.with(|cell| {
-                    let mut buf = cell.borrow_mut();
-                    value_to_vecval(val, &mut buf);
-                    buf.as_mut_ptr()
-                });
-                vp.value.vector = ptr;
-            }
-            vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
-            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 3)),
-            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 4)),
-            vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
-            vpi::STRING_VAL if val.is_real => {
-                vp.value.str = vpi_str_scratch(&vpi_api::real_string(val.to_f64()))
-            }
-            vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
-            vpi::TIME_VAL => {
-                let t = val.to_u64().unwrap_or(0);
-                let ptr = VPI_TIME_SCRATCH.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    *slot = s_vpi_time {
-                        type_: vpi::SIM_TIME,
-                        high: (t >> 32) as u32,
-                        low: (t & 0xFFFF_FFFF) as u32,
-                        // §37 vpiTimeVal: `.real` must describe the SAME value
-                        // as high/low (the value being read, `t`), not the sim
-                        // clock. Using `current_time` made the record
-                        // self-inconsistent (a `time` var holding 42 read at
-                        // tick 5 reported real=5).
-                        real: t as f64,
-                    };
-                    cell.as_ptr()
-                });
-                vp.value.time = ptr;
-            }
-            vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
-            // vpiStrengthVal, the short/long/shortreal formats and the raw
-            // formats; false for anything unknown.
-            other => return vpi_api::fill_extra_format(val, obj_type_code, other, vp),
-        }
-        true
-    }
-}
-
-/// Write a signal value via VPI (supports force/release).
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_put_value(
-    handle: *mut std::ffi::c_void,
-    value_p: *mut s_vpi_value,
-    _time_p: *mut s_vpi_time,
-    flags: std::ffi::c_int,
-) -> *mut std::ffi::c_void {
-    if handle.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    // Depositing into the call handle sets a system function's return value
-    // (IEEE 1800-2017 §38.33). Handled before the simulator lookup because it
-    // touches only the call frame.
-    {
-        let Some(h) = (unsafe { vpi_deref(handle) }) else {
-            return std::ptr::null_mut();
-        };
-        if h.kind == VpiKind::SysTfCall {
-            if value_p.is_null() {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: null value on a $systf call".into(),
-                );
-                return std::ptr::null_mut();
-            }
-            let w = h.width.max(1);
-            let vp = unsafe { &*value_p };
-            let v = match vp.format {
-                vpi::INT_VAL => Value::from_u64(unsafe { vp.value.integer } as i64 as u64, w),
-                vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-                vpi::VECTOR_VAL => {
-                    let ptr = unsafe { vp.value.vector };
-                    if ptr.is_null() {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: null vector on a $systf call".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                    let words = (w as usize).div_ceil(32);
-                    vecval_to_value(unsafe { std::slice::from_raw_parts(ptr, words) }, w, false)
-                }
-                other => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: format {} unsupported on a $systf call",
-                            other
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-            let frame = h.frame;
-            VPI_SYSTF_STACK.with(|st| {
-                if let Some(f) = st.borrow_mut().get_mut(frame) {
-                    if f.tf_type == vpi::SYS_FUNC {
-                        f.ret = Some(v);
-                    } else {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: a $systf TASK has no return value".into(),
-                        );
-                    }
-                }
-            });
-            return std::ptr::null_mut();
-        }
-        if h.kind == VpiKind::Constant {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: a vpiConstant argument is read-only".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // VPI object model (vpi_model.rs): objects with no writable value.
-        if vpi_model::put_value_rejected(h) {
-            return std::ptr::null_mut();
-        }
-    }
-
-    try_active_sim("vpi_put_value", |sim| {
-        let h = unsafe { &*(handle as *const VpiHandle) };
-        if matches!(
-            h.kind,
-            VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::Callback
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        // §38.36.2: nothing may be written from a cbReadOnlySynch routine.
-        if sim.vpi_in_read_only() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: writes are not allowed in the read-only synch region; ignored"
-                    .into(),
-            );
-            return std::ptr::null_mut();
-        }
-        let sig_id = h.signal_id;
-        if matches!(
-            h.kind,
-            VpiKind::UserSystf | VpiKind::ModPath | VpiKind::Tchk | VpiKind::InterModPath
-        ) {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: this object has no value; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        if flags == vpi::RELEASE_FLAG && is_packed_id(sig_id) {
-            // Nothing can force a packed-arena word, so there is nothing to release.
-            return std::ptr::null_mut();
-        }
-        if flags == vpi::RELEASE_FLAG {
-            // §38.36.1 cbRelease, once the net has been re-driven.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_queue_release(vpi_cb::CB_RELEASE, Some(sig_id));
-            }
-            // Release: remove from forced_signals and trigger settle
-            sim.forced_signals.remove(&sig_id);
-            // Re-evaluate the continuous drivers of the released net.
-            sim.redrive_released_signal(sig_id);
-            // Release invalidates the event-edge assumption that a flop's
-            // output still reflects its last sampled inputs.
-            sim.edge_block_snap_valid
-                .iter_mut()
-                .for_each(|v| *v = false);
-            sim.edge_block_armed
-                .iter_mut()
-                .for_each(|v| *v |= EDGE_ARMED);
-            sim.dirty_any = true;
-            return std::ptr::null_mut();
-        }
-
-        if value_p.is_null() {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_put_value: null value_p with a write flag; ignored".into(),
-            );
-            return std::ptr::null_mut();
-        }
-
-        // A slice decodes at its own width, then splices back into its parent.
-        let w = if h.kind == VpiKind::Slice {
-            h.width
-        } else {
-            vpi_api::cell_width(sim, sig_id).unwrap_or(32)
-        };
-        let is_signed = vpi_api::cell_signed(sim, sig_id);
-        let vp = unsafe { &*value_p };
-
-        // A format we cannot decode writes NOTHING. The old code fell
-        // through to "read the current value and write it back", which
-        // looks like a successful no-op and hides the unsupported format.
-        let value = match vp.format {
-            vpi::INT_VAL => {
-                // PLI_INT32 is signed; widen through i64 so a negative
-                // integer sign-extends into a wider signal.
-                let ival = unsafe { vp.value.integer } as i64;
-                let mut v = Value::from_u64(ival as u64, w);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::REAL_VAL => Value::from_f64(unsafe { vp.value.real }),
-            vpi::SCALAR_VAL => {
-                let mut v = Value::zero(w);
-                let code = match unsafe { vp.value.scalar } {
-                    // vpiL / vpiH are the weak 0 / 1 levels.
-                    vpi::SCALAR_0 | vpi_api::vc::SCALAR_L => 0,
-                    vpi::SCALAR_1 | vpi_api::vc::SCALAR_H => 1,
-                    vpi::SCALAR_X => 2,
-                    vpi::SCALAR_Z => 3,
-                    other => {
-                        vpi_error(
-                            vpi::ERROR,
-                            format!("vpi_put_value: unsupported vpiScalarVal code {}", other),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                v.set_bit_code(0, code);
-                v.is_signed = is_signed;
-                v
-            }
-            vpi::VECTOR_VAL => {
-                // Every word of the signal's width, and both aval and
-                // bval, so X and Z survive a deposit. The old code read
-                // only `vec[0].aval` for a signal of 64 bits or fewer —
-                // dropping the upper word of anything wider than 32 —
-                // masked X/Z away as `aval & !bval`, and capped the wide
-                // path at four words (128 bits).
-                let vec_ptr = unsafe { vp.value.vector };
-                if vec_ptr.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        "vpi_put_value: vpiVectorVal with a null vector; ignored".into(),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let num_words = (w as usize).div_ceil(32);
-                let vec = unsafe { std::slice::from_raw_parts(vec_ptr, num_words) };
-                vecval_to_value(vec, w, is_signed)
-            }
-            // §38.16 string payloads. cocotb writes 4-state values this way
-            // (a `LogicArray` carrying x/z has no lossless integer form), so
-            // without these every cocotb drive of a clock or reset was
-            // rejected here and silently never reached the signal.
-            vpi::BIN_STR_VAL
-            | vpi::OCT_STR_VAL
-            | vpi::HEX_STR_VAL
-            | vpi::DEC_STR_VAL
-            | vpi::STRING_VAL => {
-                let sp = unsafe { vp.value.str };
-                if sp.is_null() {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!(
-                            "vpi_put_value: null string for format {}; ignored",
-                            vp.format
-                        ),
-                    );
-                    return std::ptr::null_mut();
-                }
-                let text = match unsafe { std::ffi::CStr::from_ptr(sp) }.to_str() {
-                    Ok(t) => t.trim(),
-                    Err(_) => {
-                        vpi_error(
-                            vpi::ERROR,
-                            "vpi_put_value: string payload is not valid UTF-8; ignored".into(),
-                        );
-                        return std::ptr::null_mut();
-                    }
-                };
-                let mut v = match vp.format {
-                    vpi::BIN_STR_VAL => vpi_value_from_radix_str(text, 1, w),
-                    vpi::OCT_STR_VAL => vpi_value_from_radix_str(text, 3, w),
-                    vpi::HEX_STR_VAL => vpi_value_from_radix_str(text, 4, w),
-                    vpi::DEC_STR_VAL => match text.parse::<i64>() {
-                        Ok(n) => Value::from_u64(n as u64, w),
-                        Err(_) => {
-                            vpi_error(
-                                vpi::ERROR,
-                                format!("vpi_put_value: '{}' is not a decimal; ignored", text),
-                            );
-                            return std::ptr::null_mut();
-                        }
-                    },
-                    // vpiStringVal: the payload is CHARACTERS, packed
-                    // right-aligned one byte per 8 bits.
-                    _ => {
-                        let mut sv = Value::zero(w);
-                        for (i, byte) in text.as_bytes().iter().rev().enumerate() {
-                            for k in 0..8u32 {
-                                let bit = i as u32 * 8 + k;
-                                if bit >= w {
-                                    break;
-                                }
-                                sv.set_bit_code(bit as usize, ((byte >> k) & 1) as u8);
-                            }
-                        }
-                        sv
-                    }
-                };
-                v.is_signed = is_signed;
-                v
-            }
-            // vpiTimeVal, vpiStrengthVal, the short/long/shortreal formats and
-            // the raw formats.
-            other => match vpi_api::decode_extra_put(vp, other, w, is_signed) {
-                Ok(v) => v,
-                Err(msg) => {
-                    vpi_error(
-                        vpi::ERROR,
-                        format!("vpi_put_value: {} (nothing written)", msg),
-                    );
-                    return std::ptr::null_mut();
-                }
-            },
-        };
-        // §6.12.2: an integral value put to a real object converts to real, a
-        // real one put to an integral object rounds to an integer.
-        let value = vpi_api::fit_put_value(sim, h, value, w, is_signed);
-
-        // Splice a slice back into its parent before it hits the signal table.
-        let value = if h.kind == VpiKind::Slice {
-            match vpi_slice_write(sim, h, &value) {
-                Some(v) => v,
-                None => return std::ptr::null_mut(),
-            }
-        } else {
-            value
-        };
-
-        // A word of a packed-arena memory has no signal-table slot.
-        if is_packed_id(sig_id) {
-            if flags == vpi::FORCE_FLAG {
-                vpi_error(
-                    vpi::ERROR,
-                    "vpi_put_value: an element of a packed-arena memory cannot be forced".into(),
-                );
-            } else {
-                sim.cell_write(sig_id, &value);
-            }
-            return std::ptr::null_mut();
-        }
-
-        // For force: write value first, THEN add to forced_signals
-        if flags == vpi::FORCE_FLAG {
-            // Write directly to signal_table (bypass write_sig! which would skip)
-            if sig_id < sim.signal_table.len() {
-                sim.signal_table[sig_id] = value.clone();
-                sim.sync_mirror(sig_id);
-                if sig_id < sim.signal_has_xz.len() {
-                    sim.signal_has_xz[sig_id] = if value.raw_bits().1 != 0 { 1u8 } else { 0u8 };
-                }
-                if sig_id < sim.signal_inline_bits.len() {
-                    let (v, x) = value.raw_bits();
-                    sim.signal_inline_bits[sig_id] = [v, x];
-                }
-                sim.after_signal_write(sig_id);
-            }
-            sim.ctl_note_external_write(sig_id);
-            // Now mark as forced (after the write succeeded)
-            sim.forced_signals.insert(sig_id, value);
-            // §38.36.1 cbForce.
-            if sim.vpi_cb_mask != 0 {
-                sim.vpi_notify_override(vpi_cb::CB_FORCE, Some(sig_id));
-            }
-        } else {
-            // Normal write - write_sig! will skip if signal is forced
-            write_sig!(sim, sig_id, value);
-            sim.ctl_note_external_write(sig_id);
-            // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
-            // it, so nothing else marks the signal dirty or re-snapshots it for
-            // edge detection. Without this a cocotb-driven clock landed in the
-            // signal table and propagated nowhere — `always @(posedge clk)` and
-            // even `always @(clk)` never fired, so the DUT sat at x while the
-            // Python side saw its own writes read back correctly.
-            sim.after_signal_write(sig_id);
-            if sig_id < sim.dirty_signals.len() && !sim.dirty_signals[sig_id] {
-                sim.dirty_signals[sig_id] = true;
-                sim.dirty_list.push(sig_id);
-            }
-            sim.dirty_any = true;
-        }
-
-        std::ptr::null_mut()
-    })
-    .unwrap_or(std::ptr::null_mut())
 }
 
 /// Read the current simulation time.
@@ -12917,6 +14365,9 @@ struct RandColl {
     /// elements are the rows; the joint solver keys each row like a row of
     /// a multi-dimensional array (`nd_base`) once the outer size is known.
     row_tail: Option<RowTail>,
+    /// §18.4: one rand member of an array of unpacked structs, solved as a
+    /// collection of its own (`prop` is `arr.m`, elements `arr[i].m`).
+    member: Option<StructElemMember>,
 }
 
 /// The rows of a dynamic outer dimension (`RandColl::row_tail`).
@@ -12928,15 +14379,36 @@ enum RowTail {
     Dyn,
 }
 
+#[derive(Clone, Debug)]
+struct StructElemMember {
+    name: String,
+    signed: bool,
+    enum_type: Option<String>,
+}
+
+impl RandColl {
+    /// Storage key of element `i` (`<h>#arr[i]`, or `<h>#arr[i].m`).
+    fn elem_key(&self, i: impl std::fmt::Display) -> String {
+        match &self.member {
+            Some(m) => format!("{}[{}].{}", self.scoped, i, m.name),
+            None => format!("{}[{}]", self.scoped, i),
+        }
+    }
+}
+
 /// A `.size()` constraint on a rand dynamic array (§18.4): the array must be
 /// SIZED before its elements can be solved.
 enum SizeCon {
     /// `a.size() == E` — E already evaluated.
     Eq(u64),
+    /// `a.size() == E` with a negative signed target or one above the trial cap.
+    Impossible,
     /// `a.size() inside {…}` — the ranges already evaluated.
     In(Vec<(u64, u64)>),
     /// `a.size() < E`, `>= E`, … — E already evaluated.
     Rel(crate::ast::expr::BinaryOp, u64),
+    /// `a.size() dist {…}` — each item's bounds and its weight over them.
+    Dist(Vec<(u64, u64, u128)>),
 }
 
 // ===========================================================================
@@ -13627,6 +15099,16 @@ fn drop_xz(r: &mut Value) {
     }
 }
 
+/// `Insn::RealToInt`: §6.12.1 — a real rounds to a 64-bit integer, ties
+/// away from zero (a target narrower than 64 bits wraps it at the `Resize`
+/// that follows); any other value is left as it is.
+#[inline]
+fn real_to_int_reg(r: &mut Value) {
+    if r.is_real {
+        *r = Value::from_real_wrapped(r.to_f64(), 64);
+    }
+}
+
 /// The last `.`-separated segment of a hierarchical name and that segment
 /// cut at its first `[` — what `rsplit('.')` / `split('[')` give, in one
 /// pass over the bytes.
@@ -13773,7 +15255,7 @@ mod dpi_trampoline_cc_tests {
     #[test]
     fn trampoline_command_is_portable() {
         let a = args(None);
-        assert_eq!(a[0], "cc");
+        assert_eq!(a[0], "clang");
         assert!(
             !a.iter()
                 .any(|x| x == "-m64" || x == "-m32" || x.starts_with("-march"))
@@ -13785,32 +15267,38 @@ mod dpi_trampoline_cc_tests {
         let b = args(Some("ccache  aarch64-linux-gnu-gcc"));
         assert_eq!(&b[..2], ["ccache", "aarch64-linux-gnu-gcc"]);
         assert!(!b.iter().any(|x| x == "-m64"));
-        assert_eq!(args(Some("  "))[0], "cc");
+        assert_eq!(args(Some("  "))[0], "clang");
     }
 }
 
-/// The outcome of comparing an aggregate with an assignment pattern
-/// (`Simulator::pattern_cmp`, IEEE 1800-2017 §11.4.5).
+/// The outcome of comparing an aggregate element by element, with another
+/// aggregate or with an assignment pattern (IEEE 1800-2023 §11.4.5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PatCmp {
     Equal,
     Unequal,
-    /// An x/z struct member: the comparison is x.
+    /// An x/z element or member leaves the relation open: `==` and `!=`
+    /// are x (§11.4.5).
     Unknown,
-    /// An x/z array element: neither `==` nor `!=` holds.
-    Neither,
 }
 
 impl PatCmp {
     /// Fold the next element's outcome in: any unequal element decides;
-    /// otherwise an unknown one makes the result unknown (x for a struct
-    /// member, `Neither` for an array element).
-    fn and(self, next: PatCmp, member: bool) -> PatCmp {
+    /// otherwise an unknown one makes the result unknown.
+    fn and(self, next: PatCmp) -> PatCmp {
         match (self, next) {
             (PatCmp::Unequal, _) | (_, PatCmp::Unequal) => PatCmp::Unequal,
-            (PatCmp::Equal, PatCmp::Equal) => PatCmp::Equal,
-            (PatCmp::Unknown, _) | (_, PatCmp::Unknown) if member => PatCmp::Unknown,
-            _ => PatCmp::Neither,
+            (PatCmp::Unknown, _) | (_, PatCmp::Unknown) => PatCmp::Unknown,
+            _ => PatCmp::Equal,
+        }
+    }
+
+    /// The 1-bit result of an equality (`want_eq`) or inequality operator.
+    fn value(self, want_eq: bool) -> Value {
+        match self {
+            PatCmp::Equal => Value::from_u64(want_eq as u64, 1),
+            PatCmp::Unequal => Value::from_u64(!want_eq as u64, 1),
+            PatCmp::Unknown => Value::new(1),
         }
     }
 }
@@ -13822,8 +15310,17 @@ mod event_name_tests;
 mod process_cache_lifetime_tests;
 
 #[cfg(test)]
+mod finished_process_lifetime_tests;
+
+#[cfg(test)]
 mod class_heap_lifetime_tests;
+
+#[cfg(test)]
+mod signal_map_tests;
 
 mod heap_trace;
 
 mod heap_gc;
+
+/// Origin tag shared by fork creation and terminal metadata retirement.
+const FORK_CHILD_ORIGIN: &str = "fork child";

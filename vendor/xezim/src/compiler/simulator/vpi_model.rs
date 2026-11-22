@@ -333,6 +333,14 @@ pub(super) mod c {
     pub const EDGE1X: c_int = 0x10;
     pub const EDGEX0: c_int = 0x20;
     pub const UNDEFINED: c_int = -1;
+    // Assertion objects and relations (sv_vpi_user.h, Clause 39).
+    pub const PROPERTY_DECL: c_int = 655;
+    pub const PROPERTY_INST: c_int = 660;
+    pub const ASSERT: c_int = 686;
+    pub const ASSUME: c_int = 687;
+    pub const COVER: c_int = 688;
+    pub const CONCURRENT_ASSERTION: c_int = 740;
+    pub const ASSERTION: c_int = 744;
 }
 
 /// `vpi_get_str(vpiType, h)`: the standard spelling of every type code the
@@ -430,6 +438,11 @@ pub(super) fn type_name(code: c_int) -> Option<&'static str> {
         c::PACKED_ARRAY_NET => "vpiPackedArrayNet",
         c::EVENT_TS => "vpiEventTypespec",
         c::VIRTUAL_INTERFACE_VAR => "vpiVirtualInterfaceVar",
+        c::PROPERTY_DECL => "vpiPropertyDecl",
+        c::PROPERTY_INST => "vpiPropertyInst",
+        c::ASSERT => "vpiAssert",
+        c::ASSUME => "vpiAssume",
+        c::COVER => "vpiCover",
         _ => return None,
     })
 }
@@ -697,6 +710,9 @@ pub(super) enum OData {
         dir: c_int,
         expr: u32,
     },
+    /// IEEE 1800-2017 Clause 39: a concurrent assertion, the property it
+    /// instantiates, or a property declaration (see `vpi_assert.rs`).
+    Assertion(vpi_assert::AssertRef),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1123,6 +1139,33 @@ struct Ctx {
     automatic: bool,
     /// Body parameters are local (the definition has a parameter port list).
     body_params_local: bool,
+    /// Names declared by `PropertyDeclaration` anywhere in this definition.
+    props: std::rc::Rc<HashSet<String>>,
+}
+
+/// Names declared by `ModuleItem::PropertyDeclaration` anywhere in `items`
+/// (including generate bodies, excluding nested module definitions).
+fn collect_prop_decls(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for it in items {
+        match it {
+            ModuleItem::PropertyDeclaration(pd) => {
+                out.insert(pd.name.name.clone());
+            }
+            ModuleItem::GenerateRegion(gr) => collect_prop_decls(&gr.items, out),
+            ModuleItem::GenerateFor(gf) => collect_prop_decls(&gf.items, out),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &gi.branches {
+                    collect_prop_decls(branch, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_prop_decls(&arm.items, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Port information gathered before the port objects are made.
@@ -1140,6 +1183,10 @@ struct Builder<'a> {
     /// §23.11 `bind` directives, with their source file.
     binds: Vec<(&'a BindDirective, u32)>,
     typedefs: HashMap<String, (&'a TypedefDeclaration, u32)>,
+    /// Names declared by `PropertyDeclaration` per definition name.
+    def_props: HashMap<String, std::rc::Rc<HashSet<String>>>,
+    /// Names declared by `PackageItem::Property` in active packages or `$unit`.
+    pkg_props: HashSet<String>,
     inst_by_path: HashMap<&'a str, InstIdx>,
     attached: Vec<bool>,
     /// Parameters grouped by their flat scope prefix.
@@ -1187,6 +1234,9 @@ impl<'a> Builder<'a> {
                 lib_texts.push((path.display().to_string(), text, exact));
             }
         }
+        for ast in &mut asts {
+            xezim_core::scope_tree::build_all(&mut ast.descriptions);
+        }
         let mut b = Builder {
             sim,
             m: VpiModel {
@@ -1211,6 +1261,8 @@ impl<'a> Builder<'a> {
             packages: Vec::new(),
             binds: Vec::new(),
             typedefs: HashMap::default(),
+            def_props: HashMap::default(),
+            pkg_props: HashSet::default(),
             inst_by_path: HashMap::default(),
             attached: vec![false; sim.module.instances.len()],
             params_by_prefix: HashMap::default(),
@@ -1288,14 +1340,21 @@ impl<'a> Builder<'a> {
                     }
                     D::Package(p) => {
                         self.packages.push((p, fi));
+                        let pkg_used = self.sim.module.packages.contains(&p.name.name);
                         for it in &p.items {
-                            if let PackageItem::Typedef(td) = it {
-                                self.typedefs
-                                    .entry(format!("{}::{}", p.name.name, td.name.name))
-                                    .or_insert((td, fi));
-                                self.typedefs
-                                    .entry(td.name.name.clone())
-                                    .or_insert((td, fi));
+                            match it {
+                                PackageItem::Typedef(td) => {
+                                    self.typedefs
+                                        .entry(format!("{}::{}", p.name.name, td.name.name))
+                                        .or_insert((td, fi));
+                                    self.typedefs
+                                        .entry(td.name.name.clone())
+                                        .or_insert((td, fi));
+                                }
+                                PackageItem::Property(pd) if pkg_used => {
+                                    self.pkg_props.insert(pd.name.name.clone());
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1305,6 +1364,9 @@ impl<'a> Builder<'a> {
                     }
                     D::PackageItem(PackageItem::Typedef(td)) => {
                         self.typedefs.insert(td.name.name.clone(), (td, fi));
+                    }
+                    D::PackageItem(PackageItem::Property(pd)) => {
+                        self.pkg_props.insert(pd.name.name.clone());
                     }
                     _ => {}
                 }
@@ -1653,6 +1715,15 @@ impl<'a> Builder<'a> {
             return s;
         }
         self.depth += 1;
+        let props = self
+            .def_props
+            .entry(def_name.clone())
+            .or_insert_with(|| {
+                let mut set = HashSet::default();
+                collect_prop_decls(items, &mut set);
+                std::rc::Rc::new(set)
+            })
+            .clone();
         let ctx = Ctx {
             scope: s,
             file: fi,
@@ -1662,13 +1733,13 @@ impl<'a> Builder<'a> {
             params: self.params_for(&flat_prefix),
             automatic: lifetime == Some(Lifetime::Automatic),
             body_params_local: !params.is_empty(),
+            props,
         };
         for p in params {
             self.param_decl(p, false, &ctx);
         }
         let mut port_decls = self.ansi_ports(ports, &ctx);
-        let mut ord = 0u32;
-        self.walk_items(items, &ctx, &mut ord, &mut port_decls);
+        self.walk_items(items, &ctx, &mut port_decls);
         // §23.11: instances `bind` adds to this one, connected in its scope.
         let binds: Vec<(&'a BindDirective, u32)> = self
             .sim
@@ -1751,6 +1822,7 @@ impl<'a> Builder<'a> {
             params: std::rc::Rc::new(self.global_params.clone()),
             automatic: p.lifetime == Some(Lifetime::Automatic),
             body_params_local: false,
+            props: std::rc::Rc::default(),
         };
         for it in &p.items {
             match it {
@@ -1872,13 +1944,7 @@ impl<'a> Builder<'a> {
 
     // --- scope items ---------------------------------------------------
 
-    fn walk_items(
-        &mut self,
-        items: &'a [ModuleItem],
-        ctx: &Ctx,
-        ord: &mut u32,
-        ports: &mut Vec<PortDecl>,
-    ) {
+    fn walk_items(&mut self, items: &'a [ModuleItem], ctx: &Ctx, ports: &mut Vec<PortDecl>) {
         for it in items {
             match it {
                 ModuleItem::PortDeclaration(pd) => self.port_decl(pd, ctx, ports),
@@ -1904,34 +1970,145 @@ impl<'a> Builder<'a> {
                 ModuleItem::ContinuousAssign(ca) => self.cont_assign(ca, ctx),
                 ModuleItem::ModuleInstantiation(mi) => self.instantiation(mi, ctx),
                 ModuleItem::GateInstantiation(gi) => self.gates(gi, ctx),
-                ModuleItem::GenerateRegion(gr) => self.walk_items(&gr.items, ctx, ord, ports),
+                ModuleItem::GenerateRegion(gr) => self.walk_items(&gr.items, ctx, ports),
                 ModuleItem::GenerateIf(gi) => {
-                    *ord += 1;
                     let labels: Vec<Option<&String>> =
                         gi.branch_labels.iter().map(|l| l.as_ref()).collect();
-                    self.placeholder_labels(&labels, *ord, ctx);
-                    self.generate_if(gi, ctx, *ord);
+                    self.placeholder_labels(&labels, &gi.implicit_name, ctx);
+                    self.generate_if(gi, ctx);
                 }
                 ModuleItem::GenerateCase(gc) => {
-                    *ord += 1;
                     let labels: Vec<Option<&String>> =
                         gc.arms.iter().map(|a| a.label.as_ref()).collect();
-                    self.placeholder_labels(&labels, *ord, ctx);
-                    self.generate_case(gc, ctx, *ord);
+                    self.placeholder_labels(&labels, &gc.implicit_name, ctx);
+                    self.generate_case(gc, ctx);
                 }
                 ModuleItem::GenerateFor(gf) => {
-                    *ord += 1;
-                    self.placeholder_labels(&[gf.name.as_ref()], *ord, ctx);
-                    self.generate_for(gf, ctx, *ord);
+                    self.placeholder_labels(&[gf.name.as_ref()], &gf.implicit_name, ctx);
+                    self.generate_for(gf, ctx);
                 }
                 ModuleItem::FunctionDeclaration(fd) => self.function(fd, ctx, None),
                 ModuleItem::TaskDeclaration(td) => self.task(td, ctx, None),
                 ModuleItem::DPIImport(di) => self.dpi_import(di, ctx),
                 ModuleItem::SpecifyBlock(sb) => self.specify(sb, ctx),
                 ModuleItem::ModportDeclaration(md) => self.modports(md, ctx),
+                ModuleItem::AssertionItem(a) => self.assertion(a, ctx),
+                ModuleItem::PropertyDeclaration(pd) => {
+                    self.assertion_obj(
+                        c::PROPERTY_DECL,
+                        &pd.name.name,
+                        pd.span,
+                        vpi_assert::AssertRole::PropertyDecl,
+                        None,
+                        0,
+                        0,
+                        ctx,
+                    );
+                }
                 _ => {}
             }
         }
+    }
+
+    /// IEEE 1800-2017 Clause 39: a labelled concurrent assertion item, and
+    /// the property instance it names when its property is a declared one.
+    /// (An assertion without a label has no name to report or to control
+    /// it by, and is not an object.)
+    fn assertion(&mut self, a: &'a crate::ast::stmt::AssertionStatement, ctx: &Ctx) {
+        use crate::ast::stmt::AssertionKind;
+        use vpi_assert::AssertRole;
+        if !a.is_property || a.deferred.is_some() {
+            return;
+        }
+        let Some(label) = &a.label else {
+            return;
+        };
+        let (ty, kind) = match a.kind {
+            AssertionKind::Assert => (c::ASSERT, 0),
+            AssertionKind::Assume => (c::ASSUME, 1),
+            AssertionKind::Cover => (c::COVER, 2),
+        };
+        let lab = Some(label.name.clone());
+        self.assertion_obj(
+            ty,
+            &label.name,
+            a.span,
+            AssertRole::Directive,
+            lab.clone(),
+            a.span.start,
+            kind,
+            ctx,
+        );
+        // `assert property (p)` or `assert property (p(actuals))`, with
+        // optional leading clocking event(s).
+        let mut expr = &a.expr;
+        while let ExprKind::SvaClocked { body, .. } = &expr.kind {
+            expr = body;
+        }
+        let prop = match &expr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.clone())
+            }
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(h.path[0].name.name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(p) = prop.filter(|p| ctx.props.contains(p) || self.pkg_props.contains(p)) {
+            self.assertion_obj(
+                c::PROPERTY_INST,
+                &p,
+                a.span,
+                AssertRole::PropertyInst,
+                lab,
+                a.span.start,
+                kind,
+                ctx,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assertion_obj(
+        &mut self,
+        ty: c_int,
+        name: &str,
+        span: Span,
+        role: vpi_assert::AssertRole,
+        label: Option<String>,
+        span_key: usize,
+        kind: u8,
+        ctx: &Ctx,
+    ) {
+        let (file, line) = self.loc(span, ctx.file);
+        let scope = self.m.scopes[ctx.scope as usize].full.clone();
+        let full = format!("{scope}.{name}");
+        // A property instance shares its declaration's name: the name
+        // resolves to the declaration.
+        let register = role != vpi_assert::AssertRole::PropertyInst;
+        self.m.add_obj(
+            MObj {
+                type_code: ty,
+                name: name.to_string(),
+                full,
+                scope: ctx.scope,
+                parent: NONE,
+                file,
+                line,
+                d: OData::Assertion(vpi_assert::AssertRef {
+                    role,
+                    scope,
+                    label,
+                    span_key,
+                    kind,
+                }),
+            },
+            register,
+            true,
+        );
     }
 
     /// Flat prefix of the instance a walk is in.
@@ -1943,9 +2120,9 @@ impl<'a> Builder<'a> {
     }
 
     /// The placeholder signals of generate block names at this level.
-    fn placeholder_labels(&mut self, labels: &[Option<&String>], ord: u32, ctx: &Ctx) {
+    fn placeholder_labels(&mut self, labels: &[Option<&String>], implicit: &str, ctx: &Ctx) {
         let mut names: Vec<String> = labels.iter().flatten().map(|l| (*l).clone()).collect();
-        names.push(format!("genblk{}", ord));
+        names.push(implicit.to_string());
         let inst_prefix = self.inst_flat_prefix(ctx);
         for n in names {
             self.m
@@ -2771,8 +2948,9 @@ impl<'a> Builder<'a> {
                     selects: Vec::new(),
                 }],
                 span: Span::dummy(),
-                cached_signal_id: Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             Span::dummy(),
         );
@@ -2922,6 +3100,34 @@ impl<'a> Builder<'a> {
                                     c::NO_DIRECTION,
                                     false,
                                     sub.automatic,
+                                    d.span,
+                                    &sub,
+                                );
+                            }
+                            continue;
+                        }
+                        if let StatementKind::ParamDecl {
+                            data_type,
+                            declarators,
+                            ..
+                        } = &s.kind
+                        {
+                            let sub = Ctx {
+                                scope: inner,
+                                flat_prefix: self.m.scopes[inner as usize].flat_prefix.clone(),
+                                flat_suffix: self.m.scopes[inner as usize].flat_suffix.clone(),
+                                automatic: false,
+                                ..ctx.clone()
+                            };
+                            for d in declarators {
+                                let t = self.tdesc(data_type, &d.dimensions, &sub);
+                                self.declare(
+                                    &d.name,
+                                    t,
+                                    0,
+                                    c::NO_DIRECTION,
+                                    false,
+                                    false,
                                     d.span,
                                     &sub,
                                 );
@@ -3392,6 +3598,7 @@ impl<'a> Builder<'a> {
             params,
             automatic: ctx.automatic,
             body_params_local: false,
+            props: ctx.props.clone(),
         }
     }
 
@@ -3399,21 +3606,18 @@ impl<'a> Builder<'a> {
     fn gen_block(
         &mut self,
         label: Option<&String>,
-        ord: u32,
+        implicit: &str,
         items: &'a [ModuleItem],
         span: Span,
         ctx: &Ctx,
     ) {
         let name = match label {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => implicit.to_string(),
         };
-        // A labeled block scopes its declarations; an unlabeled one leaves
-        // them in the enclosing flat namespace.
-        let flat_prefix = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        // §27.6: every block scopes its declarations, an unlabelled one
+        // under its implicit name (`genblk1.x`), as elaboration keys them.
+        let flat_prefix = format!("{}{}.", ctx.flat_prefix, name);
         let inst_prefix = format!("{}{}.", ctx.inst_prefix, name);
         let params = self.merge_params(ctx, &flat_prefix, None);
         let sub = self.gen_scope(
@@ -3428,9 +3632,8 @@ impl<'a> Builder<'a> {
             NONE,
             0,
         );
-        let mut ord2 = 0u32;
         let mut ports = Vec::new();
-        self.walk_items(items, &sub, &mut ord2, &mut ports);
+        self.walk_items(items, &sub, &mut ports);
     }
 
     fn merge_params(
@@ -3455,27 +3658,33 @@ impl<'a> Builder<'a> {
         std::rc::Rc::new(p)
     }
 
-    fn generate_if(&mut self, gi: &'a GenerateIf, ctx: &Ctx, ord: u32) {
+    fn generate_if(&mut self, gi: &'a GenerateIf, ctx: &Ctx) {
         for (bi, (cond, items)) in gi.branches.iter().enumerate() {
             let take = match cond {
                 Some(e) => match self.eval(e, ctx) {
                     Some(v) => v != 0,
                     None => {
                         let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
-                        self.branch_elaborated(label, ord, items, ctx)
+                        let direct = gi.branch_direct.get(bi) == Some(&true);
+                        self.branch_elaborated(label, &gi.implicit_name, direct, items, ctx)
                     }
                 },
                 None => true,
             };
             if take {
+                // §27.5: a directly nested branch is not a scope.
+                if gi.branch_direct.get(bi) == Some(&true) {
+                    self.walk_items(items, ctx, &mut Vec::new());
+                    return;
+                }
                 let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
-                self.gen_block(label, ord, items, gi.span, ctx);
+                self.gen_block(label, &gi.implicit_name, items, gi.span, ctx);
                 return;
             }
         }
     }
 
-    fn generate_case(&mut self, gc: &'a GenerateCase, ctx: &Ctx, ord: u32) {
+    fn generate_case(&mut self, gc: &'a GenerateCase, ctx: &Ctx) {
         let sel = self.eval(&gc.selector, ctx);
         let mut chosen = None;
         if let Some(sel) = sel {
@@ -3489,7 +3698,13 @@ impl<'a> Builder<'a> {
             }
         } else {
             for arm in &gc.arms {
-                if self.branch_elaborated(arm.label.as_ref(), ord, &arm.items, ctx) {
+                if self.branch_elaborated(
+                    arm.label.as_ref(),
+                    &gc.implicit_name,
+                    arm.direct,
+                    &arm.items,
+                    ctx,
+                ) {
                     chosen = Some(arm);
                     break;
                 }
@@ -3499,7 +3714,18 @@ impl<'a> Builder<'a> {
             chosen = gc.arms.iter().find(|a| a.values.is_empty());
         }
         if let Some(arm) = chosen {
-            self.gen_block(arm.label.as_ref(), ord, &arm.items, gc.span, ctx);
+            // §27.5: a directly nested arm is not a scope.
+            if arm.direct {
+                self.walk_items(&arm.items, ctx, &mut Vec::new());
+                return;
+            }
+            self.gen_block(
+                arm.label.as_ref(),
+                &gc.implicit_name,
+                &arm.items,
+                gc.span,
+                ctx,
+            );
         }
     }
 
@@ -3508,22 +3734,40 @@ impl<'a> Builder<'a> {
     fn branch_elaborated(
         &self,
         label: Option<&String>,
-        ord: u32,
+        implicit: &str,
+        direct: bool,
         items: &[ModuleItem],
         ctx: &Ctx,
     ) -> bool {
+        // §27.5: a directly nested branch left behind what its inner blocks did.
+        if direct {
+            return match &items[0] {
+                ModuleItem::GenerateIf(g) => g.branches.iter().enumerate().any(|(bi, (_, b))| {
+                    let label = g.branch_labels.get(bi).and_then(|l| l.as_ref());
+                    let direct = g.branch_direct.get(bi) == Some(&true);
+                    self.branch_elaborated(label, &g.implicit_name, direct, b, ctx)
+                }),
+                ModuleItem::GenerateCase(g) => g.arms.iter().any(|a| {
+                    self.branch_elaborated(
+                        a.label.as_ref(),
+                        &g.implicit_name,
+                        a.direct,
+                        &a.items,
+                        ctx,
+                    )
+                }),
+                _ => false,
+            };
+        }
         let name = match label {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => implicit.to_string(),
         };
         let ipre = format!("{}{}.", ctx.inst_prefix, name);
         if self.inst_by_path.keys().any(|p| p.starts_with(&ipre)) {
             return true;
         }
-        let fpre = match label {
-            Some(l) => format!("{}{}.", ctx.flat_prefix, l),
-            None => ctx.flat_prefix.clone(),
-        };
+        let fpre = format!("{}{}.", ctx.flat_prefix, name);
         items.iter().any(|it| {
             let names: Vec<&str> = match it {
                 ModuleItem::DataDeclaration(dd) => dd
@@ -3545,10 +3789,10 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn generate_for(&mut self, gf: &'a GenerateFor, ctx: &Ctx, ord: u32) {
+    fn generate_for(&mut self, gf: &'a GenerateFor, ctx: &Ctx) {
         let name = match &gf.name {
             Some(l) => l.clone(),
-            None => format!("genblk{}", ord),
+            None => gf.implicit_name.clone(),
         };
         // The iteration values, as the elaborator computed them.
         let mut values: Vec<i64> = Vec::new();
@@ -3650,9 +3894,8 @@ impl<'a> Builder<'a> {
             );
             elems.push(sub.scope);
             self.m.genvars.insert(sub.scope, (gf.var.clone(), v));
-            let mut ord2 = 0u32;
             let mut ports = Vec::new();
-            self.walk_items(&gf.items, &sub, &mut ord2, &mut ports);
+            self.walk_items(&gf.items, &sub, &mut ports);
         }
         if let OData::GenArray { elems: e } = &mut self.m.objs[arr as usize].d {
             *e = elems;
@@ -3771,6 +4014,16 @@ impl<'a> Builder<'a> {
                     for d in declarators {
                         let t = self.tdesc(data_type, &d.dimensions, &sub);
                         self.declare(&d.name, t, 0, c::NO_DIRECTION, false, auto, d.span, &sub);
+                    }
+                }
+                StatementKind::ParamDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
+                    for d in declarators {
+                        let t = self.tdesc(data_type, &d.dimensions, &sub);
+                        self.declare(&d.name, t, 0, c::NO_DIRECTION, false, false, d.span, &sub);
                     }
                 }
                 _ => self.walk_stmt(st, s, &sub),
@@ -4067,7 +4320,7 @@ fn edge_code(mask: u16) -> c_int {
 }
 
 /// A bare identifier expression.
-fn ident_expr(name: &str) -> Expression {
+pub(super) fn ident_expr(name: &str) -> Expression {
     Expression::new(
         ExprKind::Ident(HierarchicalIdentifier {
             root: None,
@@ -4079,8 +4332,9 @@ fn ident_expr(name: &str) -> Expression {
                 selects: Vec::new(),
             }],
             span: Span::dummy(),
-            cached_signal_id: Cell::new(None),
-            cached_resolved_name: std::cell::OnceCell::new(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
         }),
         Span::dummy(),
     )
@@ -4328,7 +4582,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 });
                 e.cached_width.set(None);
                 return;
@@ -4381,7 +4635,7 @@ fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
                 return;
             }
             h.cached_signal_id.set(None);
-            h.cached_resolved_name = std::cell::OnceCell::new();
+            h.cached_resolved_name = crate::ast::cache::NameCache::new();
         }
         ExprKind::Unary { operand, .. } => flatten_in_place(m, scope, operand),
         ExprKind::Binary { left, right, .. } => {
@@ -4485,6 +4739,35 @@ fn ident(m: &VpiModel, h: &VpiHandle) -> Option<MRef> {
         },
         _ => None,
     }
+}
+
+/// The assertion an object handle stands for (Clause 39), with its object
+/// index.
+pub(super) fn assert_ref(
+    sim: &mut Simulator,
+    h: &VpiHandle,
+) -> Option<(usize, vpi_assert::AssertRef)> {
+    if h.kind != VpiKind::Obj {
+        return None;
+    }
+    with_model(sim, |m, _| match ident(m, h) {
+        Some(MRef::Obj(o)) => match &m.objs[o as usize].d {
+            OData::Assertion(r) => Some((o as usize, r.clone())),
+            _ => None,
+        },
+        _ => None,
+    })
+    .flatten()
+}
+
+/// Definition name of the instance enclosing object `obj`.
+pub(super) fn obj_instance_def(sim: &mut Simulator, obj: usize) -> Option<String> {
+    with_model(sim, |m, _| {
+        let sc = m.objs.get(obj)?.scope;
+        let inst = m.instance_of(sc);
+        (inst != NONE).then(|| m.scopes[inst as usize].def_name.clone())
+    })
+    .flatten()
 }
 
 /// A bit or element handle (`w[3]`, `mem[1]`): its base object and index.
@@ -4826,6 +5109,32 @@ pub(super) fn handle(
                                 }
                                 let ts = m.typespec_obj(td);
                                 out(Some(plain_obj_handle(m, ts)))
+                            }
+                            // §38.11: the left and right range of an element
+                            // or sub-array are those of its own type, the
+                            // packed range of a vector element (`[31:0]` of
+                            // `logic [31:0] a [4]`) or the next unpacked
+                            // dimension of a sub-array. cocotb reads them for
+                            // every element it makes a handle for; a NULL here
+                            // made it read a value through a null handle.
+                            c::LEFT_RANGE | c::RIGHT_RANGE => {
+                                let Some(mut td) = obj_td(m, o) else {
+                                    return out(None);
+                                };
+                                for _ in 0..ix.len() {
+                                    if !td_is_array(m, td) {
+                                        // A bit has no range.
+                                        return out(None);
+                                    }
+                                    td = m.elem_td(td);
+                                }
+                                let w = (h.kind == VpiKind::Signal)
+                                    .then(|| sim.signal_widths.get(h.signal_id).copied())
+                                    .flatten();
+                                let r = range_ends(m, td, w);
+                                out(r.map(|(l, rr)| {
+                                    int_const(if rel == c::LEFT_RANGE { l } else { rr })
+                                }))
                             }
                             _ => None,
                         };
@@ -5256,6 +5565,20 @@ fn scope_iter(m: &mut VpiModel, sim: &mut Simulator, rel: c_int, s: u32) -> Opti
         | c::INITIAL
         | c::FINAL
         | c::MODPORT => objs_where(m, sim, &|_, ob| ob.type_code == rel),
+        // IEEE 1800-2017 Clause 39.3: the assertions of a scope, with the
+        // property instances and declarations; or its concurrent assertions;
+        // or the objects of one assertion type.
+        c::ASSERTION => objs_where(m, sim, &|_, ob| matches!(ob.d, OData::Assertion(_))),
+        c::CONCURRENT_ASSERTION => objs_where(
+            m,
+            sim,
+            &|_, ob| matches!(&ob.d, OData::Assertion(r) if r.role == vpi_assert::AssertRole::Directive),
+        ),
+        c::ASSERT | c::ASSUME | c::COVER | c::PROPERTY_DECL | c::PROPERTY_INST => {
+            objs_where(m, sim, &|_, ob| {
+                ob.type_code == rel && matches!(ob.d, OData::Assertion(_))
+            })
+        }
         // A specific variable or net type (vpiReg, vpiIntVar, vpiNetArray,
         // vpiRegArray/vpiArrayVar, vpiStructVar, ...).
         _ if type_name(rel).is_some() => objs_where(m, sim, &|_, ob| {
@@ -5664,7 +5987,7 @@ fn op_type(e: &Expression) -> c_int {
         ExprKind::Concatenation(_) => 33,
         ExprKind::Replication { .. } => 34,
         ExprKind::Inside { .. } => 95,
-        ExprKind::AssignmentPattern(_) => 75,
+        ExprKind::AssignmentPattern(_) | ExprKind::TypedPattern { .. } => 75,
         ExprKind::StreamOp { left_to_right, .. } => {
             if *left_to_right {
                 71
@@ -5845,6 +6168,13 @@ fn obj_get(
         c::LINE_NO => line,
         c::PROTECTED | c::IS_PROTECTED => 0,
         _ => match &m.objs[o as usize].d {
+            // Assertion coverage (IEEE 1800-2017 Clause 40).
+            OData::Assertion(r) => match prop {
+                vpi_assert::ATTEMPT_COVERED
+                | vpi_assert::SUCCESS_COVERED
+                | vpi_assert::FAILURE_COVERED => sim.vpi_assert_covered(r, prop),
+                _ => c::UNDEFINED,
+            },
             OData::Var(v) => {
                 let t = m.tdescs[v.td as usize].clone();
                 let array = !t.unpacked.is_empty();

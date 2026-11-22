@@ -33,6 +33,7 @@ impl Simulator {
             current_static_task: self.current_static_task.clone(),
             current_auto_task: self.current_auto_task.clone(),
             task_string_formals: self.task_string_formals.clone(),
+            local_meta_claims: self.local_meta_claims.clone(),
         }
     }
 
@@ -94,10 +95,14 @@ impl Simulator {
             && self.current_static_task.is_none()
             && self.current_auto_task.is_none()
             && self.task_string_formals.is_empty()
+            && self.local_meta_claims.is_empty()
             && !self.ref_redirect_hot
     }
 
     pub(super) fn take_process_context(&mut self) -> ProcessContext {
+        // §13.5.2: the aliased leaves of a `ref` struct formal reach their
+        // actuals before another process runs.
+        self.ref_frame_flush();
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
         self.ref_redirect_hot = false;
@@ -128,6 +133,7 @@ impl Simulator {
             current_static_task: self.current_static_task.take(),
             current_auto_task: self.current_auto_task.take(),
             task_string_formals: std::mem::take(&mut self.task_string_formals),
+            local_meta_claims: std::mem::take(&mut self.local_meta_claims),
         }
     }
 
@@ -159,6 +165,14 @@ impl Simulator {
         self.current_static_task = ctx.current_static_task;
         self.current_auto_task = ctx.current_auto_task;
         self.task_string_formals = ctx.task_string_formals;
+        self.local_meta_claims = ctx.local_meta_claims;
+        if !self.local_meta_cache.is_empty() && !self.local_meta_claims.is_empty() {
+            self.reapply_local_meta();
+        }
+        if !self.task_cleanup.is_empty() {
+            self.reinstall_struct_formal_meta();
+        }
+        self.ref_frame_refresh();
     }
 
     /// Capture the current process context, including the current
@@ -177,6 +191,9 @@ impl Simulator {
         // §24.3: a fork child of a program process is a program process.
         if !self.program_pids.is_empty() && self.program_pids.contains(&parent) {
             self.program_pids.insert(child);
+            if let Some(scope) = self.program_pid_scope.get(&parent).cloned() {
+                self.program_pid_scope.insert(child, scope);
+            }
         }
         if let Some(l) = self.process_m_label.get(&parent) {
             let l = l.clone();
@@ -214,8 +231,8 @@ impl Simulator {
                 k += last.selects.len();
                 let mut hb = h.clone();
                 hb.path.last_mut()?.selects.clear();
-                hb.cached_signal_id = std::cell::Cell::new(None);
-                hb.cached_resolved_name = std::cell::OnceCell::new();
+                hb.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                hb.cached_resolved_name = crate::ast::cache::NameCache::new();
                 return Some((Expression::new(ExprKind::Ident(hb), cur.span), k));
             }
         }
@@ -374,7 +391,7 @@ impl Simulator {
                 signed: false,
                 base: NumberBase::Decimal,
                 value: id.to_string(),
-                cached_val: Cell::new(Some((id, 0u64, 64u32))),
+                cached_val: crate::ast::cache::LiteralCache::new(Some((id, 0u64, 64u32))),
             }),
             span,
         );
@@ -598,6 +615,7 @@ impl Simulator {
                 // the slot (see the main loop's release).
                 if self.t0_starts_remaining > 0 {
                     self.t0_starts_remaining = 0;
+                    self.release_time0_held();
                     self.drain_deferred_proc_settle();
                     continue;
                 }
@@ -670,6 +688,7 @@ impl Simulator {
             // and run BEFORE this slot's NBA region — loop again at the same
             // time without applying NBAs yet. Settle first so they observe
             // completed active-region (cont-assign) state.
+            self.drain_active_driver_updates();
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 if self.dirty_any {
@@ -912,6 +931,8 @@ impl Simulator {
             match &entry.item {
                 CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    // §13.4: see `enter_private_regs`.
+                    let caller_regs = (!self.settling).then(|| self.enter_private_regs());
                     if self.vm_regs.len() < compiled.num_regs as usize {
                         self.vm_regs
                             .resize(compiled.num_regs as usize, Value::zero(1));
@@ -923,12 +944,11 @@ impl Simulator {
                         )
                     };
                     let saved_ts = self.timescale_scope_override.take();
-                    self.timescale_scope_override = entry.cold.scope_hint.clone();
+                    self.timescale_scope_override =
+                        Some(entry.cold.scope_hint.clone().unwrap_or_default());
                     let saved_hint = if compiled.has_fallback {
                         let prev = self.name_resolve_hint.borrow().clone();
-                        if let Some(sc) = entry.cold.scope_hint.as_ref() {
-                            *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
-                        }
+                        *self.name_resolve_hint.borrow_mut() = entry.cold.scope_hint.clone();
                         Some(prev)
                     } else {
                         None
@@ -938,6 +958,9 @@ impl Simulator {
                         *self.name_resolve_hint.borrow_mut() = prev;
                     }
                     self.timescale_scope_override = saved_ts;
+                    if let Some(caller_regs) = caller_regs {
+                        self.leave_private_regs(caller_regs);
+                    }
                 }
                 _ => {}
             }
@@ -1184,7 +1207,6 @@ impl Simulator {
         let mut saved = self.take_process_context();
         let ctx = self.process_contexts.remove(&pid).unwrap_or_default();
         let sibling_baseline = self.fork_baselines.get(&pid).cloned();
-        let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
         let fork_parent = self.process_parents.get(&pid).copied();
         self.restore_process_context(ctx);
         self.run_process_payload(pid, stmts);
@@ -1211,7 +1233,14 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid).map(Arc::as_ref);
+        // §6.21, §9.3.2: a variable a block of the child declared is the
+        // child's own, even when it has the name of a variable in a frame
+        // the child shares with its parent (the block's declaration hides
+        // it): its writes reach neither the parent nor the siblings, and the
+        // value its block's exit puts back is no write either (#943).
+        let child_private =
+            |g: u64, k: &str| Self::block_declares(&child_ctx.block_scope_saves, g, k);
+        let baseline = sibling_baseline.as_deref();
         let signal_caps = self.fork_signal_captures.get(&pid);
         // Parent-frame keys the child's writes reached, for the wake below.
         let mut written: Vec<String> = Vec::new();
@@ -1225,6 +1254,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 } else {
                     // Parent is the active process — its context is `saved`.
@@ -1234,6 +1264,7 @@ impl Simulator {
                         child_frames,
                         child_frames_gen,
                         baseline,
+                        &child_private,
                     )
                 };
             }
@@ -1242,31 +1273,89 @@ impl Simulator {
         // `self.signals`. Write only keys the child CHANGED (relative to the
         // fork-time baseline) so an inherited-unchanged value doesn't
         // clobber a sibling's or the parent's concurrent write.
+        let mut stored: Vec<(String, Value)> = Vec::new();
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
+            let top_gen = child_frames_gen.last().copied().unwrap_or(0);
             for nm in caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
+                if child_private(top_gen, nm) {
+                    continue;
+                }
                 let inherited_unchanged = baseline
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
                 if !inherited_unchanged {
                     self.signals.insert(nm.clone(), v.clone());
+                    stored.push((nm.clone(), v.clone()));
+                }
+            }
+        }
+        // The other children of a fork share these block-locals too, but each
+        // holds a copy in its own capture frame, under its own activation, so
+        // the frame broadcast below never reaches them: hand them the value
+        // and make it their baseline, so a later write of the fork-time value
+        // by one of them is still a write.
+        if !stored.is_empty() {
+            let others: Vec<usize> = self
+                .fork_signal_captures
+                .iter()
+                .filter(|(p, caps)| **p != pid && stored.iter().any(|(n, _)| caps.contains(n)))
+                .map(|(p, _)| *p)
+                .collect();
+            for other_pid in others {
+                let Some(other) = self.process_contexts.get_mut(&other_pid) else {
+                    continue;
+                };
+                let top_gen = other.local_gen_stack.last().copied().unwrap_or(0);
+                let Some(top) = other.local_stack.last_mut() else {
+                    continue;
+                };
+                for (n, v) in &stored {
+                    if Self::block_declares(&other.block_scope_saves, top_gen, n) {
+                        continue;
+                    }
+                    if let Some(slot) = top.get_mut(n) {
+                        *slot = v.clone();
+                    }
+                }
+                if let Some(base) = self.fork_baselines.get_mut(&other_pid) {
+                    Self::sync_fork_baseline(
+                        base,
+                        &other.local_stack,
+                        &other.local_gen_stack,
+                        &other.block_scope_saves,
+                    );
                 }
             }
         }
         // Match both task activation and lexical block activation. Repeated
         // loop-block declarations share a flattened frame but not storage.
         if let Some(sibling_baseline) = &sibling_baseline {
-            Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
-            let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
-                .map(|(i, frame)| frame.iter().filter(|(k, v)| {
-                    sibling_baseline.get(i).and_then(|base| base.get(*k))
-                        .is_some_and(|old| old != *v)
-                }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
-            if changes.iter().any(|frame| !frame.is_empty()) {
+            let has_changes = child_frames.iter().enumerate().any(|(i, frame)| {
+                frame.iter().any(|(k, v)| {
+                    sibling_baseline.get(i).and_then(|base| base.get(k))
+                        .is_some_and(|old| old != v)
+                })
+            });
+            if has_changes {
+                let mut sibling_scopes = self.fork_local_scopes.get(&pid).cloned().unwrap_or_default();
+                Self::overlay_fork_local_scopes(&mut sibling_scopes, &child_ctx.block_scope_saves);
+                let changes: Vec<HashMap<String, Value>> = child_frames.iter().enumerate()
+                    .map(|(i, frame)| frame.iter().filter(|(k, v)| {
+                        sibling_baseline.get(i).and_then(|base| base.get(*k))
+                            .is_some_and(|old| old != *v)
+                    }).map(|(k, v)| (k.clone(), v.clone())).collect()).collect();
+                // The child's own block variables are no sibling's (#943).
+                let mut changes = changes;
+                if !child_ctx.block_scope_saves.is_empty() {
+                    for (frame, g) in changes.iter_mut().zip(child_frames_gen) {
+                        frame.retain(|k, _| !child_private(*g, k));
+                    }
+                }
                 // Only a fork child holding one of the changed frames' own
                 // activations can receive a write (`merge_fork_writes`
                 // matches frames by generation), so visit just those, not
@@ -1282,6 +1371,12 @@ impl Simulator {
                     .collect();
                 candidates.sort_unstable();
                 candidates.dedup();
+                let has_any_block_saves = !child_ctx.block_scope_saves.is_empty()
+                    || !sibling_scopes.is_empty()
+                    || candidates.iter().any(|p| {
+                        self.fork_local_scopes.get(p).is_some_and(|s| !s.is_empty())
+                            || self.process_contexts.get(p).is_some_and(|c| !c.block_scope_saves.is_empty())
+                    });
                 for other_pid in candidates {
                     let Some(other) = self.process_contexts.get_mut(&other_pid) else {
                         continue;
@@ -1290,23 +1385,103 @@ impl Simulator {
                         continue;
                     }
                     let other_pid = &other_pid;
-                    let mut other_scopes = self.fork_local_scopes.get(other_pid).cloned().unwrap_or_default();
-                    Self::overlay_fork_local_scopes(&mut other_scopes, &other.block_scope_saves);
-                    let mut visible = changes.clone();
-                    for (i, frame) in visible.iter_mut().enumerate() {
-                        let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
-                        frame.retain(|key, _| {
-                            sibling_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                                == other_scopes.get(&frame_generation).and_then(|m| m.get(key))
-                        });
-                    }
+                    let visible_storage;
+                    let visible: &[HashMap<String, Value>] = if !has_any_block_saves {
+                        &changes
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let has_other_blocks = !other.block_scope_saves.is_empty();
+                        let (other_scopes_storage, other_scopes_ref) = if has_other_blocks {
+                            let mut sc = base_scopes.cloned().unwrap_or_default();
+                            Self::overlay_fork_local_scopes(&mut sc, &other.block_scope_saves);
+                            (Some(sc), None)
+                        } else {
+                            (None, base_scopes)
+                        };
+                        let lookup_other = |f_gen: &u64, key: &str| -> Option<u64> {
+                            if let Some(sc) = &other_scopes_storage {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else if let Some(sc) = other_scopes_ref {
+                                sc.get(f_gen).and_then(|m| m.get(key)).copied()
+                            } else {
+                                None
+                            }
+                        };
+                        let mut filtered = changes.clone();
+                        for (i, frame) in filtered.iter_mut().enumerate() {
+                            let frame_generation = child_frames_gen.get(i).copied().unwrap_or(0);
+                            frame.retain(|key, _| {
+                                sibling_scopes.get(&frame_generation).and_then(|m| m.get(key)).copied()
+                                    == lookup_other(&frame_generation, key)
+                            });
+                        }
+                        visible_storage = filtered;
+                        &visible_storage
+                    };
                     let updates = Self::merge_fork_writes(
-                        &mut other.local_stack, &other.local_gen_stack,
-                        &visible, child_frames_gen, None,
+                        &mut other.local_stack,
+                        &other.local_gen_stack,
+                        visible,
+                        child_frames_gen,
+                        None,
+                        &|g, k| Self::block_declares(&other.block_scope_saves, g, k),
                     );
+                    // §6.21: where a block of the sibling hides the variable,
+                    // the value is for the hidden one, which the block's exit
+                    // puts back.
+                    // A write of a variable the sibling shares at the fork
+                    // (the writer's and the sibling's fork-time scopes agree).
+                    let hidden = if other.block_scope_saves.is_empty() {
+                        Vec::new()
+                    } else {
+                        let base_scopes = self.fork_local_scopes.get(other_pid);
+                        let shared = |g: u64, k: &str| {
+                            sibling_scopes.get(&g).and_then(|m| m.get(k))
+                                == base_scopes.and_then(|sc| sc.get(&g)).and_then(|m| m.get(k))
+                        };
+                        Self::deliver_to_hidden(
+                            &mut other.block_scope_saves,
+                            &other.local_gen_stack,
+                            &changes,
+                            child_frames_gen,
+                            &shared,
+                        )
+                    };
+                    // The sibling now holds these values: a later write of
+                    // the value it held at the fork is a write too.
+                    if let Some(base) = self.fork_baselines.get_mut(other_pid) {
+                        Self::sync_fork_baseline(
+                            base,
+                            &other.local_stack,
+                            &other.local_gen_stack,
+                            &other.block_scope_saves,
+                        );
+                        if !hidden.is_empty() {
+                            let frames = Arc::make_mut(base);
+                            for (i, k, v) in hidden {
+                                if let Some(b) = frames.get_mut(i).and_then(|f| f.get_mut(&k)) {
+                                    *b = v;
+                                }
+                            }
+                        }
+                    }
                     written.extend(updates);
                 }
             }
+        }
+        // §9.3.2: this child's writes are published (to the parent and its
+        // siblings), so they become its baseline. A later write is then
+        // compared with what the child last published, not with the value at
+        // the fork: `x = 0; #10; x = 5;` with 5 the fork-time value used to
+        // read as "unchanged" and be dropped, the parent keeping 0.
+        drop(sibling_baseline);
+        if let Some(base) = self.fork_baselines.get_mut(&pid) {
+            Self::sync_fork_baseline(
+                base,
+                child_frames,
+                child_frames_gen,
+                &child_ctx.block_scope_saves,
+            );
         }
         if !written.is_empty() {
             // A child wrote a key a parked `wait` of the parent reads —
@@ -1358,6 +1533,22 @@ impl Simulator {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
             self.run_proc_fsm(pid);
+        } else if stmts.is_empty()
+            && !self.lazy_initial.is_empty()
+            && let Some(p) = self.lazy_initial.remove(&pid)
+        {
+            // An initial block queued by its pending form (see `compile`):
+            // its body is materialized for this instance now, with the
+            // block locals given storage of their own as an instance's
+            // always block gets (`materialize_pending_always`), and is
+            // dropped again when the process ends.
+            let mut ib = p.materialize();
+            Self::rename_instance_locals(&mut ib.stmt, &ib.scope);
+            let stmts = match ib.stmt.kind {
+                StatementKind::SeqBlock { stmts, .. } => stmts,
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
+            };
+            self.run_process_stmts(pid, &ProcCont::from_vec(stmts.into_vec()));
         } else {
             self.run_process_stmts(pid, stmts);
         }
@@ -1382,19 +1573,12 @@ impl Simulator {
     /// the register-value half of `delay_value_to_ticks`, without the
     /// pathological-real diagnostics (no source expression at hand).
     pub(super) fn fsm_delay_ticks(&self, v: &Value, precision_diff: i32) -> u64 {
-        let raw = if v.is_real {
-            let f = v.to_f64();
-            if f.is_finite() && f > 0.0 { f } else { 0.0 }
-        } else {
-            v.to_u64().unwrap_or(0) as f64
-        };
-        if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
-        } else {
-            raw.round() as u64
+        if !v.is_real {
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
         }
+        let f = v.to_f64();
+        let raw = if f.is_finite() && f > 0.0 { f } else { 0.0 };
+        Self::quantize_delay_ticks(raw, precision_diff)
     }
 
     /// Roadmap step 13 (XEZIM_AOT=1): compile every process FSM body that
@@ -1708,14 +1892,10 @@ impl Simulator {
         // queue, which the scheduler drains inside one delta, so the outer
         // loop's stall counter never sees `initial forever begin #0; ... end`
         // spin — the run_proc_fsm path hung the stall-report test.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
         let Some(mut f) = self.proc_fsm.remove(&pid) else {
             return;
@@ -1778,7 +1958,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                         f.pc = npc;
                         break;
@@ -1868,7 +2048,7 @@ impl Simulator {
                         } else {
                             let w =
                                 self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
-                            self.event_waiters.push(w);
+                            self.park_event_waiter(w);
                         }
                     }
                 }
@@ -1917,17 +2097,13 @@ impl Simulator {
         // Match run_process_stmts' per-process zero-delay protection. The
         // marker was removed from the timing wheel before dispatch, so park it
         // again before asking the outer loop to seek a future event.
-        if self.stall_limit > 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED, so it must not inflate the "ran N times"
-            // attribution in the stall report.
-            if *hits >= self.stall_limit {
-                self.event_queue.schedule(self.time, pid, Vec::new().into());
-                self.zero_delay_defer_pending = true;
-                return;
-            }
-            *hits += 1;
+        // Check BEFORE counting (inside `stall_pid_tripped`): the activation
+        // that trips the guard is re-parked UNEXECUTED, so it must not inflate
+        // the "ran N times" attribution in the stall report.
+        if self.stall_limit > 0 && self.stall_pid_tripped(pid, None) {
+            self.event_queue.schedule(self.time, pid, Vec::new().into());
+            self.zero_delay_defer_pending = true;
+            return;
         }
 
         // Temporarily own the entry so evaluation and assignment can mutably
@@ -2030,16 +2206,20 @@ impl Simulator {
     /// Returns the names of keys actually propagated (child value differs
     /// from both baseline and parent, so a real write landed). The caller
     /// uses this to promote parked condition waiters that read those names.
+    /// `baseline` is what the child last published or was given (see
+    /// `sync_fork_baseline`), so a write back to the fork-time value counts.
     pub(super) fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
+        private: &dyn Fn(u64, &str) -> bool,
     ) -> Vec<String> {
-        let mut written = Vec::new();
+        let mut propagated = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
+            let g = child_gens.get(i).copied().unwrap_or(0);
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
             if !same_activation {
                 // The parent slot `i` no longer belongs to the activation this
@@ -2061,7 +2241,7 @@ impl Simulator {
                         paired = false;
                         break;
                     }
-                    if v == bv {
+                    if v == bv || private(g, k) {
                         continue;
                     }
                     if let Some(slot) = parent_frames[i].get_mut(k) {
@@ -2069,7 +2249,7 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
                         }
                     }
                 }
@@ -2081,7 +2261,7 @@ impl Simulator {
                 let inherited_unchanged = base_frame
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
-                if inherited_unchanged {
+                if inherited_unchanged || private(g, k) {
                     continue;
                 }
                 match parent_frames[i].get_mut(k) {
@@ -2090,14 +2270,101 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
-                            written.push(k.clone());
+                            propagated.push(k.clone());
                         }
                     }
                     None => continue,
                 }
             }
         }
-        written
+        propagated
+    }
+
+    /// Move a fork child's baseline to the values its frames now hold, for
+    /// every key it inherited. Copied on write: the snapshot is shared until
+    /// a value actually differs. A key one of the child's open `blocks`
+    /// declared holds the block's own variable, not the inherited one, so
+    /// its baseline stays (see `block_declares`).
+    pub(super) fn sync_fork_baseline(
+        base: &mut Arc<Vec<HashMap<String, Value>>>,
+        frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        blocks: &[BlockScopeSave],
+    ) {
+        let moved = |i: usize, k: &str, bv: &Value, cf: &HashMap<String, Value>| {
+            cf.get(k).is_some_and(|v| v != bv)
+                && !Self::block_declares(blocks, gens.get(i).copied().unwrap_or(0), k)
+        };
+        let differs = |b: &[HashMap<String, Value>]| {
+            b.iter()
+                .zip(frames)
+                .enumerate()
+                .any(|(i, (bf, cf))| bf.iter().any(|(k, bv)| moved(i, k, bv, cf)))
+        };
+        if !differs(base) {
+            return;
+        }
+        for (i, (bf, cf)) in Arc::make_mut(base).iter_mut().zip(frames).enumerate() {
+            for (k, bv) in bf.iter_mut() {
+                if moved(i, k, bv, cf) {
+                    if let Some(v) = cf.get(k) {
+                        *bv = v.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Store a fork sibling's writes (`frames`, under activations `gens`)
+    /// of `shared` variables that the receiver's open `blocks` hide into the
+    /// hidden variables' saved values, the outermost hiding block's (§6.21).
+    /// Returns them by frame index, key and value.
+    fn deliver_to_hidden(
+        blocks: &mut [BlockScopeSave],
+        receiver_gens: &[u64],
+        frames: &[HashMap<String, Value>],
+        gens: &[u64],
+        shared: &dyn Fn(u64, &str) -> bool,
+    ) -> Vec<(usize, String, Value)> {
+        let mut out = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let Some(&g) = gens.get(i) else {
+                continue;
+            };
+            if receiver_gens.get(i) != Some(&g) {
+                continue;
+            }
+            for (k, v) in frame {
+                if !shared(g, k) {
+                    continue;
+                }
+                let slot = blocks
+                    .iter_mut()
+                    .filter(|b| b.frame_gen == g)
+                    .find_map(|b| b.shadowed.iter_mut().find(|(n, _)| n == k));
+                if let Some(slot) = slot {
+                    slot.1 = v.clone();
+                    out.push((i, k.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether one of the open `blocks` declared the variable of frame entry
+    /// `key` (its bare name, or a leaf `name.member` / `name[i]` of an
+    /// unpacked aggregate) into the frame of generation `g` (§6.21): the
+    /// entry is then the block's variable, hiding the enclosing one of the
+    /// same name.
+    pub(super) fn block_declares(blocks: &[BlockScopeSave], g: u64, key: &str) -> bool {
+        let names = |n: &String| {
+            key.strip_prefix(n.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+        };
+        !blocks.is_empty()
+            && blocks
+                .iter()
+                .any(|b| b.frame_gen == g && b.declared_names.iter().any(names))
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -2157,7 +2424,7 @@ impl Simulator {
             }
             if f.is_finite() && f > 0.0 { f } else { 0.0 }
         } else {
-            v.to_u64().unwrap_or(0) as f64
+            return Self::quantize_integral_delay_ticks(v.to_u64().unwrap_or(0), precision_diff);
         };
         // §3.14.3: a delay rounds to the CURRENT MODULE's time precision, not
         // the (finer) global tick — `#1.55` in a 1ns/100ps module is 1.6ns,
@@ -2165,14 +2432,45 @@ impl Simulator {
         // elaborator pre-scales by the module unit), so quantize to the
         // module-precision-per-tick grid. The grid ratio comes from EXPONENT
         // arithmetic (10^n is exact in f64 for small n; dividing seconds
-        // values is not), and a 1-ulp relative nudge keeps a half-grid delay
+        // values is not), and `round_time_units` keeps a half-grid delay
         // that arrived as x.49999999999996 from rounding the wrong way.
+        Self::quantize_delay_ticks(raw, precision_diff)
+    }
+
+    /// §3.14.1: `raw` global ticks rounded to the running scope's precision,
+    /// 10^`precision_diff` ticks. A count of 2^52 or more is a whole number
+    /// already: the relative nudge used before, `x * (1 + 1e-12)`, moved
+    /// `#9200s` under a 1 ps precision with a 1 fs tick by 9.2 ns.
+    #[inline]
+    pub(super) fn quantize_delay_ticks(raw: f64, precision_diff: i32) -> u64 {
+        use super::elaborate::{round_time_units, scale_pow10};
         if precision_diff > 0 {
-            let q = 10f64.powi(precision_diff);
-            let x = (raw / q) * (1.0 + 1e-12);
-            (x.round() * q).round() as u64
+            scale_pow10(
+                round_time_units(scale_pow10(raw, -precision_diff)),
+                precision_diff,
+            ) as u64
         } else {
             raw.round() as u64
+        }
+    }
+
+    /// §3.14.1, §9.4.1: an integral tick count rounded to the running scope's
+    /// precision, 10^`precision_diff` ticks, ties away from zero, in integer
+    /// arithmetic. Converting the count to binary64 first lost its low bits
+    /// above 2^53 ticks (`#(64'd9007199254740993)` under 1 fs woke at
+    /// ...992).
+    #[inline]
+    pub(super) fn quantize_integral_delay_ticks(raw: u64, precision_diff: i32) -> u64 {
+        if precision_diff <= 0 {
+            return raw;
+        }
+        match 10u64.checked_pow(precision_diff as u32) {
+            Some(grid) => {
+                let rem = raw % grid;
+                (raw / grid + u64::from(rem >= grid - rem)).saturating_mul(grid)
+            }
+            // Half a grid step is more than any count: every count rounds to 0.
+            None => 0,
         }
     }
 
@@ -2211,6 +2509,442 @@ impl Simulator {
         }
     }
 
+    /// Freeze a selected RHS before trying the array and scalar capture paths.
+    /// Each path then sees the same label even when its selector calls a function.
+    pub(super) fn freeze_array_rhs_selectors(&mut self, rhs: &Expression) -> Option<Expression> {
+        let rhs = Self::unparen(rhs);
+        if (self.module.arrays_2d.is_empty() && self.module.arrays_nd.is_empty())
+            || !matches!(rhs.kind, ExprKind::Index { .. })
+            || Self::cond_expr_is_effect_free(rhs, false)
+        {
+            return None;
+        }
+        // Freeze just select chains on a name. Expressions that produce an
+        // array by calling a function keep their own call-result handling.
+        let mut base = rhs;
+        let mut selects = 0;
+        while let ExprKind::Index { expr, .. } = &base.kind {
+            selects += 1;
+            base = expr;
+        }
+        let ExprKind::Ident(h) = &base.kind else { return None };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.array_operand_name(base).unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+        let rank = if self.module.arrays_2d.contains_key(&name) {
+            2
+        } else {
+            self.module.arrays_nd.get(&name)?.0.len()
+        };
+        (rank > selects).then(|| self.freeze_conditional_path(rhs, true))
+    }
+
+    /// §10.10: capture a one-dimensional unpacked array in element order.
+    pub(super) fn capture_array_rhs(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+    ) -> Option<Vec<Value>> {
+        let dst = self.array_operand_name(lhs)?;
+        if self.is_associative_array(&dst)
+            || self.module.arrays_2d.contains_key(&dst)
+            || self.module.arrays_nd.contains_key(&dst)
+            || self.queue_elem_struct(&dst).is_some()
+        {
+            return None;
+        }
+        let mut rhs = rhs;
+        while let ExprKind::Paren(inner) = &rhs.kind {
+            rhs = inner;
+        }
+        // Existing slice capture retains indexed direction and declared bounds.
+        if matches!(rhs.kind, ExprKind::RangeSelect { .. }) {
+            return None;
+        }
+        let mut items = Vec::new();
+        fn flatten<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+            match &e.kind {
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        flatten(x, out);
+                    }
+                }
+                ExprKind::Paren(x) => flatten(x, out),
+                _ => out.push(e),
+            }
+        }
+        if let ExprKind::AssignmentPattern(xs) = &rhs.kind {
+            // Positional patterns include already captured intra-assignment
+            // operands. Keyed/default patterns retain their existing path.
+            if !xs
+                .iter()
+                .all(|x| matches!(x, AssignmentPatternItem::Ordered(_)))
+            {
+                return None;
+            }
+            // §11.6.1: each item in the element type, as without the delay.
+            let shape = self.intra_element_shape(&dst);
+            let mut values = Vec::new();
+            for x in xs {
+                match &x.expr().kind {
+                    // §10.9.1 `'{n{a, b}}`: the items, read once, repeated
+                    // n times.
+                    ExprKind::Replication { count, exprs } => {
+                        let n = self.eval_expr(count).to_u64().unwrap_or(0) as usize;
+                        let once: Vec<Value> = exprs
+                            .iter()
+                            .map(|e| self.intra_item_value(shape.as_ref(), e))
+                            .collect();
+                        for _ in 0..n {
+                            values.extend(once.iter().cloned());
+                        }
+                    }
+                    _ => values.push(self.intra_item_value(shape.as_ref(), x.expr())),
+                }
+            }
+            return Some(values);
+        }
+        if !matches!(
+            rhs.kind,
+            ExprKind::Concatenation(_) | ExprKind::Call { .. }
+        ) && self.array_operand_name(rhs).is_none()
+        {
+            return None;
+        }
+        flatten(rhs, &mut items);
+        let expand_rows = self.concat_has_non_array_elements(&dst);
+        Some(self.unpacked_concat_operand_values(items, expand_rows, None))
+    }
+
+    pub(super) fn saved_array_pattern(
+        &mut self,
+        values: Vec<Value>,
+        span: crate::ast::Span,
+    ) -> Expression {
+        let items = values
+            .into_iter()
+            .map(|v| AssignmentPatternItem::Ordered(self.make_intra_saved_expr(v, span)))
+            .collect();
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
+    /// §9.4.5: capture the right-hand side of an intra-assignment timing
+    /// control when the statement runs, against its target as an
+    /// assignment without the timing control would evaluate it: at the
+    /// target's width (§11.6.1), and a pattern shaped by a packed target
+    /// (§10.9). A pattern for any other target takes its shape from the
+    /// target only when it is stored, so each item's value is captured
+    /// instead, keys and nesting kept, and the delayed store runs the
+    /// pattern of captured values. Returns that right-hand side and the
+    /// statement that frees the captured items after the store, if any.
+    pub(super) fn capture_intra_rhs(
+        &mut self,
+        lvalue: &Expression,
+        rhs: &Expression,
+        span: crate::ast::Span,
+    ) -> (Expression, Option<Statement>) {
+        let frozen = self.freeze_array_rhs_selectors(rhs);
+        let rhs = frozen.as_ref().unwrap_or(rhs);
+        let mut inner = rhs;
+        while let ExprKind::Paren(e) = &inner.kind {
+            inner = e;
+        }
+        // §11.4.11: a conditional of unpacked aggregates (`c ? '{1, 2} :
+        // '{3, 4}`) selects its operand now, and that operand is captured.
+        // An operand read through a call, or both operands merged under an
+        // unknown condition, are already a snapshot taken now.
+        if matches!(inner.kind, ExprKind::Conditional { .. })
+            && let Some(selected) = self.selected_aggregate_rhs(Some(lvalue), inner)
+        {
+            if matches!(&selected.kind, ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].name.name.starts_with("__xz_cond_aggregate_"))
+            {
+                return (selected, None);
+            }
+            return self.capture_intra_rhs(lvalue, &selected, span);
+        }
+        if let Some(values) = self.capture_array_rhs(lvalue, inner) {
+            return (self.saved_array_pattern(values, span), None);
+        }
+        // §9.4.5, §7.6: any other unpacked array (a whole multidimensional
+        // array, a subarray or slice of one, an array of unpacked structs, a
+        // class property's row) is read element by element now. It was
+        // captured as one scalar, so the delayed store wrote zeros.
+        if let Some(snapshot) = self.unpacked_array_snapshot(inner, span) {
+            return snapshot;
+        }
+        if matches!(inner.kind, ExprKind::AssignmentPattern(_)) {
+            // A packed target shapes the pattern now; its value is the one
+            // evaluation of the items (a second would repeat their calls).
+            if let Some(v) = self.eval_pattern_for_lvalue(lvalue, inner) {
+                return (self.make_intra_saved_expr(v, span), None);
+            }
+            let mut slots = Vec::new();
+            let shape = self.intra_target_shape(lvalue);
+            let captured = self.capture_intra_pattern(inner, &mut slots, shape.as_ref());
+            return (captured, Some(Self::intra_release_stmt(&slots, span)));
+        }
+        let val = self.eval_target_rhs(lvalue, rhs);
+        (self.make_intra_saved_expr(val, span), None)
+    }
+
+    /// The statement that frees the captured pattern items `slots` once the
+    /// store that reads them has run.
+    fn intra_release_stmt(slots: &[u64], span: crate::ast::Span) -> Statement {
+        let args = slots
+            .iter()
+            .map(|&idx| Self::intra_slot_literal(idx, span))
+            .collect();
+        Statement::new(
+            StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: INTRA_RELEASE_MARKER.to_string(),
+                    args,
+                },
+                span,
+            )),
+            span,
+        )
+    }
+
+    /// §7.6, §9.4.5: the unpacked array `e` (see `unpacked_array_leaves`)
+    /// read now, as an assignment pattern of the captured elements nested
+    /// like the array, with the statement that frees them after the store.
+    /// None, with nothing read, when `e` names no such array.
+    pub(super) fn unpacked_array_snapshot(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> Option<(Expression, Option<Statement>)> {
+        let e = Self::unparen(e);
+        if !matches!(
+            e.kind,
+            ExprKind::Ident(_)
+                | ExprKind::Index { .. }
+                | ExprKind::RangeSelect { .. }
+                | ExprKind::MemberAccess { .. }
+        ) {
+            return None;
+        }
+        let leaves = self.unpacked_array_leaves(e)?;
+        let rows = Self::leaf_rows(leaves);
+        let mut slots = Vec::new();
+        let captured = self.kept_element_pattern(rows, span, &mut slots);
+        Some((captured, Some(Self::intra_release_stmt(&slots, span))))
+    }
+
+    /// Leaf paths (`[1][0]`, `[1].a`) split into one step per dimension or
+    /// member, in declared order, so `kept_element_pattern` nests them.
+    fn leaf_rows(leaves: Vec<(String, Value)>) -> Vec<(Vec<String>, Value)> {
+        leaves
+            .into_iter()
+            .map(|(suffix, v)| {
+                let path = suffix
+                    .split(['[', '.'])
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.trim_end_matches(']').to_string())
+                    .collect();
+                (path, v)
+            })
+            .collect()
+    }
+
+    /// The pattern `e` with each item's value captured (`capture_intra_rhs`),
+    /// each in the type of the element `shape` matches it to, if known.
+    fn capture_intra_pattern(
+        &mut self,
+        e: &Expression,
+        slots: &mut Vec<u64>,
+        shape: Option<&super::intra_pattern_shape::ItemShape>,
+    ) -> Expression {
+        use crate::ast::expr::AssignmentPatternItem as Item;
+        match &e.kind {
+            ExprKind::Paren(inner) => self.capture_intra_pattern(inner, slots, shape),
+            ExprKind::AssignmentPattern(items) => {
+                if let Some(super::intra_pattern_shape::ItemShape::Struct(su)) = shape {
+                    let members = su.members.iter().map(|m| m.declarators.len()).sum();
+                    if let Some(expanded) = self.struct_replication_items(su, items, members) {
+                        // §10.9.2: each replicated member takes its own type.
+                        // Capturing the repeated expression in only the first
+                        // member's type loses wider bits and four-state values.
+                        let expanded = expanded
+                            .into_iter()
+                            .map(|e| Item::Ordered(e.clone()))
+                            .collect();
+                        let pattern = Expression::new(ExprKind::AssignmentPattern(expanded), e.span);
+                        return self.capture_intra_pattern(&pattern, slots, shape);
+                    }
+                }
+                let shapes = match shape {
+                    Some(s) => self.intra_item_shapes(s, items),
+                    None => Vec::new(),
+                };
+                let mut out = Vec::with_capacity(items.len());
+                for (k, item) in items.iter().enumerate() {
+                    let sh = shapes.get(k).and_then(Option::as_ref);
+                    out.push(match item {
+                        Item::Ordered(x) => Item::Ordered(self.capture_intra_pattern(x, slots, sh)),
+                        Item::Named(n, x) => {
+                            Item::Named(n.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                        Item::Typed(t, x) => {
+                            Item::Typed(t.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                        Item::Default(x) => Item::Default(self.capture_intra_pattern(x, slots, sh)),
+                        Item::Keyed(k, x) => {
+                            Item::Keyed(k.clone(), self.capture_intra_pattern(x, slots, sh))
+                        }
+                    });
+                }
+                Expression::new(ExprKind::AssignmentPattern(out), e.span)
+            }
+            // `'{n{a, b}}`: the count stays, the items are captured, each
+            // matched to an element as the replication is.
+            ExprKind::Replication { count, exprs } => {
+                let mut out = Vec::with_capacity(exprs.len());
+                for x in exprs {
+                    out.push(self.capture_intra_pattern(x, slots, shape));
+                }
+                Expression::new(
+                    ExprKind::Replication {
+                        count: count.clone(),
+                        exprs: out,
+                    },
+                    e.span,
+                )
+            }
+            _ => {
+                // §10.9.1: an array matched to a sub-array (`'{wc, wc}`)
+                // supplies its elements, read now.
+                // A target whose shape is not known here (a class property,
+                // a member path) takes an array item the same way: an
+                // unpacked array is only ever matched to a sub-array.
+                if !matches!(
+                    shape,
+                    Some(
+                        super::intra_pattern_shape::ItemShape::Leaf(_)
+                            | super::intra_pattern_shape::ItemShape::Struct(_)
+                    )
+                ) && let Some(elems) = self.array_item_elements(e)
+                {
+                    // `[1][0]` or, for an element that is an unpacked
+                    // struct, `[1].a`: one path step per dimension or member,
+                    // in declared order, so the steps nest positionally.
+                    let rows = Self::leaf_rows(elems);
+                    return self.kept_element_pattern(rows, e.span, slots);
+                }
+                // §7.2, §10.9.2: a whole unpacked struct matched to a struct
+                // element (`'{sa[1], sa[0]}`) has no value of its own, only
+                // member leaves: each is read now, nested like the members.
+                // Captured as one value, it filled every member with it. A
+                // class property's target has no known shape; an element of
+                // its struct array (`'{ks[1], ks[0]}`) is recognized by itself.
+                let elem_su = match shape {
+                    Some(super::intra_pattern_shape::ItemShape::Struct(su)) => Some(su.clone()),
+                    None if matches!(e.kind, ExprKind::Index { .. }) => self.struct_elem_type(e),
+                    _ => None,
+                };
+                if let Some(su) = elem_su
+                    && matches!(
+                        e.kind,
+                        ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
+                    )
+                    && Self::cond_expr_is_effect_free(e, false)
+                    && !su.members.iter().any(|m| {
+                        m.declarators.iter().any(|d| {
+                            d.dimensions.iter().any(|dim| {
+                                !matches!(
+                                    dim,
+                                    crate::ast::types::UnpackedDimension::Range { .. }
+                                        | crate::ast::types::UnpackedDimension::Expression { .. }
+                                )
+                            })
+                        })
+                    })
+                {
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaves("", e, &su, 0, &mut leaves);
+                    if !leaves.is_empty() {
+                        let values = leaves
+                            .into_iter()
+                            .map(|(key, leaf, _, _)| (key, self.eval_expr(&leaf)))
+                            .collect();
+                        return self.kept_element_pattern(Self::leaf_rows(values), e.span, slots);
+                    }
+                }
+                let val = self.intra_item_value(shape, e);
+                self.kept_item(val, e.span, slots)
+            }
+        }
+    }
+
+    /// A captured value as an item of the pattern the delayed store runs.
+    fn kept_item(
+        &mut self,
+        val: Value,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.intra_saved.insert(idx, val);
+        slots.push(idx);
+        Expression::new(
+            ExprKind::SystemCall {
+                name: INTRA_KEPT_MARKER.to_string(),
+                args: vec![Self::intra_slot_literal(idx, span)],
+            },
+            span,
+        )
+    }
+
+    /// Captured array elements, each with its index path, as a pattern
+    /// nested by dimension in declared order.
+    fn kept_element_pattern(
+        &mut self,
+        rows: Vec<(Vec<String>, Value)>,
+        span: crate::ast::Span,
+        slots: &mut Vec<u64>,
+    ) -> Expression {
+        let mut items = Vec::new();
+        let mut rows = rows.into_iter().peekable();
+        while let Some((mut path, v)) = rows.next() {
+            if path.len() <= 1 {
+                items.push(AssignmentPatternItem::Ordered(
+                    self.kept_item(v, span, slots),
+                ));
+                continue;
+            }
+            let head = path.remove(0);
+            let mut group = vec![(path, v)];
+            while rows.peek().is_some_and(|(p, _)| p.first() == Some(&head)) {
+                let Some((mut p, v)) = rows.next() else {
+                    break;
+                };
+                p.remove(0);
+                group.push((p, v));
+            }
+            items.push(AssignmentPatternItem::Ordered(
+                self.kept_element_pattern(group, span, slots),
+            ));
+        }
+        Expression::new(ExprKind::AssignmentPattern(items), span)
+    }
+
+    pub(super) fn intra_slot_literal(idx: u64, span: crate::ast::Span) -> Expression {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: false,
+                base: NumberBase::Decimal,
+                value: idx.to_string(),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
+            }),
+            span,
+        )
+    }
+
     /// Stash a §9.4.5 RHS value evaluated at statement-execution time and
     /// synthesize the `$__xz_intra_saved(idx)` expression that retrieves it
     /// when the delayed assignment finally runs — the pre-computed Value
@@ -2232,7 +2966,7 @@ impl Simulator {
                         signed: false,
                         base: NumberBase::Decimal,
                         value: idx.to_string(),
-                        cached_val: Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )],
@@ -2292,6 +3026,175 @@ impl Simulator {
         false
     }
 
+    /// §23.6 / §7.4: resolve literal instance selectors and fixed memory
+    /// banks once, before checking a process loop for combinational feedback.
+    /// A packed word selector remains an ordinary select on its stored signal.
+    fn loop_memory_path(
+        &self,
+        e: &Expression,
+        locals: &[&str],
+        scope: Option<&str>,
+    ) -> Option<Expression> {
+        let ExprKind::Index { expr: base, .. } = &e.kind else {
+            return None;
+        };
+        let literal_index = |e: &Expression| {
+            let ExprKind::Number(n) = &e.kind else {
+                return None;
+            };
+            let v = self.eval_number(n);
+            if v.is_real {
+                return None;
+            }
+            v.to_index()
+        };
+        let (name, root) = match &base.kind {
+            ExprKind::MemberAccess { .. } => {
+                let mut path = Vec::new();
+                if !Self::fold_hier_path_segments(base, &mut path)
+                    || !path.iter().any(|seg| !seg.selects.is_empty())
+                    || path.iter().flat_map(|seg| seg.selects.iter()).any(|i| {
+                        literal_index(i)
+                            .is_none_or(|v| Some(v) != Self::constant_array_index(i, &self.module))
+                    })
+                {
+                    return None;
+                }
+                let name = self.constant_selected_storage(base)?;
+                let (scope, _) = name.rsplit_once('.')?;
+                if !self.module.instances.iter().any(|i| i.path == scope) {
+                    return None;
+                }
+                (name, path.first()?.name.name.clone())
+            }
+            ExprKind::Index { expr, index } if matches!(index.kind, ExprKind::Number(_)) => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return None;
+                }
+                let root = &h.path[0].name.name;
+                let &(lo, hi, width) = self.module.arrays.get(root)?;
+                let idx = literal_index(index)?;
+                if !(lo.min(hi)..=lo.max(hi)).contains(&idx)
+                    || !self.module.packed_signal_elem_widths.contains_key(root)
+                {
+                    return None;
+                }
+                let name = format!("{root}[{idx}]");
+                let id = *self.signal_name_to_id.get(name.as_str())?;
+                if self.signal_widths.get(id) != Some(&width) {
+                    return None;
+                }
+                (name, root.clone())
+            }
+            _ => return None,
+        };
+        if locals.contains(&root.as_str())
+            || self.frame_get(&root).is_some()
+            || scope.is_some_and(|s| {
+                self.signal_name_to_id
+                    .contains_key(format!("{s}.{name}").as_str())
+            })
+        {
+            return None;
+        }
+        Some(Self::flat_name_ident(name, base.span))
+    }
+
+    fn loop_memory_stmt<'a>(
+        &self,
+        stmt: &'a Statement,
+        locals: &mut Vec<&'a str>,
+        scope: Option<&str>,
+    ) -> Option<Statement> {
+        use crate::ast::stmt::ForInit;
+        use crate::compiler::elaborate::{for_each_sub_expr, for_each_sub_expr_mut};
+        if !self.this_stack.is_empty() {
+            return None;
+        }
+        let mut out;
+        match &stmt.kind {
+            StatementKind::For { init, body, .. } => {
+                let len = locals.len();
+                for i in init {
+                    if let ForInit::VarDecl { name, .. } = i {
+                        locals.push(&name.name);
+                    }
+                }
+                let changed = self.loop_memory_stmt(body, locals, scope);
+                locals.truncate(len);
+                let child = changed?;
+                out = stmt.clone();
+                if let StatementKind::For { body, .. } = &mut out.kind {
+                    **body = child;
+                }
+            }
+            StatementKind::SeqBlock { name, stmts } => {
+                // A block declaration may shadow an instance or memory bank.
+                if stmts.iter().any(|s| {
+                    matches!(
+                        s.kind,
+                        StatementKind::VarDecl { .. } | StatementKind::ParamDecl { .. }
+                    )
+                }) {
+                    return None;
+                }
+                let mut changed = None;
+                for (i, s) in stmts.iter().enumerate() {
+                    if let Some(child) = self.loop_memory_stmt(s, locals, scope) {
+                        changed.get_or_insert_with(|| stmts.clone())[i] = child;
+                    }
+                }
+                let stmts = changed?;
+                out = Statement::new(
+                    StatementKind::SeqBlock {
+                        name: name.clone(),
+                        stmts,
+                    },
+                    stmt.span,
+                );
+            }
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
+                let rewrite = |e: &Expression| {
+                    let mut hit = false;
+                    for_each_sub_expr(e, &mut |sub| {
+                        if !hit && self.loop_memory_path(sub, locals, scope).is_some() {
+                            hit = true;
+                        }
+                    });
+                    if !hit {
+                        return None;
+                    }
+                    let mut result = e.clone();
+                    for_each_sub_expr_mut(&mut result, &mut |sub| {
+                        if let Some(folded) = self.loop_memory_path(sub, locals, scope)
+                            && let ExprKind::Index { expr, .. } = &mut sub.kind
+                        {
+                            **expr = folded;
+                        }
+                    });
+                    Some(result)
+                };
+                let l = rewrite(lvalue);
+                let r = rewrite(rvalue);
+                if l.is_none() && r.is_none() {
+                    return None;
+                }
+                out = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: l.unwrap_or_else(|| lvalue.clone()),
+                        rvalue: r.unwrap_or_else(|| rvalue.clone()),
+                    },
+                    stmt.span,
+                );
+            }
+            _ => return None,
+        }
+        Some(out)
+    }
+
     /// Execute a process's continuation: the current frame from its cursor, then
     /// each chained frame behind it (see `ProcCont`).
     ///
@@ -2341,7 +3244,10 @@ impl Simulator {
             }
         }
         let eligible = match &stmt.kind {
-            StatementKind::For { .. } => !self.stmt_has_event_wait(stmt),
+            StatementKind::For { .. }
+            | StatementKind::While { .. }
+            | StatementKind::DoWhile { .. }
+            | StatementKind::Repeat { .. } => !self.stmt_has_event_wait(stmt),
             _ => false,
         };
         if !eligible || stmt.span.start == 0 && stmt.span.end == 0 {
@@ -2373,11 +3279,17 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
             compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -2392,6 +3304,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_packed_struct_fields(
                 self.bc_packed_fields
                     .as_ref()
@@ -2410,6 +3323,12 @@ impl Simulator {
             // The feedback walk is per-SPAN (cached below), not per
             // activation — collect_stmt_reads is too heavy to re-run on a
             // 10k-cycle stimulus loop.
+            let folded = self.loop_memory_stmt(
+                stmt,
+                &mut Vec::new(),
+                self.process_scope_hint.get(&pid).map(String::as_str),
+            );
+            let stmt = folded.as_ref().unwrap_or(stmt);
             let feedback = self.stmt_has_comb_feedback(stmt);
             let ok = !feedback && compiler.compile_stmt(stmt);
             if std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some() {
@@ -2614,11 +3533,17 @@ impl Simulator {
                 &self.module.arrays,
                 &self.widths,
             );
+            compiler.set_unpacked_structs(&self.unpacked_struct_leaves);
             compiler.set_ast_fallback(false);
             compiler.set_pkg_enum_consts(&self.pkg_enum_consts);
             compiler.set_scope_hint(scope_hint);
             compiler.set_tasks(&self.module.tasks);
             compiler.set_functions(&self.module.functions);
+            compiler.set_deferred_callables(
+                &self.module.deferred_function_bodies,
+                &self.module.deferred_task_bodies,
+                &self.module.packages,
+            );
             compiler.set_params(&self.module.parameters);
             compiler.set_param_leaf_idx(self.param_leaf_index());
             compiler.set_cast_widths(&self.cast_widths);
@@ -2633,6 +3558,7 @@ impl Simulator {
             compiler.set_assoc_elem_widths(&self.module.assoc_elem_widths);
             compiler.set_assoc_arrays(&self.module.associative_arrays);
             compiler.set_packed_full_dims(&self.module.packed_full_dims);
+            Self::set_pattern_type_tables(&self.module, &mut compiler);
             compiler.set_multi_dim_arrays(&self.multi_dim_array_names);
             compiler.set_arrays_2d(&self.module.arrays_2d);
             compiler.set_collection_denies(&self.module.dynamic_arrays, &self.module.queue_vars);
@@ -2713,6 +3639,72 @@ impl Simulator {
     }
 
     pub(super) fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
+        // A call chain that never waits nests one activation per call; stop
+        // it with a diagnostic before it exhausts the native stack.
+        let at_limit = self.stall_limit != 0 && u64::from(self.stmts_depth) >= self.stall_limit;
+        if (at_limit || self.stmts_depth >= 64) && self.process_nesting_exceeded(pid) {
+            return;
+        }
+        self.stmts_depth += 1;
+        self.run_process_stmts_scoped(pid, pc);
+        self.stmts_depth -= 1;
+    }
+
+    /// Whether the activation about to nest at depth `stmts_depth` must stop.
+    /// A task that can wait (`@`, `#`, `wait`) runs inside its caller's
+    /// activation and resumes the caller's remaining statements from inside
+    /// its own, so a process whose calls never actually wait — a task that
+    /// calls itself, or two that call each other, at one time step — nests
+    /// one native frame per call. That is a zero-delay loop: simulated time
+    /// can never advance. It is reported, naming the process, when the depth
+    /// reaches `XEZIM_STALL_LIMIT` or when the native stack is nearly
+    /// exhausted, whichever comes first; overflowing the stack aborted the
+    /// whole run with no message about the design.
+    #[cold]
+    #[inline(never)]
+    fn process_nesting_exceeded(&mut self, pid: usize) -> bool {
+        if self.finished {
+            return true;
+        }
+        let depth = u64::from(self.stmts_depth);
+        let over_limit = self.stall_limit != 0 && depth >= self.stall_limit;
+        let low_stack = depth % 16 == 0 && stack_nearly_exhausted();
+        if !over_limit && !low_stack {
+            return false;
+        }
+        eprintln!(
+            "[xezim][error] simulation STALLED at time {} — a process nested {} task calls and blocks without waiting.",
+            self.time, depth
+        );
+        let id = self.stall_pid_identity(pid);
+        eprintln!(
+            "{} — calls a task that can wait but does not, again and again",
+            id
+        );
+        if let Some(src) = self.stall_pid_source(pid) {
+            eprintln!("                 its source: {}", src);
+        }
+        eprintln!(
+            "               This is a zero-delay loop (a task that calls itself, or tasks that call each"
+        );
+        eprintln!(
+            "               other, with no wait taken): simulated time can never advance past it."
+        );
+        if low_stack {
+            eprintln!(
+                "               It was stopped before the native stack ran out. If the recursion is finite,"
+            );
+            eprintln!("               raise the stack with XEZIM_STACK_MB=<MiB>.");
+        } else {
+            eprintln!(
+                "               Raise or disable the check with XEZIM_STALL_LIMIT=<n> (0 = never stall-check)."
+            );
+        }
+        self.abort_run();
+        true
+    }
+
+    fn run_process_stmts_scoped(&mut self, pid: usize, pc: &ProcCont) {
         // Install this activation's own scope (see `activation_scope`) —
         // the ratchet-proof twin of the hint reset performed inside. A
         // mid-block hierarchical reference (`u_child.x = 1` right before
@@ -2801,32 +3793,32 @@ impl Simulator {
         // dispatch, so the guard stays accurate while re-entrant work is free
         // to recurse up to the trampoline/stack limits above.
         if self.stall_limit > 0 && depth == 0 {
-            let hits = self.stall_pid_hits.entry(pid).or_insert(0);
-            // One process re-activated this many times at a SINGLE timestamp is
-            // not a busy design, it is a livelock: it keeps re-arming itself and
-            // time can never advance. (Counting per-process, rather than
-            // counting activations at the timestamp, is what makes this safe for
-            // a wide design that legitimately wakes thousands of DISTINCT
-            // processes at time 0.) run_one_tick's inner drain loop re-reads the
-            // queue at the current time, so a self-rescheduling process never
-            // reaches the outer event loop — the check has to live here.
-            // Check BEFORE counting: the activation that trips the guard is
-            // re-parked UNEXECUTED and must not inflate "ran N times".
-            if *hits >= self.stall_limit {
-                // A single process re-arming this many times at one timestamp is
-                // a zero-delay livelock (e.g. `always #(period) clk=~clk` whose
-                // real `period` momentarily glitched to 0). Rather than abort the
+            // One process re-activated `stall_limit` times at a SINGLE
+            // timestamp with NO observable state change in between is not a
+            // busy design, it is a livelock: it keeps re-arming itself and
+            // time can never advance (`stall_pid_tripped` is progress-aware
+            // unless XEZIM_STALL_LIMIT was set explicitly). Counting
+            // per-process, rather than counting activations at the timestamp,
+            // keeps a wide design that legitimately wakes thousands of
+            // DISTINCT processes at time 0 safe. run_one_tick's inner drain
+            // loop re-reads the queue at the current time, so a
+            // self-rescheduling process never reaches the outer event loop —
+            // the check has to live here. The activation that trips the guard
+            // is re-parked UNEXECUTED and must not inflate "ran N times".
+            if self.stall_pid_tripped(pid, Some(pc)) {
+                // A single process re-arming like this is a zero-delay
+                // livelock (e.g. `always #(period) clk=~clk` whose real
+                // `period` momentarily glitched to 0). Rather than abort the
                 // whole run here, RE-PARK this un-executed activation at the
-                // current time and ask the outer event loop to defer-and-advance
-                // to the next scheduled event — a commercial simulator lets time
-                // move past a #0 spinner once its driving value recovers (here,
-                // once a reference-clock edge updates the measured period). The outer
-                // loop declares it fatal only if nothing is scheduled ahead.
+                // current time and ask the outer event loop to
+                // defer-and-advance to the next scheduled event — a
+                // commercial simulator lets time move past a #0 spinner once
+                // its driving value recovers. The outer loop declares it
+                // fatal only if nothing is scheduled ahead.
                 self.event_queue.schedule(self.time, pid, pc.clone());
                 self.zero_delay_defer_pending = true;
                 return;
             }
-            *hits += 1;
         }
         sim_dbg_eprintln!(
             "[DEBUG] running process {} ({} stmts) at time {}",
@@ -3202,11 +4194,31 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    // Chain the caller's tail instead of copying it onto the end of
-                                    // the spliced body (ProcCont::pushed).
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -3232,7 +4244,8 @@ impl Simulator {
                             // bare free-task arm above (Stage 1).
                             self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
-                            let mut cont: Vec<Statement> = td.items.clone();
+                            let mut cont: Vec<Statement> =
+                                crate::ast::cache::with_fresh_scope_caches(|| td.items.to_vec());
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
                             return;
@@ -3267,9 +4280,31 @@ impl Simulator {
                                     self.push_instance_task_context(&mut cleanup);
                                     self.enter_free_task_scope(&td, &mut cleanup);
                                     self.task_cleanup.push(cleanup);
-                                    let mut cont: Vec<Statement> = td.items.clone();
-                                    cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
-                                    self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                    let frame = if self.share_task_frames {
+                                        self.task_body_frame(&td, stmt.span)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(frame) = frame {
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
+                                        );
+                                    } else {
+                                        // Preserve first-call lifetimes and checkpoint numbering.
+                                        let mut cont: Vec<Statement> =
+                                            crate::ast::cache::with_fresh_scope_caches(|| {
+                                                td.items.to_vec()
+                                            });
+                                        cont.push(Statement::new(
+                                            StatementKind::ScopePop,
+                                            stmt.span,
+                                        ));
+                                        self.run_process_stmts(
+                                            pid,
+                                            &pc.pushed(cont, pc.start + i + 1),
+                                        );
+                                    }
                                     return;
                                 }
                             }
@@ -3869,8 +4904,8 @@ impl Simulator {
                     if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4 {
                         let n_val = self.eval_expr(&args[0]).to_u64().unwrap_or(0) as i64;
                         let edge_code = self.eval_expr(&args[1]).to_u64().unwrap_or(0);
-                        let val = self.eval_target_rhs(lvalue, &args[3]);
-                        let saved = self.make_intra_saved_expr(val, rvalue.span);
+                        let (saved, release) =
+                            self.capture_intra_rhs(lvalue, &args[3], rvalue.span);
                         let assign = Statement::new(
                             StatementKind::BlockingAssign {
                                 lvalue: lvalue.clone(),
@@ -3903,6 +4938,7 @@ impl Simulator {
                             ));
                         }
                         cont.push(assign);
+                        cont.extend(release);
                         // Chain the caller's tail instead of copying it onto the end of
                         // the spliced body (ProcCont::pushed).
                         self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
@@ -3917,16 +4953,16 @@ impl Simulator {
             // `#d;` followed by `lhs = <saved value>;`.
             if let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind {
                 if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                    let val = self.eval_expr(rhs);
+                    let (saved, release) = self.capture_intra_rhs(lvalue, rhs, rvalue.span);
                     let delay = self.eval_delay_ticks(d_expr);
-                    let saved = self.make_intra_saved_expr(val, rvalue.span);
-                    let cont = vec![Statement::new(
+                    let mut cont = vec![Statement::new(
                         StatementKind::BlockingAssign {
                             lvalue: lvalue.clone(),
                             rvalue: saved,
                         },
                         stmt.span,
                     )];
+                    cont.extend(release);
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     self.event_queue.schedule(self.time + delay, pid, cont);
@@ -4017,8 +5053,9 @@ impl Simulator {
                                             selects: Vec::new(),
                                         }],
                                         span: *span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
                                     }),
                                     *span,
                                 ),
@@ -4048,7 +5085,7 @@ impl Simulator {
                         {
                             {
                                 let w = self.make_event_waiter(pid, sens, cont);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             }
                         } else {
                             eprintln!(
@@ -4304,7 +5341,24 @@ impl Simulator {
                         // `@prop` / `@(h.prop)` on a NON-event class property:
                         // a value-change wait, resumed by an ordinary write
                         // of the property (never by `->`).
+                        // `@(vif)` / `@(vifs[i])`: a change of the instance a
+                        // virtual-interface variable refers to.
+                        if let Some(cond) = self.vif_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         if let Some(cond) = self.class_prop_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
+                        // `@(posedge prop)` / `@(negedge prop)` on a non-signal
+                        // operand (class property or procedural local): an
+                        // edge-sensitive value change, not a signal edge.
+                        if let Some(cond) = self.class_prop_edge_cond(event) {
                             let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
                             let cont = pc.pushed(vec![wait], pc.start + i + 1);
                             self.park_condition_waiter(pid, cont, &cond);
@@ -4334,15 +5388,19 @@ impl Simulator {
                                 }];
                                 {
                                     let w = self.make_event_waiter_kind(pid, sens, cont, false);
-                                    self.event_waiters.push(w);
+                                    self.park_event_waiter(w);
                                 }
                                 return;
                             }
                             // §15.5: an event with no signal — a subroutine's
                             // local `event e;` — waits for `fire_named_event`
                             // by name. The signal fallback below resumed it
-                            // after the slot's NBA region, i.e. at once.
-                            if !canon.contains('.') && canon != Self::EVENT_NULL_KEY {
+                            // after the slot's NBA region, i.e. at once. So
+                            // does a labeled block's local stored under its
+                            // hierarchical name (`a.e`, §6.21).
+                            if (!canon.contains('.') || self.module.events.contains(canon.as_str()))
+                                && canon != Self::EVENT_NULL_KEY
+                            {
                                 let cont = pc.pushed_body(body, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
                                     key: InstanceEventKeys::One(self.unbacked_event_key(&canon)),
@@ -4391,7 +5449,7 @@ impl Simulator {
                                 }
                             } else if has_real {
                                 let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
-                                self.event_waiters.push(w);
+                                self.park_event_waiter(w);
                             } else {
                                 // `@(x)` where x is not a real signal — a
                                 // procedural local that was NBA-assigned then
@@ -4599,7 +5657,7 @@ impl Simulator {
                                     pc.resume_at(pc.start + i + 1),
                                 );
                                 waiter.remaining_events = n;
-                                self.event_waiters.push(waiter);
+                                self.park_event_waiter(waiter);
                                 return;
                             }
                         }
@@ -4713,7 +5771,7 @@ impl Simulator {
                 // owns the §12.5.3 unique/unique0/priority violation checks,
                 // so only intercept when some arm can actually suspend.
                 if !items.iter().any(|i| i.pattern.is_some()) && self.stmt_is_blocking(stmt) {
-                    let val = self.case_selector_value(kind, expr, items);
+                    let comparison = self.case_comparison(kind, expr, items);
                     let chosen: Option<&Statement> = items
                         .iter()
                         .find_map(|item| {
@@ -4721,22 +5779,7 @@ impl Simulator {
                                 return None;
                             }
                             for pat in &item.patterns {
-                                let hit = match kind {
-                                    CaseKind::CaseInside => self.case_inside_match(&val, pat),
-                                    CaseKind::Casez => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casez_eq(&pv).is_true()
-                                    }
-                                    CaseKind::Casex => {
-                                        let pv = self.eval_expr(pat);
-                                        val.casex_eq(&pv).is_true()
-                                    }
-                                    _ => {
-                                        let pv = self.eval_expr(pat);
-                                        val.case_eq(&pv).is_true()
-                                    }
-                                };
-                                if hit {
+                                if self.case_item_matches(kind, &comparison, pat) {
                                     return Some(&item.stmt);
                                 }
                             }
@@ -4867,7 +5910,7 @@ impl Simulator {
                         let while_body = Statement::new(
                             StatementKind::SeqBlock {
                                 name: None,
-                                stmts: body_stmts,
+                                stmts: body_stmts.into(),
                             },
                             stmt.span,
                         );
@@ -4999,7 +6042,7 @@ impl Simulator {
                         self.process_scope_hint.insert(pid_child, h);
                     }
                     self.process_origin
-                        .insert(pid_child, (s.span, "fork child"));
+                        .insert(pid_child, (s.span, FORK_CHILD_ORIGIN));
                     // §9.6.2: `disable <label>` where the label names this
                     // child's own top-level `begin : name` block terminates
                     // the child. `disable_labels` was populated ONLY for
@@ -5008,38 +6051,15 @@ impl Simulator {
                     // the self-unwind path, and the child kept running — a
                     // later `wait fork` then blocked on it forever.
                     if let StatementKind::SeqBlock { name: Some(n), .. } = &s.kind {
-                        self.disable_labels.insert(n.name.clone(), pid_child);
+                        self.register_disable_label(&n.name, pid_child);
                     }
                     self.inherit_fork_child_context(pid_child);
                     self.inherit_fork_m_scope(pid_child, pid, block_name.as_ref());
-                    // §9.4.5: a child that IS an intra-assignment delay
-                    // (`fork lhs = #d rhs; join_none`) captures its RHS at the
-                    // fork point — a join_none parent keeps running and may
-                    // overwrite RHS operands before the child would start, so
-                    // deferring the capture to child start-up reads the
-                    // post-fork values. Evaluate now and schedule the
-                    // pre-computed assignment directly at t+d.
-                    if let StatementKind::BlockingAssign { lvalue, rvalue } = &s.kind {
-                        if let Some((d_expr, rhs)) = Self::intra_delay_marker(rvalue) {
-                            let val = self.eval_expr(rhs);
-                            let delay = self.eval_delay_ticks(d_expr);
-                            let saved = self.make_intra_saved_expr(val, rvalue.span);
-                            let assign = Statement::new(
-                                StatementKind::BlockingAssign {
-                                    lvalue: lvalue.clone(),
-                                    rvalue: saved,
-                                },
-                                s.span,
-                            );
-                            self.event_queue.schedule(
-                                self.time + delay,
-                                pid_child,
-                                vec![assign].into(),
-                            );
-                            child_pids.insert(pid_child);
-                            continue;
-                        }
-                    }
+                    // §9.3.2, §9.4.5: a child that is an intra-assignment
+                    // delay (`fork lhs = #d rhs; join_none`) evaluates its
+                    // right-hand side when it starts, like any other child:
+                    // after the parent blocks or finishes, so it reads what
+                    // the parent wrote after the fork.
                     // Schedule children to run at current time, sharing one
                     // cached Arc<[Statement]> per static fork branch node.
                     let frame = self.blocking_cont_frame(&pc.stmts, s, 5, std::slice::from_ref(s));
@@ -5055,8 +6075,7 @@ impl Simulator {
                 }
                 self.auto_loop_vars.truncate(saved_auto_len);
                 if let Some(nm) = block_name {
-                    self.fork_block_children
-                        .insert(nm.name.clone(), child_pids.clone());
+                    self.register_named_fork(&nm.name, &child_pids);
                 }
 
                 // An empty fork (or one whose only items were declarations)
@@ -5163,7 +6182,7 @@ impl Simulator {
                             keys[*idx].clone()
                         };
                         let kv = if *is_str {
-                            Value::from_string(&key_str)
+                            Self::name_key_value(&key_str)
                         } else if key_type.1 {
                             let mut v = Value::from_u64(
                                 key_str.parse::<i64>().unwrap_or(0) as u64,
@@ -5272,7 +6291,7 @@ impl Simulator {
                             // run the FIRST iteration now
                             if let Some(vn) = &loop_var {
                                 let kv = if is_str {
-                                    Value::from_string(&keys[0])
+                                    Self::name_key_value(&keys[0])
                                 } else if key_type.1 {
                                     let mut v = Value::from_u64(
                                         keys[0].parse::<i64>().unwrap_or(0) as u64,
@@ -5414,13 +6433,9 @@ impl Simulator {
                 // transitive closure made a `join_none` grandchild extend the
                 // wait arbitrarily — or forever, for a persistent monitor
                 // spawned by a child, which is exactly the shape UVM drivers
-                // use.
-                let children: HashSet<usize> = self
-                    .process_parents
-                    .iter()
-                    .filter(|&(_, &parent)| parent == pid)
-                    .map(|(&child, _)| child)
-                    .collect();
+                // use. A finished child's children, handed up to this process
+                // for `disable fork`, are not its own (`wait_fork_children`).
+                let children: HashSet<usize> = self.wait_fork_children(pid);
 
                 if children.is_empty() {
                     i += 1;
@@ -5479,9 +6494,82 @@ impl Simulator {
                     }
                 }
             }
+            // §9.6.2: a `disable` of the process's own top-level block ends
+            // with the process; leave no flag for the next activation.
+            if pc.next.is_none()
+                && self.break_flag
+                && !self.killed_pids.contains(&pid)
+                && self
+                    .disable_target
+                    .as_deref()
+                    .is_some_and(|t| self.is_process_top_label(pid, t))
+            {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.continue_flag = false;
+            }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);
             }
         }
     }
+}
+
+/// Whether the current thread has used all but its reserve of native stack:
+/// an eighth of the stack, at least 256 KiB and at most 64 MiB, which is
+/// room to report and unwind. False where the stack bounds are unknown.
+fn stack_nearly_exhausted() -> bool {
+    thread_local! {
+        /// (lowest stack address, reserve), probed once per thread.
+        static BOUNDS: std::cell::Cell<Option<Option<(usize, usize)>>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let bounds = BOUNDS.with(|b| {
+        if b.get().is_none() {
+            b.set(Some(thread_stack_bounds().map(|(low, size)| {
+                (low, (size / 8).clamp(256 << 10, 64 << 20))
+            })));
+        }
+        b.get().flatten()
+    });
+    let Some((low, reserve)) = bounds else {
+        return false;
+    };
+    let here = std::hint::black_box(&low) as *const usize as usize;
+    here.saturating_sub(low) < reserve
+}
+
+/// The lowest address and the size of the current thread's stack.
+#[cfg(target_os = "linux")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: `attr` is initialized by `pthread_getattr_np` before it is
+    // read and destroyed after; both out-pointers are valid locals.
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return None;
+        }
+        let mut addr: *mut libc::c_void = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        let ok = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+        libc::pthread_attr_destroy(&mut attr);
+        (ok && !addr.is_null() && size > 0).then_some((addr as usize, size))
+    }
+}
+
+/// The lowest address and the size of the current thread's stack.
+#[cfg(target_os = "macos")]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    // SAFETY: plain queries about the calling thread.
+    unsafe {
+        let me = libc::pthread_self();
+        let top = libc::pthread_get_stackaddr_np(me) as usize;
+        let size = libc::pthread_get_stacksize_np(me);
+        (top > size && size > 0).then_some((top - size, size))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_stack_bounds() -> Option<(usize, usize)> {
+    None
 }

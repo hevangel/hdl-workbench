@@ -45,6 +45,8 @@ fn local_coll_queues_all_shapes() {
     let src = r#"
 class C;
   int mq[$];
+  string last;
+  int r, t, p, d, n, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
   function new();
   endfunction
   function void fill(int n, int base);
@@ -120,7 +122,6 @@ class C;
       b0 = q.size();
     end
   endfunction
-  int r, t, p, d, n, last, lq, lmq, lqs, lmqs, dv, hn, heq, ht, b1, b0;
 endclass
 
 module top;
@@ -225,14 +226,8 @@ endmodule
     assert_eq!(f(&off), f(&on), "ON != OFF");
 }
 
-/// Subprocess binary path (tests run from the crate's test harness —
-/// current_exe-relative like the other compiled-method tests).
+/// Subprocess binary path, as Cargo built it for the integration tests.
 fn xezim_bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop(); // deps/
-    p.pop(); // tests/ (or debug/)
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("xezim")
+    // Cargo names the binary it built for the integration tests.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_xezim"))
 }

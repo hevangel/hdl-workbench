@@ -62,6 +62,8 @@ use xezim_core::ast::types::{
 };
 use xezim_core::elaborate::ElaboratedModule;
 
+use crate::should_fail_lint::{GenReach, GenerateSelection};
+
 #[derive(Clone, Debug, PartialEq)]
 enum Ty {
     Unknown,
@@ -80,6 +82,7 @@ enum Ty {
         short: bool,
     },
     Str,
+    Event,
     Class(Rc<str>),
     Null,
     Void,
@@ -151,6 +154,7 @@ impl Ty {
             Ty::Real { short: true } => "shortreal".into(),
             Ty::Real { short: false } => "real".into(),
             Ty::Str => "string".into(),
+            Ty::Event => "event".into(),
             Ty::Class(c) => format!("class {c}"),
             Ty::Null => "null".into(),
             Ty::Void => "void".into(),
@@ -285,6 +289,13 @@ struct ClassInfo {
     props: HashMap<String, Ty>,
     types: HashMap<String, Ty>,
     methods: HashMap<String, Rc<Sig>>,
+    params: Vec<ClassParam>,
+}
+
+#[derive(Clone)]
+struct ClassParam {
+    name: String,
+    is_type: bool,
 }
 
 #[derive(Default)]
@@ -355,6 +366,19 @@ struct Ck<'a> {
     /// Inside a generate block, which may not be elaborated: counts that
     /// depend on a parameter are not judged there.
     gen_depth: u32,
+    /// The conditional generate branches the elaborated design selects
+    /// (§27.5); a branch no instance selects is not checked.
+    gen_sel: Option<&'a GenerateSelection<'a>>,
+    /// The instances that elaborate the generate branch being walked (see
+    /// `GenReach`); a nested construct is decided for those only.
+    gen_reach: GenReach,
+    /// Stack depth of the definition's own scope: a name declared above it
+    /// is local to a generate block (or a genvar), which the elaborated
+    /// parameter tables do not key by its bare name.
+    body_depth: usize,
+    /// The concatenation being walked as an unpacked array concatenation
+    /// (§10.10): the right-hand side of an assignment to an unpacked array.
+    unpacked_concat: Option<Span>,
     errs: Vec<String>,
 }
 
@@ -376,6 +400,10 @@ impl<'a> Ck<'a> {
             seen: HashSet::default(),
             params_fixed: false,
             gen_depth: 0,
+            gen_sel: None,
+            gen_reach: None,
+            body_depth: usize::MAX,
+            unpacked_concat: None,
             errs: Vec::new(),
         }
     }
@@ -495,6 +523,10 @@ impl<'a> Ck<'a> {
                 kind: SimpleType::String,
                 ..
             } => Ty::Str,
+            DataType::Simple {
+                kind: SimpleType::Event,
+                ..
+            } => Ty::Event,
             DataType::Simple { .. } => Ty::Unknown,
             DataType::Void(_) => Ty::Void,
             DataType::Enum(et) => self.resolve_enum(et, None),
@@ -524,6 +556,7 @@ impl<'a> Ck<'a> {
                 type_args,
                 ..
             } => {
+                self.check_class_type_args(&name.name.name, type_args);
                 if !dimensions.is_empty() || !type_args.is_empty() {
                     return Ty::Unknown;
                 }
@@ -828,6 +861,11 @@ impl<'a> Ck<'a> {
                 data_type,
                 declarators,
                 ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
             } = &s.kind
             {
                 for d in declarators {
@@ -908,6 +946,31 @@ impl<'a> Ck<'a> {
                 }
                 ModuleItem::ClassDeclaration(c) => {
                     self.top().types.remove(&c.name.name);
+                }
+                // §23.6, §23.9: an instance or a generate block is a scope of
+                // this one, so `p.s` is a hierarchical name through it even
+                // when a package is named `p` too; a package item is named
+                // with `::` (§26.3), never with a dot.
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        let n = hi.name.name.split('[').next().unwrap_or_default();
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => {
+                    if let Some(n) = &g.name {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateIf(g) => {
+                    for n in g.branch_labels.iter().flatten() {
+                        self.declare_scope_name(n);
+                    }
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for n in g.arms.iter().filter_map(|a| a.label.as_ref()) {
+                        self.declare_scope_name(n);
+                    }
                 }
                 _ => {}
             }
@@ -993,6 +1056,114 @@ impl<'a> Ck<'a> {
             props,
             types,
             methods,
+            params: c
+                .params
+                .iter()
+                .flat_map(|p| match &p.kind {
+                    ParameterKind::Data { assignments, .. } => assignments
+                        .iter()
+                        .map(|a| ClassParam {
+                            name: a.name.name.clone(),
+                            is_type: false,
+                        })
+                        .collect::<Vec<_>>(),
+                    ParameterKind::Type { assignments } => assignments
+                        .iter()
+                        .map(|a| ClassParam {
+                            name: a.name.name.clone(),
+                            is_type: true,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
+    /// §6.20.2/§8.25: a type actual must denote a declared type. A default
+    /// type is not a subtype bound, and omitted actuals may use defaults.
+    fn check_class_type_args(&mut self, name: &str, args: &[Expression]) {
+        if args.is_empty() {
+            return;
+        }
+        let Some(params) = self.class(name).map(|c| c.params.clone()) else {
+            return;
+        };
+        for (i, actual) in args.iter().enumerate() {
+            let (param, actual) = match &actual.kind {
+                ExprKind::NamedArg {
+                    name,
+                    expr: Some(value),
+                } => (params.iter().find(|p| p.name == name.name), value.as_ref()),
+                ExprKind::NamedArg { .. } => continue,
+                _ => (params.get(i), actual),
+            };
+            if param.is_some_and(|p| p.is_type) {
+                self.check_type_actual(actual);
+            }
+        }
+    }
+
+    fn check_type_actual(&mut self, actual: &Expression) {
+        let unknown = match &actual.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            ExprKind::TypeLiteral(dt) => {
+                if let DataType::TypeReference { name, .. } = dt.as_ref() {
+                    if name.scopes.is_empty() {
+                        Some(name.name.name.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(n) = unknown {
+            // Virtual interface types are retained as source text by the
+            // parser; their names and parameters need interface resolution.
+            if !n.starts_with("virtual ")
+                && !matches!(
+                    n,
+                    "bit"
+                        | "logic"
+                        | "reg"
+                        | "byte"
+                        | "shortint"
+                        | "int"
+                        | "longint"
+                        | "integer"
+                        | "time"
+                        | "shortreal"
+                        | "real"
+                        | "realtime"
+                        | "string"
+                        | "chandle"
+                        | "event"
+                        | "void"
+                        | "mailbox"
+                        | "semaphore"
+                        | "process"
+                )
+                && self.lookup_type(n).is_none()
+                && !self.env.class_names.contains_key(n)
+                // SourceDefinition omits compilation-unit imports. A type
+                // provided by a package may be visible through one, so its
+                // visibility is uncertain here; only reject unknown names.
+                && !self.env.packages.values().any(|p| p.types.contains_key(n))
+                && self.seen.insert(actual.span.start)
+            {
+                self.report(
+                    actual.span,
+                    format!(
+                        "type argument '{n}' is not a declared type (IEEE 1800-2017 §6.20.2, §8.25)"
+                    ),
+                );
+            }
         }
     }
 
@@ -1105,12 +1276,25 @@ impl<'a> Ck<'a> {
                 self.index_ty(t, index)
             }
             ExprKind::RangeSelect {
-                expr, left, right, ..
+                expr,
+                kind,
+                left,
+                right,
             } => match self.ty_of(expr) {
                 Ty::Unpacked { mut dims, elem } => {
-                    let n = match (lit_i64(left), lit_i64(right)) {
-                        (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
-                        _ => None,
+                    // §7.4.5, §11.5.1: `a[l:r]` has |l - r| + 1 elements;
+                    // `a[b +: w]` and `a[b -: w]` have `w`, whatever the base
+                    // (it may vary at run time). Counting the base and the
+                    // width as the bounds of a range rejected `a[0 +: 6] = b`
+                    // (#869).
+                    let n = match kind {
+                        RangeKind::Constant => match (lit_i64(left), lit_i64(right)) {
+                            (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
+                            _ => None,
+                        },
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            lit_i64(right).filter(|&w| w > 0).map(|w| w.unsigned_abs())
+                        }
                     };
                     dims[0] = Dim::Fixed(n);
                     Ty::Unpacked { dims, elem }
@@ -1383,6 +1567,9 @@ impl<'a> Ck<'a> {
     fn check_struct_members(&mut self, e: &Expression) {
         let mut missing: Vec<(String, Span)> = Vec::new();
         visit_expr(e, &mut |x| {
+            if self.check_parenthesized_field(x) {
+                return;
+            }
             let (base, members): (Ty, Vec<&xezim_core::ast::Identifier>) = match &x.kind {
                 ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), vec![member]),
                 ExprKind::Ident(h)
@@ -1415,6 +1602,32 @@ impl<'a> Ck<'a> {
                 format!("'{m}' is not a member of the struct or union (IEEE 1800-2017 §7.2)"),
             );
         }
+    }
+
+    /// A.8.2 permits a parenthesized method-call root, even with omitted
+    /// call parentheses; A.8.3's struct field select needs a hierarchical name.
+    fn check_parenthesized_field(&mut self, e: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr, .. } = &e.kind else {
+            return false;
+        };
+        let ExprKind::Paren(inner) = &expr.kind else {
+            return false;
+        };
+        let mut receiver = inner.as_ref();
+        while let ExprKind::Paren(inner) = &receiver.kind {
+            receiver = inner;
+        }
+        if matches!(self.ty_of(receiver), Ty::Struct(_)) {
+            if self.seen.insert(e.span.start) {
+                self.report(
+                    e.span,
+                    "member select cannot follow a parenthesized expression (IEEE 1800-2017 A.8.3)"
+                        .into(),
+                );
+            }
+            return true;
+        }
+        false
     }
 
     /// A parameter, genvar or enum member (not a variable, and not a
@@ -1477,7 +1690,24 @@ impl<'a> Ck<'a> {
     /// `target = rhs` where `target` has type `lt`; `what` names the target
     /// (built only for a report).
     fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: impl FnOnce() -> String) {
+        if is_new_call(rhs)
+            && let Ty::Class(c) = lt
+        {
+            self.check_ctor_call(c, rhs);
+        }
+        if let Some(c) = typed_new_class(rhs) {
+            self.check_ctor_call(c, rhs);
+        }
         if is_new_call(rhs) {
+            // §6.17: events are created by their declarations or aliased;
+            // `new()` constructs a class, not a synchronization object.
+            if matches!(lt, Ty::Event) {
+                self.report(
+                    rhs.span,
+                    "'new' cannot construct an event (IEEE 1800-2017 §6.17, §8.7)".into(),
+                );
+                return;
+            }
             // `new(args)` and `new[n](init)` share one AST shape; only the
             // bare `new` is certainly a class constructor.
             if matches!(rhs.kind, ExprKind::Ident(_))
@@ -1505,6 +1735,8 @@ impl<'a> Ck<'a> {
         let rt = match typed_new_class(rhs) {
             Some(c) if self.is_class_name(c) => Ty::Class(c.into()),
             Some(_) => return,
+            // §7.6: `(x + 1)` is as scalar as `x + 1` to an unpacked array.
+            None if matches!(lt, Ty::Unpacked { .. }) => self.ty_of(peel_parens(rhs)),
             None => self.ty_of(rhs),
         };
         if let Some(why) = self.incompatible(lt, &rt) {
@@ -1660,6 +1892,34 @@ impl<'a> Ck<'a> {
         }
     }
 
+    /// §8.7, §13.5: the actuals of `new`, `new(...)` or `C::new(...)` bound to
+    /// the formals of class `c`'s own constructor. Constructors are not
+    /// inherited: a class that declares none has the implicit `new()` with no
+    /// formals, unless it extends a class, where `extends B(default)` (§8.17)
+    /// would give it the base's.
+    fn check_ctor_call(&mut self, c: &str, rhs: &Expression) {
+        let Some(ci) = self.chain(c).and_then(|ch| ch.first().cloned()) else {
+            return;
+        };
+        if ci.interface {
+            return;
+        }
+        let sig = match ci.methods.get("new") {
+            Some(s) => s.clone(),
+            None if ci.base.is_none() => Rc::new(Sig {
+                ret: Ty::Void,
+                ports: Vec::new(),
+                is_task: false,
+            }),
+            None => return,
+        };
+        let args: &[Expression] = match &rhs.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        self.check_call(&format!("{c}::new"), &sig, args, rhs.span);
+    }
+
     fn walk_expr(&mut self, e: &Expression) {
         self.check_const_selects(e);
         self.check_struct_members(e);
@@ -1667,10 +1927,25 @@ impl<'a> Ck<'a> {
         self.walk_value(e, true);
     }
 
+    /// `walk_expr` for the value `e` assigned to a target of type `lt`.
+    /// §10.10: a concatenation assigned to an unpacked array is an unpacked
+    /// array concatenation, whose items may be real; §11.4.12 rules out real
+    /// operands of a packed concatenation only.
+    fn walk_rhs(&mut self, lt: &Ty, e: &Expression) {
+        let cat = peel_parens(e);
+        let unpacked = (matches!(lt, Ty::Unpacked { .. })
+            && matches!(cat.kind, ExprKind::Concatenation(_)))
+        .then_some(cat.span);
+        let saved = std::mem::replace(&mut self.unpacked_concat, unpacked);
+        self.walk_expr(e);
+        self.unpacked_concat = saved;
+    }
+
     /// Walk `e`; `value` is false for a call made as a statement.
     fn walk_value(&mut self, e: &Expression, value: bool) {
         match &e.kind {
             ExprKind::Call { func, args } => {
+                self.check_builtin_call(func, e.span);
                 for a in args {
                     self.walk_value(a, true);
                 }
@@ -1749,14 +2024,71 @@ impl<'a> Ck<'a> {
                 self.walk_value(expr, true);
                 self.walk_value(index, true);
             }
-            ExprKind::MemberAccess { expr, member } => match self.package_of(expr) {
-                Some(pkg) => {
-                    self.check_package_member(pkg, &member.name, member.span);
+            ExprKind::MemberAccess { expr, member } => {
+                self.check_parenthesized_field(e);
+                match self.package_of(expr) {
+                    Some(pkg) => {
+                        self.check_package_member(pkg, &member.name, member.span);
+                    }
+                    None => self.walk_value(expr, true),
                 }
-                None => self.walk_value(expr, true),
-            },
+            }
             ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_value(x, true)),
             _ => {}
+        }
+    }
+
+    /// §15.5.3/§7.10.2/§7.12: known built-in receiver types have a closed
+    /// set of methods. Class methods with the same spellings remain legal.
+    fn check_builtin_call(&mut self, func: &Expression, span: Span) {
+        let (receiver, method) = match &func.kind {
+            ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), member.name.as_str()),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut base = h.clone();
+                let method = &h.path.last().unwrap().name.name;
+                base.path.pop();
+                (
+                    self.ty_of(&Expression::new(ExprKind::Ident(base), func.span)),
+                    method.as_str(),
+                )
+            }
+            _ => return,
+        };
+        let invalid = match &receiver {
+            Ty::Event => method != "triggered",
+            Ty::Unpacked { dims, .. } if dims.first() == Some(&Dim::Queue) => !matches!(
+                method,
+                "size"
+                    | "insert"
+                    | "delete"
+                    | "pop_front"
+                    | "pop_back"
+                    | "push_front"
+                    | "push_back"
+                    | "find"
+                    | "find_index"
+                    | "find_first"
+                    | "find_first_index"
+                    | "find_last"
+                    | "find_last_index"
+                    | "min"
+                    | "max"
+                    | "unique"
+                    | "unique_index"
+                    | "reverse"
+                    | "sort"
+                    | "rsort"
+                    | "shuffle"
+                    | "sum"
+                    | "product"
+                    | "and"
+                    | "or"
+                    | "xor"
+            ),
+            _ => false,
+        };
+        if invalid && self.seen.insert(span.start) {
+            self.report(span, format!("method '{method}' is not defined for {} (IEEE 1800-2017 §15.5.3, §7.10.2, §7.12)", receiver.describe()));
         }
     }
 
@@ -1818,6 +2150,14 @@ impl<'a> Ck<'a> {
         let t = with_dims(self.resolve(dt), dims);
         self.declare_value(name, t.clone());
         t
+    }
+
+    /// The name of an instance or generate block: neither a constant nor a
+    /// variable (`u.x = 1` writes through it), of no type this pass models.
+    fn declare_scope_name(&mut self, name: &str) {
+        let top = self.top();
+        top.vars.insert(name.to_string(), Ty::Unknown);
+        top.unsure.insert(name.to_string());
     }
 
     /// A variable, net or port of type `t`.
@@ -2086,10 +2426,10 @@ impl<'a> Ck<'a> {
     /// operand of positive size.
     fn operand_errors(&self, e: &Expression, sized_sibling: bool, out: &mut Vec<(Span, String)>) {
         let zero = |x: &Expression| self.zero_width(x);
-        let operands = |xs: &[Expression], out: &mut Vec<(Span, String)>| {
+        let operands = |xs: &[Expression], unpacked: bool, out: &mut Vec<(Span, String)>| {
             let sized = xs.iter().any(|x| !zero(x));
             for x in xs {
-                if matches!(self.ty_of(x), Ty::Real { .. }) {
+                if !unpacked && matches!(self.ty_of(x), Ty::Real { .. }) {
                     out.push((
                         x.span,
                         "a real value cannot be an operand of a concatenation \
@@ -2101,7 +2441,7 @@ impl<'a> Ck<'a> {
             }
         };
         match &e.kind {
-            ExprKind::Concatenation(xs) => operands(xs, out),
+            ExprKind::Concatenation(xs) => operands(xs, self.unpacked_concat == Some(e.span), out),
             ExprKind::Replication { count, exprs } => {
                 match self.eval_const(count) {
                     Some(CVal::Xz) => out.push((
@@ -2135,7 +2475,7 @@ impl<'a> Ck<'a> {
                     }
                     _ => {}
                 }
-                operands(exprs, out);
+                operands(exprs, false, out);
             }
             ExprKind::SystemCall { name, args } => {
                 let size = match name.as_str() {
@@ -2279,11 +2619,13 @@ impl<'a> Ck<'a> {
                 self.walk_value(e, false)
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
-                self.walk_expr(rvalue);
+                let lt = self.ty_of(lvalue);
+                self.walk_rhs(&lt, rvalue);
                 self.check_assign(lvalue, rvalue);
             }
             StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
-                self.walk_expr(rvalue);
+                let lt = self.ty_of(lvalue);
+                self.walk_rhs(&lt, rvalue);
                 self.check_nba_target(lvalue);
                 self.check_assign(lvalue, rvalue);
             }
@@ -2375,11 +2717,9 @@ impl<'a> Ck<'a> {
                     self.check_const_dims(&d.name.name, data_type, &d.dimensions);
                     let vt = with_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
-                        self.walk_expr(init);
+                        self.walk_rhs(&vt, init);
                         self.check_value(&vt, init, || format!("'{}'", d.name.name));
                     }
-                    // A block-level `localparam` parses as a `static`
-                    // declaration, so such a name may be a constant.
                     if *lifetime == Some(Lifetime::Static) {
                         self.declare_unsure(&d.name.name, vt);
                     } else {
@@ -2390,10 +2730,27 @@ impl<'a> Ck<'a> {
                     }
                 }
             }
+            StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                let t = self.resolve(data_type);
+                for d in declarators {
+                    self.check_const_dims(&d.name.name, data_type, &d.dimensions);
+                    let vt = with_dims(t.clone(), &d.dimensions);
+                    if let Some(init) = &d.init {
+                        self.walk_expr(init);
+                        self.check_value(&vt, init, || format!("'{}'", d.name.name));
+                    }
+                    self.declare_unsure(&d.name.name, vt);
+                }
+            }
             StatementKind::Typedef(td) => self.declare_typedef(td),
             StatementKind::ProceduralContinuous(pc) => self.check_proc_continuous(pc),
             StatementKind::Return(Some(e)) => {
-                self.walk_expr(e);
+                let rt = self.ret.clone().unwrap_or(Ty::Unknown);
+                self.walk_rhs(&rt, e);
                 if let Some(rt) = self.ret.clone() {
                     self.check_value(&rt, e, || "the return value".to_string());
                 }
@@ -2474,6 +2831,24 @@ impl<'a> Ck<'a> {
     }
 
     fn walk_class(&mut self, c: &ClassDeclaration) {
+        self.push();
+        for p in &c.params {
+            self.declare_param(p);
+        }
+        if let Some(base) = &c.extends {
+            let args: Vec<Expression> = base
+                .args
+                .iter()
+                .map(|p| match p {
+                    xezim_core::ast::decl::ParamValue::Expr(e) => e.clone(),
+                    xezim_core::ast::decl::ParamValue::Type(t) => {
+                        Expression::new(ExprKind::TypeLiteral(Box::new(t.clone())), base.span)
+                    }
+                })
+                .collect();
+            self.check_class_type_args(&base.name.name, &args);
+        }
+        self.pop();
         if !c.params.is_empty() {
             return;
         }
@@ -2536,7 +2911,7 @@ impl<'a> Ck<'a> {
                         self.check_const_dims(&dc.name.name, &d.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
-                            self.walk_expr(init);
+                            self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
@@ -2547,14 +2922,15 @@ impl<'a> Ck<'a> {
                         self.check_const_dims(&dc.name.name, &n.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
-                            self.walk_expr(init);
+                            self.walk_rhs(&vt, init);
                             self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
                 }
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, r) in &ca.assignments {
-                        self.walk_expr(r);
+                        let lt = self.ty_of(l);
+                        self.walk_rhs(&lt, r);
                         self.check_cont_lvalue(l);
                         self.check_assign(l, r);
                     }
@@ -2577,19 +2953,70 @@ impl<'a> Ck<'a> {
                 ModuleItem::ClassDeclaration(c) => self.walk_class(c),
                 ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
                 ModuleItem::GenerateIf(g) => {
-                    for (_, items) in &g.branches {
-                        self.walk_block(items, None);
+                    let conds: Vec<Option<&Expression>> =
+                        g.branches.iter().map(|(c, _)| c.as_ref()).collect();
+                    let reach = match self.gen_sel {
+                        Some(sel) if !conds.iter().flatten().any(|c| self.names_gen_local(c)) => {
+                            sel.if_branches(&self.owner, &conds, &self.gen_reach)
+                        }
+                        _ => vec![self.gen_reach.clone(); conds.len()],
+                    };
+                    for ((_, items), reach) in g.branches.iter().zip(reach) {
+                        self.walk_branch(items, reach);
                     }
                 }
                 ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
                 ModuleItem::GenerateCase(g) => {
-                    for arm in &g.arms {
-                        self.walk_block(&arm.items, None);
+                    let arms: Vec<&[Expression]> =
+                        g.arms.iter().map(|a| a.values.as_slice()).collect();
+                    let reach = match self.gen_sel {
+                        Some(sel)
+                            if !self.names_gen_local(&g.selector)
+                                && !arms
+                                    .iter()
+                                    .flat_map(|a| a.iter())
+                                    .any(|v| self.names_gen_local(v)) =>
+                        {
+                            sel.case_arms(&self.owner, &g.selector, &arms, &self.gen_reach)
+                        }
+                        _ => vec![self.gen_reach.clone(); arms.len()],
+                    };
+                    for (arm, reach) in g.arms.iter().zip(reach) {
+                        self.walk_branch(&arm.items, reach);
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    /// A conditional generate branch, walked only when some instance in
+    /// `reach` elaborates it (§27.5), with its constructs decided for those.
+    fn walk_branch(&mut self, items: &[ModuleItem], reach: GenReach) {
+        if reach.as_ref().is_some_and(|r| r.is_empty()) {
+            return;
+        }
+        let outer = std::mem::replace(&mut self.gen_reach, reach);
+        self.walk_block(items, None);
+        self.gen_reach = outer;
+    }
+
+    /// Whether `e` reads a name declared inside a generate block or a genvar,
+    /// whose value the elaborated tables do not hold under its bare name.
+    fn names_gen_local(&self, e: &Expression) -> bool {
+        let mut local = false;
+        visit_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind
+                && let Some(seg) = h.path.first()
+            {
+                let n = seg.name.name.as_str();
+                local |= self.stack.iter().skip(self.body_depth).any(|l| {
+                    let s = l.get();
+                    s.vars.contains_key(n) || s.types.contains_key(n) || s.unsure.contains(n)
+                });
+            }
+        });
+        local
     }
 
     fn walk_block(&mut self, items: &[ModuleItem], genvar: Option<&str>) {
@@ -2674,6 +3101,14 @@ fn is_new_call(e: &Expression) -> bool {
             && h.path[0].name.name == "new")
 }
 
+/// `e` without enclosing parentheses.
+fn peel_parens(mut e: &Expression) -> &Expression {
+    while let ExprKind::Paren(inner) = &e.kind {
+        e = inner;
+    }
+    e
+}
+
 /// `C::new` / `C::new(args)`: the class it constructs.
 fn typed_new_class(e: &Expression) -> Option<&str> {
     let m = match &e.kind {
@@ -2726,6 +3161,14 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 
 /// Run the checks over every definition; returns the error messages.
 pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    check_with_selection(defs, elab, &GenerateSelection::new(elab))
+}
+
+pub(crate) fn check_with_selection(
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    gen_sel: &GenerateSelection<'_>,
+) -> Vec<String> {
     // Phase 0: class names (a name declared twice is ambiguous and ignored).
     let mut class_names: HashMap<String, usize> = HashMap::default();
     fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
@@ -2983,6 +3426,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Interface(m) => {
@@ -2999,6 +3444,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Program(m) => {
@@ -3015,6 +3462,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 for p in &m.params {
                     ck.check_param_values(p);
                 }
+                ck.gen_sel = Some(gen_sel);
+                ck.body_depth = ck.stack.len();
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Package(p) => {
@@ -3237,7 +3686,8 @@ pub(crate) fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression
         }
         ExprKind::Paren(x)
         | ExprKind::Specialization { base: x, .. }
-        | ExprKind::ShallowCopy { source: x } => visit_expr(x, f),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => visit_expr(x, f),
         ExprKind::WithClause { expr, filter } => {
             visit_expr(expr, f);
             visit_expr(filter, f);

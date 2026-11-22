@@ -335,8 +335,8 @@ impl<'a> Names<'a> {
             match self.step(&cur, seg) {
                 Step::Item => return Ok(()),
                 Step::Scope(s) => cur = s,
-                // §27.6: an unnamed generate block's implicit name. Its
-                // declarations are flattened into the enclosing scope.
+                // §27.6: an implicit block name the lint has no record of (a
+                // block of processes only). Core rejects one naming no block.
                 Step::Missing if implicit(&seg.name) => {}
                 Step::Missing => {
                     let declared = self
@@ -654,7 +654,8 @@ fn expr_refs(e: &Expression, out: &mut Vec<Ref>) {
         | ExprKind::MemberAccess { expr: x, .. }
         | ExprKind::RandomizeWith { call: x, .. }
         | ExprKind::Tagged { inner: Some(x), .. }
-        | ExprKind::ShallowCopy { source: x } => each(x),
+        | ExprKind::ShallowCopy { source: x }
+        | ExprKind::TypedPattern { pattern: x, .. } => each(x),
         ExprKind::Inside { expr, ranges } => {
             each(expr);
             ranges.iter().for_each(each);
@@ -851,7 +852,8 @@ impl Walker {
                     self.expr(x)
                 }
             },
-            StatementKind::VarDecl { declarators, .. } => {
+            StatementKind::VarDecl { declarators, .. }
+            | StatementKind::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     // In scope from its declarator on, its initializer included.
                     if let Some(l) = self.locals.last_mut() {
@@ -967,20 +969,21 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             let mut refs = Vec::new();
             expr_refs(&ca.lhs, &mut refs);
             expr_refs(&ca.rhs, &mut refs);
-            add(Rc::new(refs), scope.clone(), None, None);
+            add(Rc::new(refs), scope.to_string(), None, None);
         }
     }
+    let mut subr_memo: HashMap<usize, Rc<Vec<Ref>>> = HashMap::new();
     let subroutines = elab
         .tasks
         .iter()
-        .map(|(k, t)| (k, &t.ports, &t.items))
+        .map(|(k, t)| (k, &t.ports, &t.items, elab.deferred_task_bodies.get(k)))
         .chain(
             elab.functions
                 .as_map()
                 .iter()
-                .map(|(k, f)| (k, &f.ports, &f.items)),
+                .map(|(k, f)| (k, &f.ports, &f.items, elab.deferred_function_bodies.get(k))),
         );
-    for (key, ports, items) in subroutines {
+    for (key, ports, items, dctx) in subroutines {
         // A package subroutine cannot name the design hierarchy (§26.2).
         if key.contains("::")
             || elab.pkg_subr_owner.contains_key(key)
@@ -988,14 +991,23 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         {
             continue;
         }
-        let formals = ports.iter().map(|p| p.name.name.clone()).collect();
-        let stmts: Vec<&Statement> = items.iter().collect();
-        add(
-            body_refs(&stmts, formals),
-            parent(key).unwrap_or("").to_string(),
-            None,
-            None,
-        );
+        let scope = parent(key).unwrap_or("").to_string();
+        if let Some(dctx) = dctx {
+            let ptr = std::sync::Arc::as_ptr(items.as_arc()) as usize;
+            let refs = subr_memo
+                .entry(ptr)
+                .or_insert_with(|| {
+                    let formals = ports.iter().map(|p| p.name.name.clone()).collect();
+                    let stmts: Vec<&Statement> = items.iter().collect();
+                    body_refs(&stmts, formals)
+                })
+                .clone();
+            add(refs, scope, Some(dctx.ctx.owner.as_str()), Some(dctx.ctx.as_ref()));
+        } else {
+            let formals = ports.iter().map(|p| p.name.name.clone()).collect();
+            let stmts: Vec<&Statement> = items.iter().collect();
+            add(body_refs(&stmts, formals), scope, None, None);
+        }
     }
     for (key, body) in &elab.property_decls {
         let mut refs = Vec::new();
@@ -1035,7 +1047,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     for p in &elab.pending_cont_assign {
         if p.origin_span.is_some() {
             let mut refs = Vec::new();
-            expr_refs(&p.lhs_source, &mut refs);
+            expr_refs(&p.source_lhs(), &mut refs);
             expr_refs(&p.rhs_source, &mut refs);
             let scope = p.ctx.prefix.trim_end_matches('.').to_string();
             add(

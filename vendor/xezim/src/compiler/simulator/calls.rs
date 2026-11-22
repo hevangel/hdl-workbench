@@ -19,6 +19,15 @@ impl Simulator {
         let lexical = self.lexical_spec();
         let extracted = self.resolve_call_spec_params(Self::extract_call_spec(func), &lexical);
         if let Some((ref base, ref sig)) = extracted {
+            // §8.8/§13.5.1: constructor actuals precede the callee scope.
+            if matches!(&func.kind, ExprKind::MemberAccess { member, .. } if member.name == "new") {
+                let normalized = Self::strip_spec_shape(func);
+                if Self::typed_ctor_call(&normalized).is_some_and(|(prefix, _)| prefix == base)
+                    && let Some(v) = self.construct_typed_ctor(&format!("{base}#({sig})"), args)
+                {
+                    return v;
+                }
+            }
             self.ensure_spec_statics(base, sig);
         }
         // Execute the callee with `current_spec` = the CALLER'S spec so an
@@ -87,11 +96,84 @@ impl Simulator {
         None
     }
 
+    /// For a method call on a locator result (`q.find with (..).size()`,
+    /// `q.unique.size()`), materialize that result queue (§7.12.1) and
+    /// return it with the method name.
+    pub(super) fn locator_result_temp<'a>(
+        &mut self,
+        func: &'a Expression,
+    ) -> Option<(String, &'a str)> {
+        // `q.unique.size()` parses as one dotted identifier.
+        let dotted_recv;
+        let (recv, mname) = match &func.kind {
+            ExprKind::MemberAccess { expr: recv, member } if Self::ends_in_locator(recv) => {
+                (&**recv, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 3
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && Self::is_locator_method(&h.path[h.path.len() - 2].name.name) =>
+            {
+                let mut recv = h.clone();
+                recv.path.pop();
+                dotted_recv = Expression::new(ExprKind::Ident(recv), func.span);
+                (&dotted_recv, h.path[h.path.len() - 1].name.name.as_str())
+            }
+            _ => return None,
+        };
+        let (arr, lm, filter, iter) = self.locator_call(recv)?;
+        let tmp = format!("__xz_locator_{:p}", func);
+        let picks = self.locator_indices_named(&arr, &lm, filter.as_ref(), iter.as_deref());
+        self.materialize_locator(&tmp, &arr, &lm, &picks);
+        Some((tmp, mname))
+    }
+
     pub(super) fn eval_call_inner(&mut self, func: &Expression, args: &[Expression]) -> Value {
+        // §11.4.1, §7.8.7: a receiver's selects (`m[f()].push_back(x)`) are
+        // evaluated once; the dispatch below resolves the receiver several
+        // times, so a side-effecting select is folded to its value first.
+        if let ExprKind::MemberAccess { expr: recv, member } = &func.kind
+            && matches!(recv.kind, ExprKind::Index { .. })
+            && Self::lvalue_has_incdec_index(recv)
+            && let Some(frozen) = self.rewrite_lvalue_index_side_effects(recv)
+        {
+            let func = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(frozen),
+                    member: member.clone(),
+                },
+                func.span,
+            );
+            return self.eval_call_inner(&func, args);
+        }
         if let Some(key) = self.package_dpi_call_key(func) {
             if let Some(value) = self.exec_dpi_import_call(&key, args) {
                 return value;
             }
+        }
+        // §6.19.5: an enumeration method takes the enumeration from the
+        // receiver's declared type, whatever expression the receiver is.
+        match &func.kind {
+            ExprKind::MemberAccess { expr: recv, member }
+                if Self::is_enum_method(&member.name, args.len()) =>
+            {
+                if let Some(v) = self.enum_method_on_receiver(recv, &member.name, args) {
+                    return v;
+                }
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| {
+                        s.selects.is_empty() && Self::is_enum_method(&s.name.name, args.len())
+                    }) =>
+            {
+                let recv = self.method_receiver_expr(h, h.path.len() - 1);
+                let m = h.path[h.path.len() - 1].name.name.as_str();
+                if let Some(v) = self.enum_method_on_receiver(&recv, m, args) {
+                    return v;
+                }
+            }
+            _ => {}
         }
         // §7.5.2, §7.9.1, §7.10.2: a collection method on a function's
         // returned queue, dynamic or associative array (`f().size()`).
@@ -125,6 +207,12 @@ impl Simulator {
                 return v;
             }
         }
+        // §7.12.1, §7.10.2: a method on a locator call's result queue.
+        if let Some((tmp, mname)) = self.locator_result_temp(func)
+            && let Some(v) = self.eval_builtin_method(&tmp, mname, args)
+        {
+            return v;
+        }
         // Normalize away Specialization wrappers for dispatch shape-matching
         // (the `#(...)` text is retained in the original AST + `current_spec`
         // for per-spec static keying). Keeps pre-Specialization dispatch exact.
@@ -150,7 +238,13 @@ impl Simulator {
             {
                 let mut stripped = hier.clone();
                 stripped.path.remove(0);
-                stripped.cached_signal_id = std::cell::Cell::new(None);
+                if let Some(key) =
+                    self.pkg_qual_collection_key(&hier.path[0].name.name, &hier.path[1].name.name)
+                {
+                    stripped.path[0].name.name = key;
+                }
+                stripped.cached_resolved_name = crate::ast::cache::NameCache::new();
+                stripped.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 let f = Expression::new(ExprKind::Ident(stripped), func.span);
                 return self.eval_call_inner(&f, args);
             }
@@ -376,8 +470,10 @@ impl Simulator {
                         || self.module.arrays.contains_key(&recv_name))
                         // §8.4/§23.9: in a method, a property of `this`
                         // (`s.q` of a struct property `s`) hides a
-                        // same-named module variable.
-                        && !self.this_prop_hides(
+                        // same-named module variable; so does a scalar
+                        // formal or local of the running subroutine
+                        // (`str.len()` on a `string str` formal).
+                        && !self.scalar_hides_module_coll(
                             recv_name.split(['.', '[']).next().unwrap_or(&recv_name),
                         )
                     {
@@ -604,15 +700,19 @@ impl Simulator {
                         // that random variable, whatever value it holds. Its
                         // value used to be tried as a handle first, so an
                         // `id` holding 1 switched off object #1 instead.
-                        let this_scalar_prop = this_h.is_some_and(|th| {
+                        // A rand class-handle property is a random variable
+                        // of `this` too: only the handle's mode changes, not
+                        // that of the variables inside the object it holds.
+                        let this_rand_var = this_h.is_some_and(|th| {
                             !self
                                 .local_stack
                                 .last()
                                 .is_some_and(|f| f.contains_key(name))
                                 && self.object_declares_property(th, name)
-                                && self.prop_class_type(th, name).is_none()
+                                && (self.prop_class_type(th, name).is_none()
+                                    || (mname == "rand_mode" && self.prop_is_rand(th, name)))
                         });
-                        let h_val = if this_scalar_prop {
+                        let h_val = if this_rand_var {
                             0
                         } else {
                             self.eval_expr(expr).to_u64().unwrap_or(0) as usize
@@ -636,6 +736,11 @@ impl Simulator {
                             (None, None)
                         }
                     }
+                    // §18.8: `obj.arr[i].rand_mode(0)` names one element.
+                    ExprKind::Index { .. } => match self.rand_mode_element_target(expr) {
+                        Some((h, key)) => (Some(h), Some(key)),
+                        None => (None, None),
+                    },
                     _ => (None, None),
                 };
                 if let Some(h) = handle_opt {
@@ -660,7 +765,9 @@ impl Simulator {
                         };
                         let disabled = table.get(&h).is_some_and(|s| {
                             if let Some(ref n) = target_name {
+                                // An element is off with its whole array.
                                 s.contains(n)
+                                    || n.split_once('[').is_some_and(|(b, _)| s.contains(b))
                             } else {
                                 !s.is_empty()
                             }
@@ -1236,7 +1343,10 @@ impl Simulator {
                     if let Some(cn) = self.nested_index_name(expr) {
                         // Ensure the nested queue is registered so later
                         // index/foreach/concat reads resolve it.
-                        if matches!(mname, "push_back" | "push_front" | "insert") {
+                        // (A declared row is created by `eval_builtin_method`.)
+                        if matches!(mname, "push_back" | "push_front" | "insert")
+                            && !self.is_declared_row(&cn)
+                        {
                             self.module.dynamic_arrays.insert(cn.clone());
                             self.module.arrays.entry(cn.clone()).or_insert((0, 63, 32));
                         }
@@ -1862,10 +1972,8 @@ impl Simulator {
                 if self.is_static_method(&base_cls, &member.name) {
                     // §8.25: same as the flattened `req::get_type()` arm — a
                     // static method through a null receiver declared with a
-                    // SPECIALIZATION runs in that specialization's context
-                    // (the body's bare self-references denote the current
-                    // specialization). Seed `current_spec` from the declared
-                    // type; the live-object recovery inside
+                    // specialization uses its bound type parameters. Seed
+                    // `current_spec` from the declared type because
                     // `exec_static_method_via_object` cannot see a null handle.
                     let saved_spec = if handle == 0 {
                         // A variable receiver's declaration names its
@@ -1970,11 +2078,71 @@ impl Simulator {
                 }
                 return self.exec_method_call(handle, &member.name, args);
             }
+            // §8.4: a non-virtual method through a null receiver runs on the
+            // declared class (see `call_on_null_receiver`); it returned a
+            // silent zero here and ran nothing.
+            let recv_var = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    Some(h.path[0].name.name.clone())
+                }
+                _ => None,
+            };
+            // Only a receiver that is null: one whose value read as 0 here but
+            // that names a live object is left to the paths below.
+            if self.eval_handle_expr(expr).unwrap_or(0) == 0
+                && let Some(decl) = self.null_receiver_class(expr)
+                && let Some(v) = self.call_on_null_receiver_of(
+                    recv_var.as_deref(),
+                    &decl,
+                    &member.name,
+                    args,
+                )
+            {
+                return v;
+            }
         }
         // Handle hierarchical ident call: obj.f()
         if let ExprKind::Ident(hier) = &func.kind {
             let path = &hier.path;
             let len = path.len();
+
+            // §8.4: a class method named like a built-in array, string or
+            // enumeration method (`size`, `num`, `delete`), called through a
+            // null handle. The built-in dispatch below goes by the method's
+            // name and took the call for a method of a collection.
+            if len >= 2
+                && path[len - 1].selects.is_empty()
+                && Self::builtin_method_name(&path[len - 1].name.name)
+                && self
+                    .class_member_names()
+                    .methods
+                    .contains(path[len - 1].name.name.as_str())
+                // A plain variable receiver is a handle only when it is
+                // declared with a class type.
+                && (len > 2 || {
+                    let root = path[0].name.name.as_str();
+                    !self.module.queue_vars.contains(root)
+                        && !self.module.dynamic_arrays.contains(root)
+                        && !self.module.associative_arrays.contains_key(root)
+                        && self.class_of_var(root).is_some()
+                })
+            {
+                let recv = self.method_receiver_expr(hier, len - 1);
+                // Null for certain: the receiver's value itself (a chain
+                // through a static property has no handle to walk).
+                if self.eval_handle_expr(&recv).unwrap_or(0) == 0
+                    && self.eval_expr(&recv).to_u64() == Some(0)
+                    && let Some(decl) = self.null_receiver_class(&recv)
+                    && let Some(v) = self.call_on_null_receiver_of(
+                        (len == 2).then(|| path[0].name.name.as_str()),
+                        &decl,
+                        &path[len - 1].name.name,
+                        args,
+                    )
+                {
+                    return v;
+                }
+            }
 
             // §6.18/§8.23: resolve a plain typedef receiver before dispatching
             // Alias::member_type::method (or pkg::Alias::member_type::method).
@@ -2380,12 +2548,9 @@ impl Simulator {
                 let name = &path[0].name.name;
                 if name.starts_with('$') {
                     return match name.as_str() {
-                        "$time" => Value::from_u64(self.time_in_current_unit().round() as u64, 64),
+                        "$time" => Value::from_u64(self.rounded_time_in_current_unit(), 64),
                         "$realtime" => Value::from_f64(self.time_in_current_unit()),
-                        "$stime" => Value::from_u64(
-                            (self.time_in_current_unit().round() as u64) & 0xFFFF_FFFF,
-                            32,
-                        ),
+                        "$stime" => Value::from_u64(self.rounded_time_in_current_unit(), 32),
                         "$inferred_clock" | "$inferred_disable" if sv_parser::is_sv2023() => {
                             Value::from_u64(0, 1)
                         }
@@ -2512,6 +2677,12 @@ impl Simulator {
                             | "reverse"
                             | "shuffle"
                             | "unique"
+                            // §7.9.4-§7.9.7: the traversal methods of an
+                            // associative array take the same receiver.
+                            | "first"
+                            | "last"
+                            | "next"
+                            | "prev"
                     )
                 {
                     let arr = hier.path[hier.path.len() - 2].name.name.clone();
@@ -2545,20 +2716,12 @@ impl Simulator {
                                 .and_then(|v| v.to_u64())
                                 .unwrap_or(0) as usize;
                         }
-                        if handle != 0 {
-                            let cn = self
-                                .heap
-                                .get(handle)
-                                .and_then(|x| x.as_ref())
-                                .map(|i| i.class_name.clone());
-                            if let Some(cn) = cn {
-                                if self.class_assoc_member(&cn, &arr) {
-                                    let scoped = format!("{}#{}", handle, arr);
-                                    if let Some(res) = self.eval_builtin_method(&scoped, m, args) {
-                                        return res;
-                                    }
-                                }
-                            }
+                        // §8.9: a static collection of the object's class
+                        // is the class's one store (`handle_collection_name`).
+                        if let Some(scoped) = self.handle_collection_name(handle, &arr)
+                            && let Some(res) = self.eval_builtin_method(&scoped, m, args)
+                        {
+                            return res;
                         }
                     }
                     // A collection reached through a hierarchical path —
@@ -2625,23 +2788,39 @@ impl Simulator {
                 if matches!(method_name.as_str(), "rand_mode" | "constraint_mode") {
                     let mname = method_name.clone();
                     // Resolve obj_name to a heap handle.
+                    // §18.8/§18.9: the object is the one in the current
+                    // automatic frame, before any same-named design signal.
                     let h_val = self
-                        .get_signal_value_by_name(obj_name)
-                        .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        .eval_ident_handle(obj_name)
+                        .or_else(|| {
+                            self.get_signal_value_by_name(obj_name)
+                                .map(|v| v.to_u64().unwrap_or(0) as usize)
+                        })
                         .unwrap_or(0);
                     if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                         // Middle segments name the targeted prop/constraint;
                         // empty = whole-object mode.
+                        // §18.8: a select names one element (`arr[2]`).
                         let target_name: Option<String> = if hier.path.len() >= 3 {
-                            Some(
-                                hier.path[1..hier.path.len() - 1]
-                                    .iter()
-                                    .map(|s| s.name.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("."),
-                            )
+                            let mut parts = Vec::new();
+                            for seg in &hier.path[1..hier.path.len() - 1] {
+                                let mut part = seg.name.name.clone();
+                                for sel in &seg.selects {
+                                    let i = self.eval_expr(sel).to_i64().unwrap_or(0);
+                                    part.push_str(&format!("[{i}]"));
+                                }
+                                parts.push(part);
+                            }
+                            Some(parts.join("."))
                         } else {
                             None
+                        };
+                        let (h_val, target_name) = match target_name {
+                            Some(t) if t.contains('.') => {
+                                let (h, t) = self.rand_mode_owner(h_val, &t);
+                                (h, Some(t))
+                            }
+                            t => (h_val, t),
                         };
                         // §18.5.11: a static constraint block's mode is shared
                         // by every instance of the class — route it to the
@@ -2666,7 +2845,9 @@ impl Simulator {
                             };
                             let disabled = table.get(&h_val).is_some_and(|s| {
                                 if let Some(ref n) = target_name {
-                                    s.contains(n) || s.contains("*")
+                                    s.contains(n)
+                                        || s.contains("*")
+                                        || n.split_once('[').is_some_and(|(b, _)| s.contains(b))
                                 } else {
                                     !s.is_empty()
                                 }
@@ -2924,8 +3105,9 @@ impl Simulator {
                             root: None,
                             path: hier.path[..hier.path.len() - 1].to_vec(),
                             span: hier.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         func.span,
                     );
@@ -2977,9 +3159,16 @@ impl Simulator {
                         (self.eval_ident_handle(head).unwrap_or(0), 1)
                     };
                     let last_seg = hier.path.len() - 1;
+                    // The object holding the receiver property, when the walk
+                    // reaches the receiver itself (for its declared
+                    // specialization if the receiver is null).
+                    let mut receiver_owner: Option<usize> = None;
                     for (si, seg) in hier.path[loop_start..last_seg].iter().enumerate() {
                         if handle == 0 {
                             break;
+                        }
+                        if loop_start + si + 1 == last_seg {
+                            receiver_owner = Some(handle);
                         }
                         // §19.8: `cg.cp.get_coverage()` — the walk reached a
                         // covergroup and the next segment names one of its
@@ -2996,6 +3185,16 @@ impl Simulator {
                                 }
                             }
                         }
+                        // §8.14: a member a derived class redeclares is the
+                        // copy the declared class of the chain so far sees.
+                        if self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(&seg.name.name)
+                        {
+                            let view = self.path_view_class(&hier.path[..loop_start + si]);
+                            handle = self
+                                .member_handle_viewed(handle, &seg.name.name, view.as_deref())
+                                .unwrap_or(0);
+                            continue;
+                        }
                         handle = self
                             .heap
                             .get(handle)
@@ -3003,6 +3202,61 @@ impl Simulator {
                             .and_then(|i| i.properties.get(&seg.name.name))
                             .and_then(|v| v.to_u64())
                             .unwrap_or(0) as usize;
+                    }
+                    // §8.23: the walk ended at a NULL handle — an
+                    // unallocated intermediate object (`h.null_h.m()`). A
+                    // STATIC method needs no object, so dispatch it on the
+                    // receiver prefix's DECLARED class. Without this the
+                    // call fell through to path[0], which does not define
+                    // the method, and silently returned integer zero.
+                    if handle == 0 {
+                        let prefix: Vec<String> = hier.path[..last_seg]
+                            .iter()
+                            .map(|s| s.name.name.clone())
+                            .collect();
+                        let prefix_refs: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                        if let Some(decl_full) = self.dotted_name_declared_class(&prefix_refs) {
+                            let base_cls = decl_full
+                                .split('#')
+                                .next()
+                                .unwrap_or(&decl_full)
+                                .to_string();
+                            if self.is_static_method(&base_cls, method_name) {
+                                // §8.25: seed the specialization context from
+                                // the declared type, as the 2-segment arm does.
+                                // A property declared `P #(8) p8` names its
+                                // specialization in the owner's property
+                                // table, not in the flat type text.
+                                let owner_spec = receiver_owner.and_then(|o| {
+                                    self.cast_dest_property_type(
+                                        o,
+                                        &hier.path[last_seg - 1].name.name,
+                                    )
+                                    .and_then(|(_, spec, _)| spec)
+                                });
+                                let saved = owner_spec
+                                    .or_else(|| self.spec_for_null_receiver(None, &decl_full))
+                                    .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+                                let res = self.exec_static_method_via_object(
+                                    &base_cls,
+                                    method_name,
+                                    args,
+                                    0,
+                                );
+                                if let Some(prev) = saved {
+                                    self.current_spec = prev;
+                                }
+                                if let Some(res) = res {
+                                    return res;
+                                }
+                            }
+                            // §8.4: a non-virtual method of the declared class.
+                            if let Some(v) =
+                                self.call_on_null_receiver(&decl_full, method_name, args)
+                            {
+                                return v;
+                            }
+                        }
                     }
                     // The walked-to property may be a covergroup instance
                     // (`e.cg.sample()`, `e.cg.get_inst_coverage()`).
@@ -3074,7 +3328,20 @@ impl Simulator {
                             .flatten()
                             .and_then(|th| self.prop_class_type(th, obj_name))
                     });
-                    let base_cls = if handle != 0 {
+                    // §8.23: a static method is not virtual, so when the
+                    // DECLARED class's chain declares it, a live receiver of a
+                    // derived class still runs the declared class's method
+                    // (a derived class's same-named static hides it only for
+                    // receivers declared as the derived class).
+                    let declared_static = handle != 0
+                        && self
+                            .class_member_names()
+                            .static_methods
+                            .contains(method_name.as_str())
+                        && decl_cls_opt.as_ref().is_some_and(|d| {
+                            self.is_static_method(d.split('#').next().unwrap_or(d), method_name)
+                        });
+                    let base_cls = if handle != 0 && !declared_static {
                         self.heap
                             .get(handle)
                             .and_then(|o| o.as_ref())
@@ -3092,12 +3359,8 @@ impl Simulator {
                             // receiver whose declared type is a SPECIALIZATION
                             // (`req::get_type()` where req is declared
                             // `C#(T)` — `uvm_create_on`'s shape) runs in that
-                            // specialization's context: the body's bare
-                            // self-references (the `C` type argument of a
-                            // member typedef like
-                            // `uvm_object_registry#(C,"C") type_id`, written by
-                            // `uvm_object_utils(C)`) denote the CURRENT
-                            // specialization, not the default. The live-object
+                            // specialization's context for explicit type
+                            // arguments such as C#(T). The live-object
                             // spec recovery in `exec_static_method_via_object`
                             // cannot see a null handle, so seed `current_spec`
                             // from the DECLARED type here.
@@ -3300,12 +3563,21 @@ impl Simulator {
                     // ran nothing; the reference simulator reports the null
                     // dereference. A static method never needs the object.
                     if h == 0
-                        && hier.path.len() == 2
-                        && let Some(decl) = self.class_of_var(&hier.path[0].name.name)
+                        && let Some(decl) = self.null_receiver_class(&recv_expr)
                     {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        if let Some(v) = self.call_on_null_receiver_of(
+                            (hier.path.len() == 2).then(|| hier.path[0].name.name.as_str()),
+                            &decl,
+                            &mname,
+                            args,
+                        ) {
+                            return v;
+                        }
+                        // A virtual method: an illegal access (§8.4).
                         let base = decl.split('#').next().unwrap_or(&decl).to_string();
-                        let mname = hier.path[1].name.name.clone();
-                        if self.class_has_method(&base, &mname)
+                        if hier.path.len() == 2
+                            && self.class_has_method(&base, &mname)
                             && !self.is_static_method(&base, &mname)
                         {
                             self.report_null_handle_call(&mname);
@@ -3505,6 +3777,30 @@ impl Simulator {
                     return self.call_scoped_subroutine(&full, args);
                 }
             }
+            // §26.3: a bare call in a method of a class DECLARED inside a
+            // package binds to that package's own function/task — the class
+            // body scopes through its declaring package before the module
+            // instance scope (mirrors the ident fix in
+            // `resolve_hier_name_uncached`).
+            if hier.path.len() == 1
+                && let Some(pkg) = self
+                    .class_context_stack
+                    .last()
+                    .and_then(|c| c.as_ref())
+                    .and_then(|ctx| self.module.class_decl_pkg.get(ctx.as_str()))
+                    .map(ToOwned::to_owned)
+            {
+                let qual = format!("{}::{}", pkg, name);
+                if let Some(fd) = self.fn_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    return self.exec_function_call(&fd, args);
+                }
+                if let Some(td) = self.task_decl_rc(&qual) {
+                    self.pending_pkg_scope = Some(pkg.clone());
+                    self.exec_task_call(&td, args);
+                    return Value::zero(32);
+                }
+            }
             // Module-level function call
             if let Some(fd) = self.fn_decl_rc(name) {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
@@ -3519,6 +3815,16 @@ impl Simulator {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
+            }
+            // §18.12: a bare `randomize(…)` outside a class is the scope
+            // randomize function with its optional `std::` prefix left out.
+            // It names no declared subroutine, so it returned 0 unsolved.
+            if hier.root.is_none()
+                && hier.path.len() == 1
+                && name == "randomize"
+                && self.bare_randomize_is_scope_randomize()
+            {
+                return self.exec_std_randomize(args);
             }
             // A module-class method naming an instance subroutine that
             // resolved nowhere: report the skipped call instead of dropping
@@ -3541,5 +3847,13 @@ impl Simulator {
             }
         }
         Value::zero(32)
+    }
+
+    /// Whether a bare `randomize` call here is the §18.12 scope randomize
+    /// function (`std::randomize`): it is outside every class method, where
+    /// a bare call is `this.randomize` (§18.11).
+    pub(super) fn bare_randomize_is_scope_randomize(&self) -> bool {
+        !matches!(self.class_context_stack.last(), Some(Some(_)))
+            && !matches!(self.this_stack.last(), Some(Some(_)))
     }
 }

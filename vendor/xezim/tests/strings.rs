@@ -17,12 +17,16 @@ mod assoc_in_always_ff_and_string_element_methods;
 mod call_time_defaults_and_string_queries;
 #[path = "strings/class_member_string_queue_element_via_path.rs"]
 mod class_member_string_queue_element_via_path;
-#[path = "classes/compiled_method_test_env.rs"]
-mod compiled_method_test_env;
+#[path = "strings/class_member_string_queue_element_bytecode_compare.rs"]
+mod class_member_string_queue_element_bytecode_compare;
 #[path = "strings/compiled_sformatf_native.rs"]
 mod compiled_sformatf_native;
 #[path = "strings/display_only_always.rs"]
 mod display_only_always;
+#[path = "strings/dpi_actual_context_width.rs"]
+mod dpi_actual_context_width;
+#[path = "strings/dpi_c_sources.rs"]
+mod dpi_c_sources;
 #[path = "strings/dpi_child_module_import.rs"]
 mod dpi_child_module_import;
 #[path = "strings/dpi_export_task_waits.rs"]
@@ -31,22 +35,26 @@ mod dpi_export_task_waits;
 mod dpi_export_types;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_libc_import.rs"]
+mod dpi_libc_import;
 #[path = "strings/dpi_library_loading.rs"]
 mod dpi_library_loading;
 #[path = "strings/dpi_real_int_conversion.rs"]
 mod dpi_real_int_conversion;
 #[path = "strings/dpi_semantics.rs"]
 mod dpi_semantics;
-#[path = "strings/dpi_typedef_return.rs"]
-mod dpi_typedef_return;
 #[path = "strings/dpi_unit_scope.rs"]
 mod dpi_unit_scope;
 #[path = "strings/fixed_string_array_dims.rs"]
 mod fixed_string_array_dims;
 #[path = "strings/format_lrm_compliance.rs"]
 mod format_lrm_compliance;
+#[path = "strings/format_real_integral_889.rs"]
+mod format_real_integral_889;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
+#[path = "strings/fscanf_whitespace_directive_eof.rs"]
+mod fscanf_whitespace_directive_eof;
 #[path = "strings/fwrite_buffered_flush_points.rs"]
 mod fwrite_buffered_flush_points;
 #[path = "strings/fwrite_mcd_fd.rs"]
@@ -87,20 +95,24 @@ mod percent_p_string_values;
 mod ref_arg_assoc_writeback;
 #[path = "strings/ref_arg_collection_writeback.rs"]
 mod ref_arg_collection_writeback;
+#[path = "strings/review_vpi_unlabelled_block_data.rs"]
+mod review_vpi_unlabelled_block_data;
+#[path = "strings/scanf_four_state_digits.rs"]
+mod scanf_four_state_digits;
+#[path = "strings/string_eq_relational_2state.rs"]
+mod string_eq_relational_2state;
+#[path = "strings/string_index_write_frame_local.rs"]
+mod string_index_write_frame_local;
 #[path = "strings/string_char_index_write_followups.rs"]
 mod string_char_index_write_followups;
 #[path = "strings/string_char_receiver_shapes.rs"]
 mod string_char_receiver_shapes;
-#[path = "strings/string_char_select_signed.rs"]
-mod string_char_select_signed;
-#[path = "strings/string_eq_relational_2state.rs"]
-mod string_eq_relational_2state;
+#[path = "strings/task_string_formal_scope.rs"]
+mod task_string_formal_scope;
 #[path = "strings/string_flag_not_clobbered_by_samed_name_local.rs"]
 mod string_flag_not_clobbered_by_samed_name_local;
 #[path = "strings/string_index_ref_queue.rs"]
 mod string_index_ref_queue;
-#[path = "strings/string_index_write_frame_local.rs"]
-mod string_index_write_frame_local;
 #[path = "strings/string_is_dynamic.rs"]
 mod string_is_dynamic;
 #[path = "strings/string_methods_lrm.rs"]
@@ -109,30 +121,34 @@ mod string_methods_lrm;
 mod string_parameter_format;
 #[path = "strings/string_property_shadowed_by_local.rs"]
 mod string_property_shadowed_by_local;
-#[path = "strings/string_raw_bytes.rs"]
-mod string_raw_bytes;
 #[path = "strings/string_returning_fn_inline.rs"]
 mod string_returning_fn_inline;
 #[path = "strings/struct_elem_string_member_format.rs"]
 mod struct_elem_string_member_format;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
-#[path = "strings/task_string_formal_scope.rs"]
-mod task_string_formal_scope;
 #[path = "strings/uvm_dpi_driver_linkage.rs"]
 mod uvm_dpi_driver_linkage;
 #[path = "strings/uvm_dpi_user_library_wins.rs"]
 mod uvm_dpi_user_library_wins;
+#[path = "strings/vpi_array_elem_range.rs"]
+mod vpi_array_elem_range;
 #[path = "strings/vpi_array_ports.rs"]
 mod vpi_array_ports;
+#[path = "strings/vpi_assertion_controls.rs"]
+mod vpi_assertion_controls;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
+#[path = "strings/vpi_deposit_unchanged_driver.rs"]
+mod vpi_deposit_unchanged_driver;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]
 mod vpi_net_kinds;
 #[path = "strings/vpi_object_model_walk.rs"]
 mod vpi_object_model_walk;
+#[path = "strings/vpi_package_resolver_deposit.rs"]
+mod vpi_package_resolver_deposit;
 #[path = "strings/vpi_routines.rs"]
 mod vpi_routines;
 #[path = "strings/vpi_sva_sampling.rs"]
@@ -143,6 +159,14 @@ mod vpi_sva_time0;
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;
+#[path = "strings/dpi_typedef_return.rs"]
+mod dpi_typedef_return;
+#[path = "classes/compiled_method_test_env.rs"]
+mod compiled_method_test_env;
+#[path = "strings/string_char_select_signed.rs"]
+mod string_char_select_signed;
+#[path = "strings/string_raw_bytes.rs"]
+mod string_raw_bytes;
 
 #[path = "strings/vpi_clocking_357.rs"]
 mod vpi_clocking_357;
@@ -155,3 +179,10 @@ mod format_unknown_spec_no_eval;
 
 #[path = "strings/p_format_aggregates_566.rs"]
 mod p_format_aggregates_566;
+
+#[path = "strings/format_backslash_literal.rs"]
+mod format_backslash_literal;
+#[path = "strings/scan_zero_width.rs"]
+mod scan_zero_width;
+#[path = "strings/review_vpi_scoped_callee_deposit.rs"]
+mod review_vpi_scoped_callee_deposit;

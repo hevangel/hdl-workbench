@@ -24,20 +24,56 @@ Two crates in one repo:
 
 `xezim` consumes this repo as a **git dependency pinned by `rev`** — each
 xezim revision names the exact core revision it was tested against, so bare
-clones and release tags always build the verified pair. After pushing core
-changes that xezim depends on, bump both `rev = ...` fields in
-`../xezim/Cargo.toml` in the same xezim push. For local co-development run
-`../xezim/scripts/use-local-core.sh` once (plain `cargo build` then uses the
-local checkout, no network) — see "Modifying xezim-core" in
-`../xezim/README.md`. It is **not** a submodule. The simulators run **elaborated**
-designs, so most wrong-result bugs live in `xezim`'s VM — a change here only helps
-when the symptom is parse/elaboration/formatting.
+clones and release tags always build the verified pair. It is **not** a
+submodule. See "Keeping xezim and xezim-core in sync" below before pushing
+anything here. The simulators run **elaborated** designs, so most
+wrong-result bugs live in `xezim`'s VM — a change here only helps when the
+symptom is parse/elaboration/formatting.
 
 **One version for all three crates.** `xezim-core` (`Cargo.toml`), `sv-parser`
 (`xezim-parser/Cargo.toml`) and `xezim` (`../xezim/Cargo.toml`) always carry the
 same `version`. A release bumps all three in step: commit and push core first,
 then repin xezim to that core commit. `sv-parser` is not a separately versioned
 crate; never leave it behind.
+
+## Keeping xezim and xezim-core in sync
+
+The same section is in `../xezim/AGENTS.md`; change both together.
+
+- **The pin is the two `rev =` lines** in `../xezim/Cargo.toml`
+  (`xezim-core` and `sv-parser`). Both name the same full 40-character core
+  commit. `Cargo.lock` is git-ignored in xezim, so nothing else pins core.
+- **xezim CI builds the pinned core, not core `main`.** A core change is
+  untested by xezim CI, and invisible to xezim users, until the pin moves to
+  it. Core's own CI runs only the core and parser tests.
+- **Develop against the local checkout.** Run `../xezim/scripts/use-local-core.sh`
+  once; plain `cargo build`/`cargo test` in xezim then uses this checkout
+  through a git-ignored `.cargo/local-core.toml` `[patch]`, included by
+  the tracked `.cargo/config.toml` compiler configuration. `cargo tree -p xezim-core`
+  in xezim shows a path when the patch is active.
+- **Validate the exact commit you will pin.** Commit everything here first
+  (`git status` clean), then run this repo's tests (`cargo test` and
+  `cargo test --manifest-path xezim-parser/Cargo.toml`) and the full xezim
+  suite against it. Uncommitted core edits make the tested tree differ from
+  the pinned one.
+- **Push order:**
+  1. Push core to `main`.
+  2. In xezim, add a commit `Sync core revision` that changes only both
+     `rev =` lines to the pushed core `HEAD`
+     (`git -C ../xezim-core rev-parse HEAD`).
+  3. Check that the pin resolves without the local patch: move
+     `.cargo/local-core.toml` aside, run `cargo fetch` in xezim, put it back.
+  4. Push xezim, with the commits that need the new core in the same push.
+- **Never pin a core commit that is not on core's `origin/main`**
+  (`git -C ../xezim-core merge-base --is-ancestor <rev> origin/main`). A
+  local-only or force-pushed-away commit breaks every bare clone and CI run.
+  Never rewrite pushed core history for the same reason: old xezim pins
+  point into it.
+- **A core push that xezim does not need yet** (docs, a core-only test)
+  still gets a `Sync core revision` in the next xezim push, so the pin does
+  not fall behind `main`.
+- **Releases:** all three crates carry the same `version` (above). Push the
+  core version bump, then pin xezim to that commit in the release push.
 
 ## Repository map
 
@@ -68,9 +104,13 @@ xezim-parser/src/strict_check.rs  Additive negative-case lint (gated by --strict
 
 ## Build & test
 
-Toolchain: Rust **1.92** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
+Toolchain: Rust **1.100** MSRV (`rust-version` in `Cargo.toml`), edition 2024.
 CI (`test.yml`) runs core and parser tests separately; `msrv.yml` verifies
 both crates. The parser is a path dependency, not a workspace member.
+
+Native C/C++ builds use Clang and LLVM archive tools. Install `clang`,
+`clang++`, `llvm-ar` and `llvm-ranlib` on `PATH`. Linux x86_64 Rust links
+use Clang with the Rust toolchain's bundled LLD.
 
 ```bash
 cargo build                          # debug
@@ -122,10 +162,10 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
   this is the shared lib — declaring it here covers xezim, xezim-b, and every
   test binary. **Never add another `#[global_allocator]`.** A consumer opting
   out uses `xezim-core = { path = "../xezim-core", default-features = false }`.
-- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x32"`
+- **Artifact format versioning**: `XEZIM_BYTECODE_MAGIC = b"XEZIMBC\x46"`
   (`src/lib.rs`). The last byte is the serialized-format version. When you add
   or change a serialized field in `ElaboratedModule` (or any bincode-serialized
-  type), **bump the version byte** (`\x32` to `\x33`) and add one line to the
+  type), **bump the version byte** (for example, `\x40` to `\x41`) and add one line to the
   version-ladder comment above it, so stale `.xez` artifacts fail with a clear "recompile with
   current xezim" error instead of deserializing garbage.
 - **Artifacts are zstd-compressed bincode 2** (serde, standard configuration).
@@ -146,12 +186,22 @@ Keep that surface stable — `xezim` and `xezim-b` both depend on it.
 
 ## Coding conventions
 
-snake_case; Rust 2024 edition; MSRV 1.92 (`rust-version` in `Cargo.toml`);
+snake_case; Rust 2024 edition; MSRV 1.100 (`rust-version` in `Cargo.toml`);
 clippy-clean. Modules carry `//!` doc comments. Hard fixes get explanatory
 comments with **LRM § citations** (e.g. `§6.6.7`) and regression tests
 referencing the same section. User-facing errors are `Result<_, String>` /
 diagnostic strings; do not panic on user input. Prefer the smallest correct
 change and match the surrounding style.
+
+## Coordinating agents on GitHub
+
+When multiple agents are working on related tasks, use GitHub issues to
+coordinate across hosts. Before starting, check the issue and record which
+agent owns each task. Update the issue when work is blocked or changes hands.
+Link related issues and pull requests, including those in the sibling repository,
+so the next agent can find dependencies and test results.
+
+A single agent may skip this coordination.
 
 ## Workflows
 
@@ -195,5 +245,6 @@ citing the LRM § → document any new flag/env knob in the `xezim` README.
 ## Resources
 
 - `../xezim/AGENTS.md` — the interpreter/simulator repo this library feeds
-- `../xezim/docs/dev/*` — architecture, debugging, testing, gotchas
+- `../xezim/docs/building.md` ("Working on xezim-core"), `../xezim/CONTRIBUTING.md`
+  (test suites), `../xezim/docs/DEBUGGING.md`
 - `xezim-parser/` crate docs (`cargo doc -p sv-parser`) — lexer/parser/AST

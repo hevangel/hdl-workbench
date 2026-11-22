@@ -13,6 +13,8 @@
 
 #[path = "misc/always_timing_lint_forms.rs"]
 mod always_timing_lint_forms;
+#[path = "misc/cache_scope_regressions.rs"]
+mod cache_scope_regressions;
 #[path = "misc/ansi_net_port_procedural_assign.rs"]
 mod ansi_net_port_procedural_assign;
 #[path = "misc/argument_binding.rs"]
@@ -45,6 +47,8 @@ mod begin_keywords_noconfig;
 mod bind_upward_refs;
 #[path = "misc/blocking_task_call.rs"]
 mod blocking_task_call;
+#[path = "misc/broken_pipe_exit_status.rs"]
+mod broken_pipe_exit_status;
 #[path = "misc/c910_create_en_cont_assign.rs"]
 mod c910_create_en_cont_assign;
 #[path = "misc/c910_create_en_full_path.rs"]
@@ -57,6 +61,10 @@ mod chained_member_access;
 mod child_decl_init_and_wide_rand;
 #[path = "misc/cli_files.rs"]
 mod cli_files;
+#[path = "misc/cli_max_time_units.rs"]
+mod cli_max_time_units;
+#[path = "misc/command_file_runtime_argv.rs"]
+mod command_file_runtime_argv;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]
@@ -121,6 +129,8 @@ mod generate_item_restrictions;
 mod generate_loop_genvar;
 #[path = "misc/generate_region_contents.rs"]
 mod generate_region_contents;
+#[path = "misc/generate_scope_param_sized_array.rs"]
+mod generate_scope_param_sized_array;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
@@ -137,8 +147,14 @@ mod implicit_static_diagnostic;
 mod include_path_from_function_macro;
 #[path = "misc/init_reg_seed.rs"]
 mod init_reg_seed;
+#[path = "misc/inlined_call_caller_loop_constant.rs"]
+mod inlined_call_caller_loop_constant;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
+#[path = "misc/integral_time.rs"]
+mod integral_time;
+#[path = "misc/review_exact_time_reads.rs"]
+mod review_exact_time_reads;
 #[path = "misc/interconnect_and_var_ports.rs"]
 mod interconnect_and_var_ports;
 #[path = "misc/issue30_runner.rs"]
@@ -157,6 +173,8 @@ mod ivtest_tail2_cluster;
 mod ivtest_tail_cluster;
 #[path = "misc/library_flags.rs"]
 mod library_flags;
+#[path = "misc/local_name_geometry_leak_916.rs"]
+mod local_name_geometry_leak_916;
 #[path = "misc/local_shadow_select.rs"]
 mod local_shadow_select;
 #[path = "misc/log_redirect.rs"]
@@ -241,10 +259,16 @@ mod part_select_constant_bounds;
 mod part_select_negative_bound_compiled;
 #[path = "misc/placeholder_parameter_replication.rs"]
 mod placeholder_parameter_replication;
+#[path = "misc/port_conn_width_after_index.rs"]
+mod port_conn_width_after_index;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
+#[path = "misc/readmem_associative_array.rs"]
+mod readmem_associative_array;
 #[path = "misc/readmem_hierarchical_target.rs"]
 mod readmem_hierarchical_target;
+#[path = "misc/readmem_multidim.rs"]
+mod readmem_multidim;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
 #[path = "misc/reduce_loop_unroll.rs"]
@@ -265,8 +289,12 @@ mod shadow_name_matrix;
 mod simulation_version_banner;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
+#[path = "misc/struct_member_unselected_generate.rs"]
+mod struct_member_unselected_generate;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
+#[path = "misc/subroutine_body_port_packed_user_type.rs"]
+mod subroutine_body_port_packed_user_type;
 #[path = "misc/subroutine_port_redeclaration.rs"]
 mod subroutine_port_redeclaration;
 #[path = "misc/subroutine_port_type.rs"]
@@ -279,6 +307,8 @@ mod svtb_suite;
 mod system_task_value;
 #[path = "misc/time0_x_defaults.rs"]
 mod time0_x_defaults;
+#[path = "misc/unelaborated_top_port_connections.rs"]
+mod unelaborated_top_port_connections;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]
@@ -398,6 +428,8 @@ mod void_cast_operand;
 mod warm_cache_diag_replay;
 #[path = "misc/wildcard_import_conflict.rs"]
 mod wildcard_import_conflict;
+#[path = "misc/writemem_data_lines.rs"]
+mod writemem_data_lines;
 #[path = "misc/x_warn_switch.rs"]
 mod x_warn_switch;
 #[path = "misc/xselect_and_concat_flatten.rs"]
@@ -471,6 +503,12 @@ mod process_status_name;
 mod pure_fn_loops_compiled;
 #[path = "misc/queue_ref_formal_shadowing.rs"]
 mod queue_ref_formal_shadowing;
+#[path = "misc/ref_formal_actual_storage.rs"]
+mod ref_formal_actual_storage;
+#[path = "misc/ref_formal_struct_union_elements.rs"]
+mod ref_formal_struct_union_elements;
+#[path = "misc/rare_constraint_branches.rs"]
+mod rare_constraint_branches;
 #[path = "misc/recursive_function_in_continuous_assign.rs"]
 mod recursive_function_in_continuous_assign;
 #[path = "misc/ref_args_alias.rs"]
@@ -580,3 +618,79 @@ mod package_ref_signature;
 mod always_star_spacing;
 #[path = "misc/artifact_with_sources_738.rs"]
 mod artifact_with_sources_738;
+#[path = "misc/checkpoint_save_restore.rs"]
+mod checkpoint_save_restore;
+#[path = "misc/checkpoint_forked_process_bodies.rs"]
+mod checkpoint_forked_process_bodies;
+#[path = "misc/checkpoint_jit_display.rs"]
+mod checkpoint_jit_display;
+
+#[path = "misc/block_local_array_for_loop.rs"]
+mod block_local_array_for_loop;
+#[path = "misc/array_formal_element_types.rs"]
+mod array_formal_element_types;
+
+#[path = "misc/struct_resolver_scalarized.rs"]
+mod struct_resolver_scalarized;
+
+#[path = "misc/packed_comb_cache_844.rs"]
+mod packed_comb_cache_844;
+#[path = "misc/prepared_scope_memory_721.rs"]
+mod prepared_scope_memory_721;
+
+#[path = "misc/read_before_decl_819.rs"]
+mod read_before_decl_819;
+
+#[path = "misc/nonvhdl_issue_regressions.rs"]
+mod nonvhdl_issue_regressions;
+
+#[path = "misc/import_sized_dimension_895.rs"]
+mod import_sized_dimension_895;
+#[path = "misc/macro_actual_count_888.rs"]
+mod macro_actual_count_888;
+#[path = "misc/typed_localparam_dimension_894.rs"]
+mod typed_localparam_dimension_894;
+#[path = "misc/review_class_param_undeclared_888.rs"]
+mod review_class_param_undeclared_888;
+#[path = "misc/preprocessor_closed_pipe.rs"]
+mod preprocessor_closed_pipe;
+#[path = "misc/review_interconnect_element_types.rs"]
+mod review_interconnect_element_types;
+
+#[path = "misc/cli_worker_stack_1055.rs"]
+mod cli_worker_stack_1055;
+
+#[path = "misc/cli_address_space.rs"]
+mod cli_address_space;
+
+#[path = "misc/prepared_cache_driven_init.rs"]
+mod prepared_cache_driven_init;
+#[path = "misc/urandom_seed_input_1058.rs"]
+mod urandom_seed_input_1058;
+#[path = "misc/oom_trace.rs"]
+mod oom_trace;
+#[path = "misc/scope_randomize_without_std.rs"]
+mod scope_randomize_without_std;
+#[path = "misc/interconnect_array_drivers_1098.rs"]
+mod interconnect_array_drivers_1098;
+#[path = "misc/replication_signedness_1095.rs"]
+mod replication_signedness_1095;
+#[path = "misc/localparam_self_determined_1143.rs"]
+mod localparam_self_determined_1143;
+#[path = "misc/comb_timescale.rs"]
+mod comb_timescale;
+#[path = "misc/comb_batch_branches_1284.rs"]
+mod comb_batch_branches_1284;
+
+#[path = "misc/declaration_order_snapshots.rs"]
+mod declaration_order_snapshots;
+
+#[path = "misc/shared_procedural_bodies.rs"]
+mod shared_procedural_bodies;
+#[path = "misc/deferred_assertion_counts.rs"]
+mod deferred_assertion_counts;
+
+#[path = "misc/stringify_macro_chain.rs"]
+mod stringify_macro_chain;
+#[path = "misc/continuous_assign_time_scope.rs"]
+mod continuous_assign_time_scope;

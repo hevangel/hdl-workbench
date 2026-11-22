@@ -86,13 +86,13 @@ impl Simulator {
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
                 }
-                Insn::LoadProcessLocal(dest, _) => {
+                Insn::LoadProcessLocal(dest, _) | Insn::LoadProcessStatus(dest, _) => {
                     vm_regs[*dest as usize] = Value::new(1);
                 }
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -324,7 +324,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -401,22 +406,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -727,7 +720,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -770,12 +763,14 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
                 // These should never appear in parallel-eligible blocks
                 Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::BlockingAssign(..)
                 | Insn::BlockingAssignString(..)
                 | Insn::BlockingAssignRange(..)
@@ -818,6 +813,7 @@ impl Simulator {
         view: &mut [Value],
         signal_widths: &[u32],
         signal_signed: &[bool],
+        shortreal_signals: &HashSet<usize>,
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
         vm_regs: &mut Vec<Value>,
@@ -900,14 +896,14 @@ impl Simulator {
                     v.is_signed = true;
                     vm_regs[*dest as usize] = v;
                 }
-                Insn::LoadProcessLocal(dest, _) => {
+                Insn::LoadProcessLocal(dest, _) | Insn::LoadProcessStatus(dest, _) => {
                     vm_regs[*dest as usize] = Value::new(1);
                     unsupported = true;
                 }
                 Insn::Resize(reg, width) => {
                     let r = *reg as usize;
                     if vm_regs[r].width != *width {
-                        let resized = vm_regs[r].resize(*width);
+                        let resized = vm_regs[r].resize_for_assign(*width);
                         vm_regs[r] = resized;
                     }
                 }
@@ -1131,7 +1127,12 @@ impl Simulator {
                     if *n == 0 {
                         vm_regs[*d as usize] = Value::zero(0);
                     } else if *n == 1 {
-                        vm_regs[*d as usize] = val;
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let mut result = val;
+                        result.is_signed = false;
+                        vm_regs[*d as usize] = result;
                     } else {
                         let result = Value::concat_refs(std::iter::repeat_n(&val, *n as usize));
                         vm_regs[*d as usize] = result;
@@ -1202,22 +1203,10 @@ impl Simulator {
                             vm_regs[*else_r as usize] = vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if vm_regs[*cond as usize].has_unknown() {
-                        let t = &vm_regs[*then_r as usize];
-                        let e = &vm_regs[*else_r as usize];
-                        // §11.3.1: a real result can't hold X, so bit-merging the
-                        // branches reads their IEEE-754 bits as garbage (a real
-                        // 1000.0 came out as 4.65e18). Return a defined real value
-                        // (x condition → the else/false branch) instead.
-                        if t.is_real || e.is_real {
-                            e.clone()
-                        } else {
-                            t.merge_unknown(e)
-                        }
-                    } else if vm_regs[*cond as usize].is_true() {
-                        vm_regs[*then_r as usize].clone()
-                    } else {
-                        vm_regs[*else_r as usize].clone()
+                    let v = match vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => vm_regs[*then_r as usize].clone(),
+                        Some(false) => vm_regs[*else_r as usize].clone(),
+                        None => vm_regs[*then_r as usize].merge_unknown(&vm_regs[*else_r as usize]),
                     };
                     vm_regs[*dest as usize] = v;
                 }
@@ -1280,7 +1269,7 @@ impl Simulator {
                     // value's `is_fill` verbatim).
                     let sv = &vm_regs[*s as usize];
                     vm_regs[*d as usize] = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -1323,6 +1312,7 @@ impl Simulator {
                     vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -1380,6 +1370,13 @@ impl Simulator {
                     // (the source of the 522 is_signed repr_diffs).
                     let id = *sig_id;
                     let w = *width;
+                    if view[id].is_real && shortreal_signals.contains(&id) {
+                        let mut val = Value::from_f64(vm_regs[*val_reg as usize].to_f64() as f32 as f64);
+                        val.is_signed = signal_signed[id];
+                        comb_write_full!(id, val);
+                        pc += 1;
+                        continue;
+                    }
                     let mut handled = false;
                     if w > 0 && w <= 64 && signal_widths[id] == w {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -1515,7 +1512,12 @@ impl Simulator {
                             unsupported = true;
                             break;
                         }
-                        let val = vm_regs[*val_reg as usize].resize(*width);
+                        let rhs = &vm_regs[*val_reg as usize];
+                        let val = if shortreal_signals.contains(&eid) {
+                            Value::from_f64(rhs.to_f64() as f32 as f64)
+                        } else {
+                            rhs.resize(*width)
+                        };
                         comb_write_full!(eid, val);
                     }
                 }
@@ -1702,6 +1704,7 @@ impl Simulator {
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
+                | Insn::LoadDynElem(..)
                 | Insn::CovHit(..) => {
                     unsupported = true;
                 }
@@ -1812,15 +1815,20 @@ impl Simulator {
             return None;
         }
         let (p, n) = self.settle_entries_view;
-        let hint = if !p.is_null() && e < n {
+        let entry = if !p.is_null() && e < n {
             // SAFETY: the settle published the taken vector's buffer, which is
             // heap-stable and outlives this call (restored before returning).
-            unsafe { (*p.add(e)).cold.scope_hint.clone() }
+            Some(unsafe { &*p.add(e) })
         } else {
-            self.comb_entries
-                .get(e)
-                .and_then(|en| en.cold.scope_hint.clone())
+            self.comb_entries.get(e)
         };
+        let hint = entry.and_then(|en| en.cold.scope_hint.clone());
+        let is_always = entry.is_some_and(|en| {
+            matches!(
+                en.item,
+                CombItem::CompiledAlwaysBlock { .. } | CombItem::AlwaysBlock { .. }
+            )
+        });
         let prev_hint = self.name_resolve_hint.borrow().clone();
         let prev_ts = self.timescale_scope_override.take();
         self.set_m_block_scope(hint.as_deref());
@@ -1829,7 +1837,11 @@ impl Simulator {
         }
         // `$time`/`%t` in the fallback scale to the entry's module timescale,
         // as the four-state arm arranges.
-        self.timescale_scope_override = hint;
+        self.timescale_scope_override = if is_always {
+            Some(hint.unwrap_or_default())
+        } else {
+            hint
+        };
         Some((prev_hint, prev_ts))
     }
 
@@ -2139,11 +2151,27 @@ impl Simulator {
                 // time (§8.15 super / §8.20 non-virtual bare call): run
                 // the body via the hierarchy walk from that class —
                 // non-virtual, ctor chaining included.
+                if let Some(v) =
+                    self.vm_try_direct_call_from(handle, Some(start_class), method, base, n)
+                {
+                    self.vm_regs[*dest as usize] = v;
+                    self.vm_ret_coll = self.pending_ret_collection.clone();
+                    local_count += 1;
+                    return local_count;
+                }
                 let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                 let result = if handle == 0 {
-                    // Null receiver (unreachable for instance frames;
-                    // a static frame never lowers a scoped call).
-                    Value::zero(32)
+                    // §8.23: a null receiver still has a legally callable
+                    // STATIC target — a static method neither needs nor
+                    // references `this` (§8.7), so it resolves on the
+                    // declared class. §8.4: so does a non-virtual instance
+                    // method (see `call_on_null_receiver`).
+                    match self.call_on_null_receiver(start_class, method, &args) {
+                        Some(v) => v,
+                        None => self
+                            .exec_static_method_via_object(start_class, method, &args, 0)
+                            .unwrap_or_else(|| Value::zero(32)),
+                    }
                 } else {
                     self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                 };
@@ -2165,7 +2193,7 @@ impl Simulator {
                 // compiler bound to `P::name` names it outright; any other
                 // callee runs in its declaring scope.
                 let pkg = match &fd {
-                    Some(fd) => self.free_call_pkg(&fname.0, &fd.name.name.name),
+                    Some(fd) => self.free_call_pkg(&fname.0, fd),
                     None => None,
                 };
                 // Fast dispatch when this callee has a compiled block
@@ -2234,8 +2262,9 @@ impl Simulator {
                                     selects: Vec::new(),
                                 }],
                                 span: crate::ast::Span::dummy(),
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
+                                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                bound: crate::ast::binding::Bound::UNSET,
                             }),
                             crate::ast::Span::dummy(),
                         ));
@@ -2332,7 +2361,11 @@ impl Simulator {
                 self.class_static_set(class, prop, v);
             }
             Insn::ConstructObject(dest, class, arg_start, n_args) => {
-                let class: &str = &class.0;
+                // `class\0mask`: positions of empty actuals (defaults).
+                let (class, empty_mask): (&str, u64) = match class.0.split_once('\u{0}') {
+                    Some((c, m)) => (c, m.parse().unwrap_or(0)),
+                    None => (&class.0, 0),
+                };
                 // Step 9g: `new(args)` / bare `new` — §8.8 constructor
                 // of the baked DEFINING class. Allocation, property
                 // inits, and the ctor chain all stay in
@@ -2349,7 +2382,14 @@ impl Simulator {
                 }
                 let args: Vec<Expression> = argvals
                     .iter()
-                    .map(|v| self.value_method_arg_expr(v))
+                    .enumerate()
+                    .map(|(i, v)| {
+                        if i < 64 && empty_mask & (1 << i) != 0 {
+                            Expression::new(ExprKind::Empty, crate::ast::Span::dummy())
+                        } else {
+                            self.value_method_arg_expr(v)
+                        }
+                    })
                     .collect();
                 let v = if let Some(cd) = self.module.classes.get(class).cloned() {
                     self.instantiate_class(&cd, &args)
@@ -2366,7 +2406,7 @@ impl Simulator {
                 let n = *n_args as usize;
                 // Value-const actuals + row-2 write-back temps (the
                 // builtin arms read/eval them through the ordinary
-                // expression paths — §7.10.2.3 queue append, §15.5.5
+                // expression paths — §7.10.1 queue append, §15.5.5
                 // event keys, string keys — all carried).
                 let callee_class = self
                     .heap
@@ -2523,10 +2563,25 @@ impl Simulator {
                         // of `format!` — this runs once per element access on
                         // associative-array procedural loops.
                         let elem = Self::name_with_key(&an, &key);
-                        self.signals
-                            .get(&elem)
-                            .cloned()
-                            .unwrap_or_else(|| Value::zero(32))
+                        // §7.9 / §7.10.4: an element at or past a queue's or
+                        // dynamic array's current SIZE does not exist and
+                        // reads the element type's default. The store keeps
+                        // the cells a shrink (`delete()`, `delete(i)`,
+                        // `pop_*`) orphaned, so the map hit below returned
+                        // the retired element. Same default as this arm's
+                        // own miss path.
+                        let idx = idx_val.to_i64().unwrap_or(-1);
+                        if !self.is_associative_array(&an)
+                            && (idx < 0 || idx as u64 >= self.get_queue_size(&an))
+                        {
+                            self.coll_missing_elem_value(&an)
+                                .unwrap_or_else(|| Value::zero(32))
+                        } else {
+                            self.signals
+                                .get(&elem)
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(32))
+                        }
                     }
                     None => Value::zero(32),
                 };
@@ -2567,20 +2622,37 @@ impl Simulator {
                     let key = self.assoc_key_str(&an, &idx_val);
                     // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
                     let elem_name = Self::name_with_key(&an, &key);
-                    // Keep the established queue-unpack growth behavior in
-                    // sync with the AST path.
-                    if !self.is_associative_array(&an) {
-                        let kval = idx_val.to_i64().unwrap_or(0);
-                        if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
-                            self.set_queue_size(&an, kval as u64 + 1);
-                        }
+                    let is_assoc = self.is_associative_array(&an);
+                    if !is_assoc && self.prepare_sequence_write(&an, &idx_val).is_none() {
+                        return 1;
                     }
                     // §10.7: fit to the DECLARED element width when one
                     // was recorded; otherwise store as-is.
-                    let fitted = match self.assoc_elem_width(&an) {
+                    let mut fitted = match self.assoc_elem_width(&an) {
                         Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                         _ => val.clone(),
                     };
+                    // The element takes its declared signedness, not the RHS's
+                    // (`byte m[int]; m[k] = 8'hF0` is -16) — mirror the AST
+                    // store (`assignments.rs::assign_queue_elem_value`). The
+                    // compiled path dropped this, so a byte array element
+                    // written as a negative RHS stored unsigned 8'hFF and
+                    // later sign-RE-ad to 255.
+                    if is_assoc {
+                        if !fitted.is_real
+                            && let Some(sg) = self.assoc_elem_signed(&an)
+                        {
+                            fitted.is_signed = sg;
+                        }
+                    } else {
+                        // §7.10/§10.7: a queue or dynamic-array element takes
+                        // the element type (an `int unsigned` element of -1
+                        // is 2**32-1).
+                        fitted = self.fit_coll_store_elem(&an, fitted);
+                        if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                            fitted = self.fit_signed_class_coll_elem(&an, fitted);
+                        }
+                    }
                     let changed = self.signals.get(&elem_name) != Some(&fitted);
                     self.signals.insert(elem_name, fitted);
                     if changed {
@@ -2600,8 +2672,9 @@ impl Simulator {
                                         selects: Vec::new(),
                                     }],
                                     span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                    bound: crate::ast::binding::Bound::UNSET,
                                 }),
                                 crate::ast::Span::dummy(),
                             );
@@ -2734,7 +2807,7 @@ impl Simulator {
                     .iter()
                     .map(|key| {
                         if is_str {
-                            Value::from_string(key)
+                            Self::name_key_value(key)
                         } else {
                             let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
                             v.is_signed = ks_sign;
@@ -3002,6 +3075,16 @@ impl Simulator {
                         .unwrap_or_else(|| Value::new(1));
                     self.vm_regs[*dest as usize] = value;
                 }
+                Insn::LoadProcessStatus(dest, handle) => {
+                    let hreg = *handle as usize;
+                    let h = self.vm_regs[hreg].to_u64().unwrap_or(0);
+                    // A null (or non-process) handle reads like the
+                    // interpreter's `p.status` on it: the 32-bit zero of a
+                    // member read through a null handle, not RUNNING.
+                    let st =
+                        Self::proc_handle_to_pid(h).map_or(0, |pid| self.proc_status(pid) as u64);
+                    self.vm_regs[*dest as usize] = Value::from_u64(st, 32);
+                }
                 // class-perf tier-1 opcodes: read/write an object member off
                 // the heap, addressed by a register-held handle. `this` is
                 // held in the `this_handle` VM register slot that the method-
@@ -3089,13 +3172,22 @@ impl Simulator {
                         } else {
                             vr.inline_bits()
                         };
-                        match bits.and_then(|(v, x)| vm_resize_bits(v, x, cw, sg, w)) {
+                        // §11.8.3: widening a signed four-state value copies
+                        // its sign on both planes, including an x or z MSB.
+                        let resized = bits.and_then(|(v, x)| {
+                            if sg && w > cw && cw > 0 && x & (1u64 << (cw - 1)) != 0 {
+                                None
+                            } else {
+                                vm_resize_bits(v, x, cw, sg, w)
+                            }
+                        });
+                        match resized {
                             Some((nv, nx)) => {
                                 vr.set_inline_bits(nv, nx);
                                 vr.width = w;
                             }
                             None => {
-                                let resized = self.vm_regs[r].resize(w);
+                                let resized = self.vm_regs[r].resize_for_assign(w);
                                 self.vm_regs[r] = resized;
                             }
                         }
@@ -3489,10 +3581,13 @@ impl Simulator {
                     if n == 0 {
                         vm_store(&mut self.vm_regs[d], 0, 0, 0, false); // Value::zero(0)
                     } else if n == 1 {
-                        if d != s {
-                            let v = self.vm_regs[s].clone();
-                            self.vm_regs[d] = v;
-                        }
+                        // §11.8.1: "Concatenation results are unsigned, regardless
+                        // of the operands." `{1{x}}` is still a concatenation, so it
+                        // must not hand the operand's sign flag through.
+                        let v = self.vm_regs[s].clone();
+                        let mut result = v;
+                        result.is_signed = false;
+                        self.vm_regs[d] = result;
                     } else {
                         // `{n{x}}` used to build a `Vec<Value>` of `n` clones
                         // (a heap allocation each, for `Wide`) and hand it to
@@ -3534,7 +3629,7 @@ impl Simulator {
                     // skip preserves `is_fill` verbatim).
                     let sv = &self.vm_regs[*s as usize];
                     let nv = if sv.width != *w {
-                        sv.resize(*w)
+                        sv.resize_for_assign(*w)
                     } else {
                         sv.clone()
                     };
@@ -3650,22 +3745,10 @@ impl Simulator {
                                 self.vm_regs[*else_r as usize].resize(tw);
                         }
                     }
-                    let v = if self.vm_regs[*cond as usize].has_unknown() {
-                        let t = self.vm_regs[*then_r as usize].clone();
-                        let e = self.vm_regs[*else_r as usize].clone();
-                        // §11.3.1: a real result can't hold X — bit-merging the
-                        // branches would read their IEEE-754 bits as garbage.
-                        // Return a defined real value (else branch) when either
-                        // branch is real.
-                        if t.is_real || e.is_real {
-                            e
-                        } else {
-                            t.merge_unknown(&e)
-                        }
-                    } else if self.vm_regs[*cond as usize].is_true() {
-                        self.vm_regs[*then_r as usize].clone()
-                    } else {
-                        self.vm_regs[*else_r as usize].clone()
+                    let v = match self.vm_regs[*cond as usize].is_nonzero() {
+                        Some(true) => self.vm_regs[*then_r as usize].clone(),
+                        Some(false) => self.vm_regs[*else_r as usize].clone(),
+                        None => self.vm_regs[*then_r as usize].merge_unknown(&self.vm_regs[*else_r as usize]),
                     };
                     self.vm_regs[*dest as usize] = v;
                 }
@@ -4008,6 +4091,10 @@ impl Simulator {
                             }
                         }
                     }
+                }
+                Insn::LoadDynElem(dest, op, idx_reg) => {
+                    let v = self.load_dyn_elem(op, *idx_reg);
+                    self.vm_regs[*dest as usize] = v;
                 }
                 Insn::EvalExprFallback(payload, r, ctxw) => {
                     // Expression-level AST escape hatch: interpret one
@@ -4752,6 +4839,7 @@ impl Simulator {
                     self.vm_regs[*reg as usize].is_signed = false;
                 }
                 Insn::DropXz(reg) => drop_xz(&mut self.vm_regs[*reg as usize]),
+                Insn::RealToInt(reg) => real_to_int_reg(&mut self.vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);
@@ -4762,5 +4850,46 @@ impl Simulator {
             pc += 1;
         }
         self.prof_insns_executed += local_count;
+    }
+
+    /// `Insn::LoadDynElem`: element `idx_reg` of a design-scope dynamic array
+    /// or queue, read as the interpreter reads it (§7.5, §7.10, §7.4.6). An
+    /// index inside both the live size and the placeholder element cells
+    /// reads its cell, as the interpreter's own first lookup does; anything
+    /// else (an x index, past `size()`, past the cells) takes that same
+    /// interpreter read.
+    #[inline]
+    pub(super) fn load_dyn_elem(
+        &mut self,
+        op: &super::bytecode::DynElemOp,
+        idx_reg: super::bytecode::RegId,
+    ) -> Value {
+        let ir = &self.vm_regs[idx_reg as usize];
+        if let Some((first, lo, hi)) = op.cells
+            && !ir.has_xz()
+            && let (Some(i), Some(ix)) = (ir.to_i64(), ir.to_index())
+            && i >= 0
+            && ix >= lo
+            && ix <= hi
+            && *self.spec_static_coll_key(&op.name) == *op.name
+        {
+            let size = match self.signals.get(&*op.size_key) {
+                Some(v) => v.to_u64().unwrap_or(0),
+                None => self.get_queue_size(&op.name),
+            };
+            // `get_queue_size`'s clamp of a garbage size.
+            let size = if size > 1 << 26 { 0 } else { size };
+            let eid = first + (ix - lo) as usize;
+            if (i as u64) < size && !is_packed_id(eid) {
+                let mut v = self.signal_table[eid].clone();
+                if self.signal_signed[eid] {
+                    v.is_signed = true;
+                }
+                return v;
+            }
+        }
+        let idx_val = self.vm_regs[idx_reg as usize].clone();
+        let store = self.spec_static_coll_key(&op.name).into_owned();
+        self.coll_elem_read(&op.name, &store, idx_val, op.ctx_width)
     }
 }

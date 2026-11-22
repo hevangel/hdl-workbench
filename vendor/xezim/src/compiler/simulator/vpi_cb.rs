@@ -456,7 +456,7 @@ fn active_sim_ptr() -> *mut Simulator {
 
 /// A `vpiSimTime` / `vpiScaledRealTime` record as a tick count, scaled by the
 /// time unit of the registration obj.
-fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
+pub(super) fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
     if t.type_ == vpi::SCALED_REAL_TIME {
         let v = t.real * ticks_per_unit;
         if v > 0.0 { v.round() as u64 } else { 0 }
@@ -468,7 +468,7 @@ fn time_to_ticks(t: &s_vpi_time, ticks_per_unit: f64) -> u64 {
 /// Ticks per time unit of `obj` for vpiScaledRealTime: a module's own
 /// timeunit, else (NULL or any other object) the simulation's, which is the
 /// tick. Matches `vpi_get(vpiTimeUnit, obj)`.
-fn ticks_per_unit_of(sim: &Simulator, obj: *mut c_void) -> f64 {
+pub(super) fn ticks_per_unit_of(sim: &Simulator, obj: *mut c_void) -> f64 {
     let def = unsafe { vpi_deref(obj) }
         .filter(|h| h.kind == VpiKind::Module)
         .map(|h| h.def_name.clone());
@@ -627,7 +627,7 @@ impl Simulator {
 
     /// Flush `$display` output (only if anything was written since the last
     /// flush) and file writes, so a callback's `vpi_printf` lands after them.
-    fn vpi_sync_output(&mut self) {
+    pub(super) fn vpi_sync_output(&mut self) {
         if self.stdout_unsynced {
             self.stdout_unsynced = false;
             self.flush_stdout();
@@ -704,7 +704,11 @@ impl Simulator {
         // §16.5.1: the assertions tick in the slot of an edge a routine makes.
         self.vpi_observed();
         self.tick_clocking_blocks();
-        if self.clocking_mirror_dirty {
+        let edge_drove = std::mem::take(&mut self.clocking_edge_drive_dirty);
+        if edge_drove && self.dirty_any {
+            self.settle_combinatorial();
+        }
+        if self.clocking_mirror_dirty || edge_drove {
             self.clocking_mirror_dirty = false;
             let saved = self.edge_dispatch_phase;
             self.edge_dispatch_phase = "clocking-mirror";
@@ -810,6 +814,7 @@ impl Simulator {
                 if self.finished || self.zero_delay_defer_pending {
                     break;
                 }
+                self.drain_active_driver_updates();
                 self.drain_condition_waiters(true, false);
                 if self.event_queue.next_time() == Some(now) {
                     continue;
@@ -1135,12 +1140,12 @@ impl Simulator {
     }
 
     /// A `disable name` is executing in the current process.
-    pub(super) fn vpi_note_disable(&mut self, name: &str) {
+    pub(super) fn vpi_note_disable(&mut self, name: &str, fork_target: Option<&str>) {
         let leaf = scope_leaf(name);
         // Processes the disable terminates, as the Disable arm computes them.
         let mut affected: HashSet<usize> = HashSet::default();
         affected.insert(self.current_pid);
-        if let Some(children) = self.fork_block_children.get(name).cloned() {
+        if let Some(children) = fork_target.and_then(|key| self.fork_block_children.get(key)).cloned() {
             for c in children {
                 affected.insert(c);
                 affected.extend(self.collect_fork_descendants(c));
@@ -1397,11 +1402,15 @@ pub(super) fn vpi_notify_pli_error() {
 }
 
 /// `write_sig!` wrote a watched signal: report the change now, so the
-/// routine runs in the same region as the write.
+/// routine runs in the same region as the write. A write from inside a
+/// callback (`vpi_put_value` from a routine) is not reported from within
+/// it: the settle after the routine returns compares the watched values
+/// and reports the change in the same time slot. Calling a routine while
+/// another one runs aborts cocotb 1.x ("calling up again").
 #[cold]
 #[inline(never)]
 pub(super) fn vpi_vc_written(sp: *mut Simulator, sig: usize) {
-    if sp.is_null() {
+    if sp.is_null() || CB_DEPTH.with(|d| d.get()) > 0 {
         return;
     }
     let sim = unsafe { &mut *sp };
@@ -1786,7 +1795,10 @@ pub extern "C" fn vpi_remove_cb(cb_obj: *mut c_void) -> c_int {
     let sp = active_sim_ptr();
     if !sp.is_null() {
         let sim = unsafe { &mut *sp };
-        if sim.vpi_cb.entries.get(&id).is_some_and(|e| !e.internal) {
+        // An assertion callback (Clause 39.4.2, `vpi_assert.rs`).
+        if id & vpi_assert::CB_ID_BASE != 0 {
+            sim.vpi_assert_remove_cb(id);
+        } else if sim.vpi_cb.entries.get(&id).is_some_and(|e| !e.internal) {
             sim.vpi_cb_delete(id);
         }
     }

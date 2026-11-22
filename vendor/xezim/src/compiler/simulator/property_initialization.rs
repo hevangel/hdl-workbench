@@ -189,7 +189,7 @@ impl Simulator {
                 .properties
                 .get(&pname)
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base);
+                .and_then(|t| self.builtin_container_kind(t));
             let (is_new, ctor_args): (bool, &[Expression]) = match &init.kind {
                 ExprKind::Call { func, args } if matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new" && h.path[0].selects.is_empty()) => {
                     (true, args.as_slice())
@@ -283,6 +283,9 @@ impl Simulator {
                 }
                 continue;
             }
+            // §10.9: a typed pattern of an unpacked type initializes the
+            // property as an untyped one does.
+            let init = self.unpacked_pattern(init);
             // §7.9.11: an associative-array property's pattern
             // initializer (`int m[int] = '{1: 5, default: -1}`) fills the
             // per-instance store and records its default.
@@ -309,8 +312,66 @@ impl Simulator {
             };
             if is_queue_init {
                 let scoped_q = format!("{}#{}", handle, pname);
+                if let ExprKind::AssignmentPattern(items) = &init.kind
+                    && let Some(su) = self
+                        .collection_elem_struct(handle, &pname)
+                        .filter(Self::spreads_member_wise)
+                {
+                    // Calls, including ones nested in a pattern, read the queue before it grows. The resize drops a value stored earlier, so a saved call is written last.
+                    let base = prop_ident_expr(&pname);
+                    let mut calls = Vec::new();
+                    for (i, item) in items.iter().enumerate() {
+                        let e = item.expr();
+                        if !(matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false))
+                        {
+                            calls.push((i, self.eval_expr(e)));
+                        }
+                    }
+                    for (i, item) in items.iter().enumerate() {
+                        let e = item.expr();
+                        if matches!(e.kind, ExprKind::AssignmentPattern(_))
+                            || Self::cond_expr_is_effect_free(e, false)
+                        {
+                            let elem = Self::index_expr(&base, i as i64);
+                            self.assign_class_unpacked_elem(&elem, e, &su);
+                        }
+                    }
+                    self.set_queue_size(&scoped_q, items.len() as u64);
+                    for (i, v) in calls {
+                        self.set_signal_value_by_name(&format!("{scoped_q}[{i}]"), v);
+                    }
+                    continue;
+                }
                 self.populate_queue_from_init(&scoped_q, &init);
                 continue;
+            }
+            // §10.9.1: a pattern initializing a MULTIDIMENSIONAL fixed
+            // property (`int a2[2][2] = '{default: '{0: 1, default: 2}}`)
+            // spreads over every dimension into the element signals
+            // `<handle>#a2[i][j]`, as for a module array; evaluated as one
+            // value it wrote nothing those elements read. Elements that are
+            // unpacked structs keep the member-wise paths.
+            if cdef.array_nd_properties.contains_key(&pname)
+                && let ExprKind::AssignmentPattern(items) = &init.kind
+                && let Some(elem_dt) = self.class_prop_elem_type(cdef, &pname).cloned()
+                && !matches!(self.resolve_dt(&elem_dt), DataType::Struct(su) if Self::spreads_member_wise(&su))
+            {
+                let scoped = format!("{}#{}", handle, pname);
+                if let Some((dims, _)) = self.unpacked_decl_shape(&scoped) {
+                    let lists: Vec<Vec<i64>> = dims
+                        .iter()
+                        .map(|&(l, r)| {
+                            if l <= r {
+                                (l..=r).collect()
+                            } else {
+                                (r..=l).rev().collect()
+                            }
+                        })
+                        .collect();
+                    self.assign_pattern_items_over_dims(&scoped, &elem_dt, &lists, items);
+                    continue;
+                }
             }
             // Fixed-size UNPACKED array member initializer
             // (`int fa[4] = '{1,2,3,4}`): per-instance storage is the
@@ -341,35 +402,66 @@ impl Simulator {
                     // write now uses.
                     if let Some(su) = self.class_prop_struct(handle, &pname) {
                         if Self::spreads_member_wise(&su) {
-                            let base = Expression::new(
-                                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: pname.clone(),
-                                            span: crate::ast::Span::dummy(),
-                                        },
-                                        selects: Vec::new(),
-                                    }],
-                                    span: crate::ast::Span::dummy(),
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
-                                }),
-                                crate::ast::Span::dummy(),
-                            );
-                            let elems = self.pattern_elems(items, &indices);
+                            let base = prop_ident_expr(&pname);
+                            let prop_dt = cdef.property_types.get(&pname).cloned();
+                            let outer_types: Vec<(DataType, Expression)> = items
+                                .iter()
+                                .filter_map(|it| {
+                                    self.array_pattern_type_key(it)
+                                        .map(|(dt, e)| (dt, e.clone()))
+                                })
+                                .collect();
+                            let items_no_default: Vec<AssignmentPatternItem> = items
+                                .iter()
+                                .filter(|it| !matches!(it, AssignmentPatternItem::Default(_)))
+                                .cloned()
+                                .collect();
+                            let explicit_elems: Vec<bool> = match prop_dt.as_ref() {
+                                Some(dt) => self.pattern_elems_for_type(&items_no_default, &indices, dt),
+                                None => self.pattern_elems(&items_no_default, &indices),
+                            }
+                            .into_iter()
+                            .map(|e| e.is_some())
+                            .collect();
+                            let elems = match prop_dt.as_ref() {
+                                Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
+                                None => self.pattern_elems(items, &indices),
+                            };
                             let owned: Vec<(usize, Option<Expression>)> =
                                 elems.into_iter().map(|e| e.cloned()).enumerate().collect();
                             for (k, e) in owned {
-                                if let Some(e) = e {
-                                    let elem = Self::index_expr(&base, indices[k]);
-                                    self.assign_class_unpacked_elem(&elem, &e, &su);
-                                }
+                                let Some(e) = e.or_else(|| {
+                                    (!outer_types.is_empty()).then(|| {
+                                        Expression::new(
+                                            ExprKind::AssignmentPattern(Vec::new()),
+                                            init.span,
+                                        )
+                                    })
+                                }) else {
+                                    continue;
+                                };
+                                let elem = Self::index_expr(&base, indices[k]);
+                                let slot_outer: &[_] =
+                                    if explicit_elems.get(k).copied().unwrap_or(false) {
+                                        &[]
+                                    } else {
+                                        &outer_types
+                                    };
+                                self.assign_class_unpacked_elem_with_types(
+                                    &elem,
+                                    &e,
+                                    &su,
+                                    slot_outer,
+                                );
                             }
                             continue;
                         }
                     }
-                    let elems = self.pattern_elems(items, &indices);
+                    let prop_dt = cdef.property_types.get(&pname).cloned();
+                    let elems = match prop_dt.as_ref() {
+                        Some(dt) => self.pattern_elems_for_type(items, &indices, dt),
+                        None => self.pattern_elems(items, &indices),
+                    };
                     for (k, e) in elems.into_iter().enumerate() {
                         if let Some(e) = e {
                             let en = format!("{}[{}]", scoped, indices[k]);
@@ -393,7 +485,7 @@ impl Simulator {
             if let ExprKind::AssignmentPattern(items) = &init.kind
                 && let Some(su) = self
                     .class_prop_struct(handle, &pname)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
             {
                 let base =
                     Self::hier_ident_expr(Self::iface_path_segs(&pname, init.span), init.span);
@@ -427,7 +519,15 @@ impl Simulator {
                 }
             }
             let real = cdef.properties.get(&pname).is_some_and(|sig| sig.is_real);
-            self.evaluate_property_init_at_construct(handle, &slot, init, real);
+            // §10.8: a pattern takes the property's declared type.
+            let decl_ty = if has_pattern(&init) {
+                self.class_property_decl_type(&cdef.name, &pname)
+                    .filter(|(_, unpacked)| unpacked.is_empty())
+                    .map(|(dt, _)| dt)
+            } else {
+                None
+            };
+            self.evaluate_property_init_at_construct(handle, &slot, init, real, decl_ty);
         }
     }
 
@@ -439,6 +539,7 @@ impl Simulator {
         pname: &str,
         init: &Expression,
         real: bool,
+        decl_ty: Option<DataType>,
     ) {
         // An initializer may construct another object. Bound malformed
         // self-recursive declarations without re-running any initializer.
@@ -447,10 +548,11 @@ impl Simulator {
         }
         let width = self.heap_prop_width(handle, pname);
         self.construct_init_depth += 1;
-        let value = if let Some(width) = width {
-            self.eval_expr_ctx(init, width)
-        } else {
-            self.eval_expr(init)
+        let typed = decl_ty.and_then(|dt| self.eval_in_packed_type(init, &dt));
+        let value = match (typed, width) {
+            (Some(v), _) => v,
+            (None, Some(width)) => self.eval_expr_ctx(init, width),
+            (None, None) => self.eval_expr(init),
         };
         self.construct_init_depth -= 1;
         let value = if real {
@@ -465,4 +567,24 @@ impl Simulator {
             inst.properties.insert(pname.to_string(), value);
         }
     }
+}
+
+fn prop_ident_expr(name: &str) -> Expression {
+    Expression::new(
+        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.to_string(),
+                    span: crate::ast::Span::dummy(),
+                },
+                selects: Vec::new(),
+            }],
+            span: crate::ast::Span::dummy(),
+            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+            cached_resolved_name: crate::ast::cache::NameCache::new(),
+            bound: crate::ast::binding::Bound::UNSET,
+        }),
+        crate::ast::Span::dummy(),
+    )
 }

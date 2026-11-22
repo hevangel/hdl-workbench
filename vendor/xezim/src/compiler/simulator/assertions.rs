@@ -39,7 +39,11 @@ impl Simulator {
     /// in memory, which cost 0.6% more instructions on a design with 288
     /// named properties.
     pub(super) fn fold_named_sva_members(module: &mut ElaboratedModule) {
-        if !module.property_decls.values().any(Self::has_member_access) {
+        if !module
+            .property_decls
+            .values()
+            .any(|body| Self::has_member_access(body))
+        {
             return;
         }
         // §3.12.1: keep `$unit::x` where the scope shadows `x`, as the
@@ -58,7 +62,8 @@ impl Simulator {
                     &HashMap::default(),
                     &unit,
                     &HashMap::default(),
-                );
+                )
+                .into();
             }
         }
     }
@@ -200,13 +205,113 @@ impl Simulator {
         }
     }
 
+    /// §16.8, §16.12, §26.3: the `property_decls` key of the named sequence
+    /// or property a reference names: `name`, or `pkg::name` when it is
+    /// qualified by its package (as written, or as the elaborator spells a
+    /// reference to a name two packages declare), so each package keeps its
+    /// own body.
+    pub(super) fn sva_named_key(&self, e: &Expression) -> Option<String> {
+        let qualified = |pkg: &str, leaf: &str| {
+            let q = format!("{pkg}::{leaf}");
+            self.module.property_decls.contains_key(&q).then_some(q)
+        };
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                match h.path.as_slice() {
+                    [one] => Some(one.name.name.clone()),
+                    [pkg, leaf] => qualified(&pkg.name.name, &leaf.name.name),
+                    _ => None,
+                }
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    qualified(&h.path[0].name.name, &member.name)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// §16.8, §16.12: the actual argument of each formal of the named
+    /// sequence or property `key` in an instance with the arguments `args`:
+    /// bound by position or by name (`.x(a)`), and the declaration's default
+    /// actual argument for a formal the instance leaves out. A default may
+    /// name an earlier formal, which takes that formal's actual.
+    pub(super) fn sva_bind_actuals(
+        &self,
+        key: &str,
+        args: &[Expression],
+    ) -> HashMap<String, Expression> {
+        let formals: &[String] = self
+            .module
+            .property_params
+            .get(key)
+            .map_or(&[], |v| v.as_slice());
+        let mut map: HashMap<String, Expression> = HashMap::default();
+        for (i, a) in args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let Some(e) = expr
+                        && !matches!(e.kind, ExprKind::Empty)
+                    {
+                        map.insert(name.name.clone(), (**e).clone());
+                    }
+                }
+                ExprKind::Empty => {}
+                _ => {
+                    if let Some(f) = formals.get(i) {
+                        map.insert(f.clone(), a.clone());
+                    }
+                }
+            }
+        }
+        if let Some(defaults) = self.module.property_param_defaults.get(key) {
+            for (f, d) in formals.iter().zip(defaults) {
+                if let Some(d) = d
+                    && !map.contains_key(f)
+                {
+                    let d = super::elaborate::rewrite_expr(
+                        d,
+                        "",
+                        &map,
+                        &std::collections::HashSet::new(),
+                        &HashMap::default(),
+                    );
+                    map.insert(f.clone(), d);
+                }
+            }
+        }
+        map
+    }
+
+    /// §16.8: the body of the named sequence or property `key` for an
+    /// instance written without an argument list: each formal with a default
+    /// actual argument replaced by it.
+    pub(super) fn sva_body_with_defaults(&self, key: &str) -> Option<Expression> {
+        let body = self.module.property_decls.get(key)?;
+        if !self.module.property_param_defaults.contains_key(key) {
+            return Some(body.as_ref().clone());
+        }
+        let map = self.sva_bind_actuals(key, &[]);
+        Some(super::elaborate::rewrite_expr(
+            body,
+            "",
+            &map,
+            &std::collections::HashSet::new(),
+            &HashMap::default(),
+        ))
+    }
+
     pub(super) fn sva_expand_named(&self, e: &Expression, depth: u32) -> Expression {
         if depth > 16 {
             return e.clone();
         }
         match &e.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                let name = h.path[0].name.name.as_str();
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
+                if let Some(key) = self.sva_named_key(e) =>
+            {
+                let name = key.as_str();
                 if self.module.sequences.contains(name)
                     && self
                         .module
@@ -219,31 +324,24 @@ impl Simulator {
                         return self.sva_expand_named(&inner, depth + 1);
                     }
                 }
+                // §16.8: an instance without an argument list takes every
+                // default actual argument.
+                if self.module.sequences.contains(name)
+                    && self.module.property_param_defaults.contains_key(name)
+                    && let Some(body) = self.sva_body_with_defaults(name)
+                {
+                    let inner = Self::sva_unclocked(&body);
+                    return self.sva_expand_named(&inner, depth + 1);
+                }
                 e.clone()
             }
             // `s(x, y)`: a named sequence / property with formals — the
             // body with the actuals substituted.
             ExprKind::Call { func, args } => {
-                let name = match &func.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some(h.path[0].name.name.clone())
-                    }
-                    _ => None,
-                };
+                let name = self.sva_named_key(func);
                 if let Some(name) = name {
                     if let Some(body) = self.module.property_decls.get(&name).cloned() {
-                        let formals = self
-                            .module
-                            .property_params
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut map: HashMap<String, Expression> = HashMap::default();
-                        for (i, f) in formals.iter().enumerate() {
-                            if let Some(actual) = args.get(i) {
-                                map.insert(f.clone(), actual.clone());
-                            }
-                        }
+                        let map = self.sva_bind_actuals(&name, args);
                         let body = super::elaborate::rewrite_expr(
                             &body,
                             "",
@@ -571,12 +669,14 @@ impl Simulator {
             SvaNode::And(a, b)
             | SvaNode::Or(a, b)
             | SvaNode::Iff(a, b)
+            | SvaNode::Implies(a, b)
             | SvaNode::Until {
                 left: a, right: b, ..
             } => {
                 Self::sva_inject_init(a, init);
                 Self::sva_inject_init(b, init);
             }
+            SvaNode::Abort { body, .. } => Self::sva_inject_init(body, init),
             // Not modelled: initialisers ahead of `s_eventually` /
             // `s_always` of a boolean.
             SvaNode::Eventually(_) | SvaNode::Always(_) => {}
@@ -684,6 +784,24 @@ impl Simulator {
                     Box::new(self.sva_compile_node(right)),
                 )
             }
+            // §16.12.8 `p implies q`, kept by the parser as `$sva_implies(p, q)`.
+            ExprKind::SystemCall { name, args } if name == "$sva_implies" && args.len() == 2 => {
+                SvaNode::Implies(
+                    Box::new(self.sva_compile_node(&args[0])),
+                    Box::new(self.sva_compile_node(&args[1])),
+                )
+            }
+            // §16.12.14 abort properties, `$sva_<operator>(cond, body)`.
+            ExprKind::SystemCall { name, args }
+                if Self::sva_abort_marker(name) && args.len() == 2 =>
+            {
+                SvaNode::Abort {
+                    cond: args[0].clone(),
+                    accept: name.ends_with("accept_on"),
+                    sync: name.starts_with("$sva_sync_"),
+                    body: Box::new(self.sva_compile_node(&args[1])),
+                }
+            }
             // §16.12.2 `strong(seq)` / `weak(seq)` as a property.
             ExprKind::SystemCall { name, args }
                 if matches!(name.as_str(), "$sva_strong" | "$sva_weak") && args.len() == 1 =>
@@ -765,9 +883,22 @@ impl Simulator {
             (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
                 Self::sva_op_nonvacuous(ra, na, a) || Self::sva_op_nonvacuous(rb, nb, b)
             }
+            // §16.14.8 (z): `p implies q` is nonvacuous iff `p` holds
+            // nonvacuously and `q`'s attempt is nonvacuous.
+            (SvaNode::Implies(_, nb), SvaState::And { b, ra, rb, .. }) => {
+                *ra == Some(SvaOutcome::Pass) && Self::sva_op_nonvacuous(rb, nb, b)
+            }
             (SvaNode::Until { .. }, SvaState::Until { nonvacuous, .. }) => *nonvacuous,
             (SvaNode::Eventually(_), SvaState::Leaf(_))
             | (SvaNode::Always(_), SvaState::Leaf(_)) => true,
+            // §16.14.8: an aborted attempt is vacuous; otherwise the body's
+            // attempt decides.
+            (
+                SvaNode::Abort { body, .. },
+                SvaState::Abort {
+                    body: bst, aborted, ..
+                },
+            ) => !*aborted && Self::sva_attempt_nonvacuous(body, bst),
             _ => false,
         }
     }
@@ -801,6 +932,9 @@ impl Simulator {
             (SvaNode::Iff(na, nb), SvaState::And { a, b, ra, rb }) => {
                 Self::sva_op_fails(ra, na, a) != Self::sva_op_fails(rb, nb, b)
             }
+            (SvaNode::Implies(na, nb), SvaState::And { a, b, ra, rb }) => {
+                !Self::sva_op_fails(ra, na, a) && Self::sva_op_fails(rb, nb, b)
+            }
             (
                 SvaNode::Until {
                     left,
@@ -809,6 +943,11 @@ impl Simulator {
                 },
                 SvaState::Until { ticks, .. },
             ) => Self::sva_until_fails_at_end(left, right, *strong, ticks),
+            // §16.12.14: an abort in flight has its operand's result; one
+            // its condition settled is no longer in flight.
+            (SvaNode::Abort { body, .. }, SvaState::Abort { body: bst, .. }) => {
+                Self::sva_fails_at_end(body, bst)
+            }
             _ => false,
         }
     }
@@ -825,17 +964,25 @@ impl Simulator {
             let node = self.sva_sites[i].node.clone();
             let span_key = self.sva_sites[i].stat_key;
             let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let metas = self.sva_take_meta(i, attempts.len());
+            let settled = std::mem::take(&mut self.sva_sites[i].settled);
+            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
+            let prev_active = self.active_sva_site.replace(i);
+            // §16.12.14: an abort that settled an attempt after the last tick.
+            self.sva_report_outcomes(i, settled, settled_meta);
             if disabled {
                 self.finished = was_finished;
+                self.active_sva_site = prev_active;
                 continue;
             }
-            let n_fail = attempts
-                .iter()
-                .filter(|st| Self::sva_fails_at_end(&node, st))
-                .count();
-            let prev_active = self.active_sva_site.replace(i);
-            for _ in 0..n_fail {
-                self.sva_tally(i, span_key, false);
+            for (st, meta) in attempts.iter().zip(&metas) {
+                if Self::sva_fails_at_end(&node, st) {
+                    if self.vpi_assert_on {
+                        self.vpi_assert_fire(i, vpi_assert::CB_STEP_FAILURE, meta.start_time);
+                        self.vpi_assert_fire(i, vpi_assert::CB_FAILURE, meta.start_time);
+                    }
+                    self.sva_tally(i, span_key, false);
+                }
             }
             self.finished = was_finished;
             self.active_sva_site = prev_active;
@@ -861,7 +1008,18 @@ impl Simulator {
     pub(super) fn sva_cancel_disabled(&mut self, i: usize) -> bool {
         let disabled = self.sva_site_disabled(i);
         if disabled {
+            // IEEE 1800-2017 Clause 39: each attempt `disable iff` discards
+            // is a cbAssertionDisabledEvaluation.
+            if self.vpi_assert_on && !self.sva_sites[i].attempts.is_empty() {
+                let n = self.sva_sites[i].attempts.len();
+                let metas = self.sva_take_meta(i, n);
+                self.sva_sites[i].attempts.clear();
+                for meta in metas {
+                    self.vpi_assert_fire(i, vpi_assert::CB_DISABLED_EVALUATION, meta.start_time);
+                }
+            }
             self.sva_sites[i].attempts.clear();
+            self.sva_sites[i].attempt_meta.clear();
             self.sva_sites[i].matured.clear();
         }
         disabled
@@ -880,8 +1038,8 @@ impl Simulator {
             ExprKind::SystemCall { name, .. }
                 if matches!(
                     name.as_str(),
-                    "$sva_follow_overlap" | "$sva_follow_nonoverlap"
-                ) =>
+                    "$sva_follow_overlap" | "$sva_follow_nonoverlap" | "$sva_implies"
+                ) || Self::sva_abort_marker(name) =>
             {
                 true
             }
@@ -901,6 +1059,33 @@ impl Simulator {
                     || (matches!(op, UnaryOp::LogNot) && Self::sva_is_temporal(operand))
             }
             _ => false,
+        }
+    }
+
+    /// The markers the parser emits for the §16.12.14 abort properties.
+    pub(super) fn sva_abort_marker(name: &str) -> bool {
+        matches!(
+            name,
+            "$sva_accept_on" | "$sva_reject_on" | "$sva_sync_accept_on" | "$sva_sync_reject_on"
+        )
+    }
+
+    /// Whether a compiled property holds an asynchronous abort (§16.12.14).
+    pub(super) fn sva_has_async_abort(node: &SvaNode) -> bool {
+        match node {
+            SvaNode::Abort { sync, body, .. } => !*sync || Self::sva_has_async_abort(body),
+            SvaNode::Not(inner) => Self::sva_has_async_abort(inner),
+            SvaNode::Impl { cons, .. } | SvaNode::Followed { cons, .. } => {
+                Self::sva_has_async_abort(cons)
+            }
+            SvaNode::And(a, b)
+            | SvaNode::Or(a, b)
+            | SvaNode::Iff(a, b)
+            | SvaNode::Implies(a, b)
+            | SvaNode::Until {
+                left: a, right: b, ..
+            } => Self::sva_has_async_abort(a) || Self::sva_has_async_abort(b),
+            SvaNode::Seq(..) | SvaNode::Eventually(_) | SvaNode::Always(_) => false,
         }
     }
 
@@ -935,7 +1120,7 @@ impl Simulator {
                 nonvacuous: false,
                 cons: Vec::new(),
             },
-            SvaNode::And(a, b) | SvaNode::Iff(a, b) => SvaState::And {
+            SvaNode::And(a, b) | SvaNode::Iff(a, b) | SvaNode::Implies(a, b) => SvaState::And {
                 a: Box::new(Self::sva_new_state(a, env)),
                 b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
@@ -954,6 +1139,12 @@ impl Simulator {
                 closed: false,
             },
             SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
+            SvaNode::Abort { body, .. } => SvaState::Abort {
+                body: Box::new(Self::sva_new_state(body, env)),
+                env: env.clone(),
+                started: false,
+                aborted: false,
+            },
         }
     }
 
@@ -1284,8 +1475,15 @@ impl Simulator {
 
     /// Advance one attempt by one clock tick; `Some` when it is decided.
     pub(super) fn sva_advance(&mut self, node: &SvaNode, st: &mut SvaState) -> Option<SvaOutcome> {
+        // §16.12.14: between ticks (`sva_abort_step`) only an asynchronous
+        // abort condition is checked; sequences, delays and the strong
+        // leaves advance at ticks only.
+        let abort_step = self.sva_abort_step;
         match (node, st) {
             (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
+                if abort_step {
+                    return None;
+                }
                 let (m, alive) = self.sva_run_advance(nfa, run, true);
                 if !m.is_empty() {
                     Some(SvaOutcome::Pass)
@@ -1316,7 +1514,7 @@ impl Simulator {
                 // Every match of the antecedent starts one evaluation of the
                 // consequent, with the local variables of that match.
                 let mut fresh: Vec<SvaState> = Vec::new();
-                if *ante_alive {
+                if *ante_alive && !abort_step {
                     let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
                     if !m.is_empty() {
@@ -1331,7 +1529,9 @@ impl Simulator {
                 let mut failed = false;
                 let mut keep: Vec<(u32, SvaState)> = Vec::new();
                 for (mut delay, mut cst) in cons.drain(..) {
-                    if delay > 0 {
+                    // A consequent waiting for its first tick has not
+                    // started: an abort step leaves it alone.
+                    if delay > 0 && !abort_step {
                         delay -= 1;
                     }
                     if delay > 0 {
@@ -1403,7 +1603,7 @@ impl Simulator {
                 // Unlike implication, one successful match suffices. Failure of
                 // one consequent must not discard other possible match points.
                 let mut fresh = Vec::new();
-                if *ante_alive {
+                if *ante_alive && !abort_step {
                     let (matches, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
                     for env in matches {
@@ -1416,7 +1616,9 @@ impl Simulator {
                 let mut vacuous = false;
                 let mut keep = Vec::new();
                 for (mut delay, mut cst) in cons.drain(..) {
-                    delay = delay.saturating_sub(1);
+                    if !abort_step {
+                        delay = delay.saturating_sub(1);
+                    }
                     if delay > 0 {
                         keep.push((delay, cst));
                         continue;
@@ -1546,6 +1748,26 @@ impl Simulator {
                     _ => None,
                 }
             }
+            // §16.12.8: `p implies q` evaluates both from this tick. A
+            // failing `p` decides it as a vacuous success (§16.14.8 z);
+            // otherwise `q` decides it, nonvacuous only when both are.
+            (SvaNode::Implies(na, nb), SvaState::And { a, b, ra, rb }) => {
+                if ra.is_none() {
+                    *ra = self.sva_advance(na, a);
+                }
+                if *ra == Some(SvaOutcome::Fail) {
+                    return Some(SvaOutcome::Vacuous);
+                }
+                if rb.is_none() {
+                    *rb = self.sva_advance(nb, b);
+                }
+                match (*ra, *rb) {
+                    (Some(_), Some(SvaOutcome::Fail)) => Some(SvaOutcome::Fail),
+                    (Some(SvaOutcome::Pass), Some(SvaOutcome::Pass)) => Some(SvaOutcome::Pass),
+                    (Some(_), Some(_)) => Some(SvaOutcome::Vacuous),
+                    _ => None,
+                }
+            }
             (
                 SvaNode::Until { left, right, .. },
                 SvaState::Until {
@@ -1556,21 +1778,160 @@ impl Simulator {
                 },
             ) => self.sva_advance_until(left, right, env, nonvacuous, ticks, closed),
             (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
-                if self.sva_eval_env(e, env).is_true() {
+                if !abort_step && self.sva_eval_env(e, env).is_true() {
                     Some(SvaOutcome::Pass)
                 } else {
                     None
                 }
             }
             (SvaNode::Always(e), SvaState::Leaf(env)) => {
-                if self.sva_eval_env(e, env).is_true() {
+                if abort_step || self.sva_eval_env(e, env).is_true() {
                     None
                 } else {
                     Some(SvaOutcome::Fail)
                 }
             }
+            // §16.12.14: the condition's sampled value, at a tick or (for
+            // `accept_on` / `reject_on`) in a time step between ticks,
+            // settles the evaluation without advancing the body in that
+            // time step: an abort takes precedence over the body's result,
+            // and an outer abort over an inner one (lexical order). An
+            // inner abort that settled the body earlier ended its
+            // evaluation, so a later outer condition no longer applies. An
+            // accept is a vacuous success (§16.14.8 ab-ae).
+            //
+            // Annex F.5.3.1: an abort in time step i settles the evaluation
+            // on the steps before i, continued as if every Boolean held
+            // (accept) or none did (reject). At the first tick nothing
+            // precedes it, so the operand decides structurally: an implication
+            // holds when nothing matches its antecedent, so `reject_on (rst)
+            // req |=> ack` is not rejected at the tick it starts in while
+            // `rst` holds; the attempt goes on (vacuous when `req` is 0).
+            (
+                SvaNode::Abort {
+                    cond,
+                    accept,
+                    sync,
+                    body,
+                },
+                SvaState::Abort {
+                    body: bst,
+                    env,
+                    started,
+                    aborted,
+                },
+            ) => {
+                let first = !*started;
+                *started |= !abort_step;
+                if !(abort_step && *sync)
+                    && (!first
+                        || if *accept {
+                            Self::sva_holds_on(body, true)
+                        } else {
+                            !Self::sva_holds_on(body, false)
+                        })
+                    && self.sva_eval_env(cond, env).is_true()
+                {
+                    *aborted = true;
+                    return Some(if *accept {
+                        SvaOutcome::Vacuous
+                    } else {
+                        SvaOutcome::Fail
+                    });
+                }
+                self.sva_advance(body, bst)
+            }
             _ => Some(SvaOutcome::Vacuous),
         }
+    }
+
+    /// Annex F.5.3.1: whether a fresh evaluation of `node` holds on a word
+    /// whose every letter satisfies every Boolean (`top`) or none (`!top`).
+    /// A sequence matches only on the first; an implication holds on the
+    /// second because its antecedent cannot match.
+    pub(super) fn sva_holds_on(node: &SvaNode, top: bool) -> bool {
+        match node {
+            SvaNode::Seq(..) | SvaNode::Eventually(_) | SvaNode::Always(_) => top,
+            SvaNode::Impl { cons, .. } | SvaNode::Followed { cons, .. } => {
+                let follows = matches!(node, SvaNode::Followed { .. });
+                if top {
+                    Self::sva_holds_on(cons, true)
+                } else {
+                    !follows
+                }
+            }
+            SvaNode::Not(inner) => !Self::sva_holds_on(inner, !top),
+            SvaNode::And(a, b) => Self::sva_holds_on(a, top) && Self::sva_holds_on(b, top),
+            SvaNode::Or(a, b) => Self::sva_holds_on(a, top) || Self::sva_holds_on(b, top),
+            SvaNode::Iff(a, b) => Self::sva_holds_on(a, top) == Self::sva_holds_on(b, top),
+            SvaNode::Implies(a, b) => !Self::sva_holds_on(a, top) || Self::sva_holds_on(b, top),
+            SvaNode::Until {
+                left,
+                right,
+                strong,
+            } => Self::sva_holds_on(right, top) || (!*strong && Self::sva_holds_on(left, top)),
+            // An accept holds on either word exactly when its operand does,
+            // and so does a reject: `reject_on(b) p` is `not accept_on(b)
+            // not p`, whose `not` turns the word into the other one.
+            SvaNode::Abort { body, .. } => Self::sva_holds_on(body, top),
+        }
+    }
+
+    /// §16.12.14: in a time step without a tick of site `i`, check the
+    /// asynchronous abort conditions of its attempts with sampled values
+    /// (`accept_on` and `reject_on` are evaluated at the granularity of the
+    /// time step). Only evaluations that have started are checked: a
+    /// nonoverlapped consequent waiting for its first tick has not. An
+    /// attempt an abort settles is reported at the next tick, with that
+    /// tick's results, or at the end of simulation.
+    fn sva_abort_step_site(&mut self, i: usize) {
+        let node = self.sva_sites[i].node.clone();
+        let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
+        let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+        let metas = self.sva_take_meta(i, attempts.len());
+        let prev_active = self.active_sva_site.replace(i);
+        let prev_scope = self.activation_scope.borrow().clone();
+        *self.activation_scope.borrow_mut() = Some(self.sva_sites[i].scope.clone());
+        let saved = self.install_preponed(&sampled_ids);
+        self.sva_abort_step = true;
+        let mut settled = Vec::new();
+        let mut settled_meta = Vec::new();
+        let mut live_meta = Vec::with_capacity(metas.len());
+        let mut k = 0;
+        attempts.retain_mut(|st| {
+            let meta = metas[k];
+            k += 1;
+            match self.sva_advance(&node, st) {
+                Some(r) => {
+                    settled.push(r);
+                    settled_meta.push(meta);
+                    false
+                }
+                None => {
+                    live_meta.push(meta);
+                    true
+                }
+            }
+        });
+        self.sva_abort_step = false;
+        self.restore_preponed(saved);
+        self.sva_sites[i].attempts = attempts;
+        self.sva_sites[i].attempt_meta = live_meta;
+        // The metas of the attempts already settled, in step with them.
+        let n_settled = self.sva_sites[i].settled.len();
+        let now = self.time;
+        self.sva_sites[i].settled_meta.resize(
+            n_settled,
+            SvaAttemptMeta {
+                start_time: now,
+                clock_steps: 0,
+            },
+        );
+        self.sva_sites[i].settled.extend(settled);
+        self.sva_sites[i].settled_meta.extend(settled_meta);
+        self.sva_sites[i].sampled_ids = sampled_ids;
+        self.active_sva_site = prev_active;
+        *self.activation_scope.borrow_mut() = prev_scope;
     }
 
     fn sva_event_value(&mut self, event: &SvaClockEvent) -> Value {
@@ -1804,6 +2165,7 @@ impl Simulator {
         };
         let stat_key = Self::assert_stat_key(span_key, src);
         self.note_assert_label(stat_key, label);
+        let async_abort = Self::sva_has_async_abort(&node);
         self.sva_sites.push(SvaClockedSite {
             span_key,
             stat_key,
@@ -1816,9 +2178,13 @@ impl Simulator {
             events: clock_events,
             past_names,
             node: std::sync::Arc::new(node),
+            async_abort,
+            settled: Vec::new(),
             disable,
             fired: false,
             attempts: Vec::new(),
+            attempt_meta: Vec::new(),
+            settled_meta: Vec::new(),
             past_snapshots: HashMap::default(),
             pass_action: a.action.as_deref().cloned(),
             fail_action: a.else_action.as_deref().cloned(),
@@ -1891,19 +2257,19 @@ impl Simulator {
         stat.kind = kind;
         if outcome {
             stat.pass_count += 1;
-            self.fire_sva_action(site_idx, true);
+            self.fire_sva_action(site_idx, true, false);
         } else if kind != 2 {
             stat.fail_count += 1;
-            self.fire_sva_action(site_idx, false);
+            self.fire_sva_action(site_idx, false, false);
         }
     }
 
-    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+    pub(super) fn fire_sva_action(&mut self, site_idx: usize, passed: bool, vacuous: bool) {
         // §20.12 PassOff/FailOff, decided when the attempt finishes.
         if self.assert_ctl_on {
             let st = self.sva_site_ctl(site_idx);
             if !(if passed {
-                st.pass_action(false)
+                st.pass_action(vacuous)
             } else {
                 st.fail_action()
             }) {
@@ -2405,7 +2771,7 @@ impl Simulator {
                 self.sva_collect_action_sampled_expr(lvalue, out, sels);
                 self.sva_collect_action_sampled_expr(rvalue, out, sels);
             }
-            SK::VarDecl { declarators, .. } => {
+            SK::VarDecl { declarators, .. } | SK::ParamDecl { declarators, .. } => {
                 for d in declarators {
                     if let Some(init) = &d.init {
                         self.sva_collect_action_sampled_expr(init, out, sels);
@@ -2501,6 +2867,9 @@ impl Simulator {
                     self.sva_collect_action_sampled_expr(item.expr(), out, sels);
                 }
             }
+            ExprKind::TypedPattern { pattern, .. } => {
+                self.sva_collect_action_sampled_expr(pattern, out, sels)
+            }
             ExprKind::NamedArg {
                 expr: Some(expr), ..
             } => self.sva_collect_action_sampled_expr(expr, out, sels),
@@ -2528,29 +2897,41 @@ impl Simulator {
             return;
         }
         self.clocking_preponed_slot = Some(self.time);
-        let names: Vec<String> = self
-            .clocking_meta
-            .values()
-            .flat_map(|(_, sigs)| {
-                sigs.iter()
-                    .filter(|(_, is_input)| *is_input)
-                    .map(|(n, _)| n.clone())
-            })
-            .collect();
-        for n in names {
-            // §14.3: an unpacked-array clockvar has no signal of its own;
-            // its elements are sampled one by one.
-            if let Some(elems) = self.clocking_array_elems(&n) {
-                for (_, e) in elems {
-                    if let Some(v) = self.get_signal_value_by_name(&e) {
-                        self.clocking_preponed.insert(e, v);
+        if self.clocking_preponed.is_empty() {
+            let names: Vec<String> = self
+                .clocking_meta
+                .values()
+                .flat_map(|(_, sigs)| {
+                    sigs.iter()
+                        .filter(|(_, is_input)| *is_input)
+                        .map(|(n, _)| n.clone())
+                })
+                .collect();
+            for n in names {
+                // §14.3: an unpacked-array clockvar has no signal of its own;
+                // its elements are sampled one by one.
+                if let Some(elems) = self.clocking_array_elems(&n) {
+                    for (_, e) in elems {
+                        if let Some(v) = self.get_signal_value_by_name(&e) {
+                            self.clocking_preponed.insert(e, v);
+                        }
                     }
+                    continue;
                 }
-                continue;
+                if let Some(v) = self.get_signal_value_by_name(&n) {
+                    self.clocking_preponed.insert(n, v);
+                }
             }
-            if let Some(v) = self.get_signal_value_by_name(&n) {
-                self.clocking_preponed.insert(n, v);
+        } else {
+            let mut preponed = std::mem::take(&mut self.clocking_preponed);
+            for (n, slot) in preponed.iter_mut() {
+                if let Some(&id) = self.signal_name_to_id.get(n.as_str()) {
+                    *slot = self.signal_table[id].clone();
+                } else if let Some(v) = self.get_signal_value_by_name(n) {
+                    *slot = v;
+                }
             }
+            self.clocking_preponed = preponed;
         }
         if !self.clocking_hist.is_empty() {
             self.record_clocking_hist();
@@ -2801,14 +3182,19 @@ impl Simulator {
             if self.finished {
                 break;
             }
-            // Only the sites whose clock event was recorded tick.
+            // Only the sites whose clock event was recorded tick. The others
+            // check their asynchronous abort conditions (§16.12.14).
             if !std::mem::take(&mut self.sva_sites[i].fired) {
+                if self.sva_sites[i].async_abort && !self.sva_sites[i].attempts.is_empty() {
+                    self.sva_abort_step_site(i);
+                }
                 continue;
             }
-            let span_key = self.sva_sites[i].stat_key;
-            let site_loc = self.sva_sites[i].stat_loc;
-            let site_kind = self.sva_sites[i].kind;
             let node = self.sva_sites[i].node.clone();
+            // §16.12.14: attempts an abort settled since the last tick come
+            // first; a `disable iff` at this tick does not reach them.
+            let settled = std::mem::take(&mut self.sva_sites[i].settled);
+            let settled_meta = std::mem::take(&mut self.sva_sites[i].settled_meta);
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read through the sampled-value overlay.
             let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
@@ -2823,28 +3209,60 @@ impl Simulator {
             // evaluating a disable condition that refers to that history.
             if self.sva_cancel_disabled(i) {
                 self.sva_sites[i].sampled_ids = sampled_ids;
+                self.sva_report_outcomes(i, settled, settled_meta);
                 self.active_sva_site = prev_active;
                 *self.activation_scope.borrow_mut() = prev_activation_scope;
                 continue;
             }
-            let saved = self.install_preponed(&sampled_ids);
-            let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let new_meta = SvaAttemptMeta {
+                start_time: self.time,
+                clock_steps: 0,
+            };
+            // Attempts restored from a checkpoint have no meta; pad into
+            // lockstep before pushing the tick's new attempts.
+            let n = self.sva_sites[i].attempts.len();
+            if self.sva_sites[i].attempt_meta.len() != n {
+                let padded = self.sva_take_meta(i, n);
+                self.sva_sites[i].attempt_meta = padded;
+            }
             // §20.12 Off/Kill: no new attempt; those in flight go on.
             let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
+            let mut started = 0usize;
             if self.sva_sites[i].procedural {
                 // §16.14.6: one attempt per matured instance, none otherwise.
                 for env in std::mem::take(&mut self.sva_sites[i].matured) {
                     if starts {
-                        attempts.push(Self::sva_new_state(&node, &env));
+                        let st = Self::sva_new_state(&node, &env);
+                        self.sva_sites[i].attempts.push(st);
+                        self.sva_sites[i].attempt_meta.push(new_meta);
+                        started += 1;
                     }
                 }
             } else if starts {
-                attempts.push(Self::sva_new_state(&node, &self.sva_sites[i].lv_init));
+                let st = Self::sva_new_state(&node, &self.sva_sites[i].lv_init);
+                self.sva_sites[i].attempts.push(st);
+                self.sva_sites[i].attempt_meta.push(new_meta);
+                started = 1;
             }
-            let mut results: Vec<SvaOutcome> = Vec::new();
+            // IEEE 1800-2017 Clause 39: report Start where a new attempt is
+            // pushed, before advancing it, so Kill/Reset in the callback can
+            // discard even a single-cycle attempt.
+            if self.vpi_assert_on {
+                for _ in 0..started {
+                    self.vpi_assert_fire(i, vpi_assert::CB_START, new_meta.start_time);
+                }
+            }
+            let saved = self.install_preponed(&sampled_ids);
+            let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            let mut metas = self.sva_take_meta(i, attempts.len());
+            let mut results: Vec<SvaOutcome> = settled;
+            let mut result_meta: Vec<SvaAttemptMeta> = settled_meta;
+            result_meta.resize(results.len(), new_meta);
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
+            let mut live_meta: Vec<SvaAttemptMeta> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
-            for mut st in attempts.drain(..) {
+            for (mut st, mut meta) in attempts.drain(..).zip(metas.drain(..)) {
+                meta.clock_steps += 1;
                 if all_matches {
                     let step = match (&*node, &mut st) {
                         (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
@@ -2855,51 +3273,107 @@ impl Simulator {
                     if let Some((matched, alive)) = step {
                         if !matched.is_empty() {
                             results.push(SvaOutcome::Pass);
+                            result_meta.push(meta);
                         }
                         if alive {
                             live.push(st);
+                            live_meta.push(meta);
                         }
                         continue;
                     }
                 }
                 match self.sva_advance(&node, &mut st) {
-                    Some(r) => results.push(r),
-                    None => live.push(st),
+                    Some(r) => {
+                        results.push(r);
+                        result_meta.push(meta);
+                    }
+                    None => {
+                        live.push(st);
+                        live_meta.push(meta);
+                    }
                 }
             }
             // §16.7: an attempt with a long legal delay remains live;
             // dropping it at a fixed queue depth changes assertion results.
             self.sva_sites[i].attempts = live;
+            self.sva_sites[i].attempt_meta = live_meta;
             self.restore_preponed(saved);
             self.sva_sites[i].sampled_ids = sampled_ids;
-            for r in results {
-                match r {
-                    SvaOutcome::Pass => self.sva_tally(i, span_key, true),
-                    SvaOutcome::Fail => self.sva_tally(i, span_key, false),
-                    SvaOutcome::Vacuous => {
-                        let stat =
-                            self.assertion_stats
-                                .entry(span_key)
-                                .or_insert_with(|| AssertionStat {
-                                    kind: site_kind,
-                                    loc: Some(site_loc),
-                                    pass_count: 0,
-                                    fail_count: 0,
-                                });
-                        stat.kind = site_kind;
-                        // §16.12.1: holds, but no pass action unless a
-                        // §20.12 PassOn enabled it for vacuous successes.
-                        if site_kind != 2 {
-                            stat.pass_count += 1;
-                            if self.assert_ctl_on && self.sva_site_ctl(i).pass_action(true) {
-                                self.fire_sva_action(i, true);
-                            }
-                        }
+            // IEEE 1800-2017 Clause 39: with stepping enabled, report attempts
+            // still in flight after advancing; `sva_report_outcomes` reports
+            // the ones it decided.
+            if self.vpi_assert_on {
+                self.vpi_assert_fire_steps(i);
+            }
+            self.sva_report_outcomes(i, results, result_meta);
+            self.active_sva_site = prev_active;
+            *self.activation_scope.borrow_mut() = prev_activation_scope;
+        }
+    }
+
+    /// The assertion API data (IEEE 1800-2017 Clause 39) of the `n` attempts
+    /// in flight at site `i`, taken out of the site. An attempt without any
+    /// (one restored from a checkpoint) starts now.
+    pub(super) fn sva_take_meta(&mut self, i: usize, n: usize) -> Vec<SvaAttemptMeta> {
+        let mut metas = std::mem::take(&mut self.sva_sites[i].attempt_meta);
+        metas.resize(
+            n,
+            SvaAttemptMeta {
+                start_time: self.time,
+                clock_steps: 0,
+            },
+        );
+        metas
+    }
+
+    /// Tally the attempts of site `i` that ended, and run their actions.
+    /// `metas` holds the attempts' assertion API data (IEEE 1800-2017
+    /// Clause 39), in step with `results`.
+    fn sva_report_outcomes(
+        &mut self,
+        i: usize,
+        results: Vec<SvaOutcome>,
+        metas: Vec<SvaAttemptMeta>,
+    ) {
+        let span_key = self.sva_sites[i].stat_key;
+        let site_loc = self.sva_sites[i].stat_loc;
+        let site_kind = self.sva_sites[i].kind;
+        for (k, r) in results.into_iter().enumerate() {
+            // The callback comes before the action block, which may end the
+            // simulation.
+            if self.vpi_assert_on {
+                let start = metas.get(k).map_or(self.time, |m| m.start_time);
+                let reason = match r {
+                    SvaOutcome::Pass => vpi_assert::CB_SUCCESS,
+                    SvaOutcome::Fail => vpi_assert::CB_FAILURE,
+                    SvaOutcome::Vacuous => vpi_assert::CB_VACUOUS_SUCCESS,
+                };
+                if reason == vpi_assert::CB_FAILURE {
+                    self.vpi_assert_fire(i, vpi_assert::CB_STEP_FAILURE, start);
+                }
+                self.vpi_assert_fire(i, reason, start);
+            }
+            match r {
+                SvaOutcome::Pass => self.sva_tally(i, span_key, true),
+                SvaOutcome::Fail => self.sva_tally(i, span_key, false),
+                SvaOutcome::Vacuous => {
+                    let stat =
+                        self.assertion_stats
+                            .entry(span_key)
+                            .or_insert_with(|| AssertionStat {
+                                kind: site_kind,
+                                loc: Some(site_loc),
+                                pass_count: 0,
+                                fail_count: 0,
+                            });
+                    stat.kind = site_kind;
+                    // §20.11: an enabled vacuous pass action runs for assert and assume.
+                    if site_kind != 2 {
+                        stat.pass_count += 1;
+                        self.fire_sva_action(i, true, true);
                     }
                 }
             }
-            self.active_sva_site = prev_active;
-            *self.activation_scope.borrow_mut() = prev_activation_scope;
         }
     }
 
@@ -2974,7 +3448,7 @@ impl Simulator {
                                 signed: false,
                                 base: NumberBase::Decimal,
                                 value: id.to_string(),
-                                cached_val: Cell::new(None),
+                                cached_val: crate::ast::cache::LiteralCache::new(None),
                             }),
                             span,
                         )],
@@ -3001,9 +3475,15 @@ impl Simulator {
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
                 self.sva_resolve_signals(operand)
             }
+            // A side compared with a bare pattern stays a name: the pattern
+            // takes that side's declared type (§10.9).
             ExprKind::Binary { left, right, .. } => {
-                self.sva_resolve_signals(left);
-                self.sva_resolve_signals(right);
+                if !has_pattern(right) {
+                    self.sva_resolve_signals(left);
+                }
+                if !has_pattern(left) {
+                    self.sva_resolve_signals(right);
+                }
             }
             ExprKind::Conditional {
                 condition,
@@ -3086,7 +3566,7 @@ impl Simulator {
                     signed: false,
                     base: NumberBase::Decimal,
                     value: v.to_string(),
-                    cached_val: Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )

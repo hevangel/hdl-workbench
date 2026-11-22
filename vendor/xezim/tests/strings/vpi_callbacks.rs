@@ -20,7 +20,7 @@ fn shared_lib(dir: &Path, src: &str) -> PathBuf {
     let so = dir.join("cb.so");
     std::fs::write(&c, src).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
+    let ok = Command::new(std::env::var_os("CC").unwrap_or_else(|| "clang".into()))
         .args(["-shared", "-fPIC", "-Wall", "-I"])
         .arg(&include)
         .arg(&c)
@@ -1070,5 +1070,140 @@ fn next_rest_issue373_final_before_end_callback() {
     assert!(
         text.find("final block").unwrap() < text.find("cbEndOfSimulation:").unwrap(),
         "{text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A deposit from inside a routine (#811)
+// ---------------------------------------------------------------------------
+
+const NESTED_C: &str = r#"
+#include <stdio.h>
+#include "vpi_user.h"
+
+static int depth;
+static vpiHandle clk;
+
+static PLI_INT32 on_change(p_cb_data cb) {
+    vpi_printf("V|change t=%u val=%d nested=%d\n", cb->time->low,
+               (int)cb->value->value.integer, depth);
+    return 0;
+}
+
+static PLI_INT32 on_delay(p_cb_data cb) {
+    s_vpi_value v;
+    s_vpi_time now;
+    depth++;
+    v.format = vpiIntVal;
+    v.value.integer = (int)(PLI_INT32)(cb->user_data != NULL);
+    vpi_put_value(clk, &v, NULL, vpiNoDelay);
+    now.type = vpiSimTime;
+    vpi_get_time(NULL, &now);
+    vpi_printf("V|put t=%u\n", now.low);
+    depth--;
+    return 0;
+}
+
+static void after(PLI_UINT32 t, int high) {
+    static s_vpi_time dt;
+    s_cb_data d = {0};
+    dt.type = vpiSimTime;
+    dt.high = 0;
+    dt.low = t;
+    d.reason = cbAfterDelay;
+    d.cb_rtn = on_delay;
+    d.time = &dt;
+    d.user_data = high ? (PLI_BYTE8 *)"1" : NULL;
+    vpi_register_cb(&d);
+}
+
+static PLI_INT32 start(p_cb_data cb) {
+    static s_vpi_time t;
+    static s_vpi_value v;
+    s_cb_data d = {0};
+    (void)cb;
+    clk = vpi_handle_by_name("top.clk", NULL);
+    t.type = vpiSimTime;
+    v.format = vpiIntVal;
+    d.reason = cbValueChange;
+    d.cb_rtn = on_change;
+    d.obj = clk;
+    d.time = &t;
+    d.value = &v;
+    vpi_register_cb(&d);
+    after(5, 1);
+    after(10, 0);
+    return 0;
+}
+
+static void reg(void) {
+    s_cb_data d = {0};
+    d.reason = cbStartOfSimulation;
+    d.cb_rtn = start;
+    vpi_register_cb(&d);
+}
+
+void (*vlog_startup_routines[])(void) = {reg, 0};
+"#;
+
+const NESTED_SV: &str = r#"
+module top;
+  logic clk = 0;
+  always @(posedge clk) $display("V|posedge t=%0t", $time);
+  initial #20 $finish;
+endmodule
+"#;
+
+/// §38.36.1: a value change made by `vpi_put_value` inside a routine is
+/// reported after that routine returns, in the same time slot, not by a call
+/// into the value-change routine while it still runs. cocotb 1.x aborts on
+/// such a nested call ("calling up again") when a test drives a clock from
+/// Python and waits on its edge (#811).
+#[test]
+fn vpi_cb_value_change_of_a_routine_deposit_is_not_nested() {
+    let (out, ok) = run("nested", NESTED_C, NESTED_SV, &[]);
+    assert!(ok, "{out}");
+    let got = lines_with(&out, &["V|"]);
+    let want = vec![
+        "V|put t=5",
+        "V|change t=5 val=1 nested=0",
+        "V|posedge t=5",
+        "V|put t=10",
+        "V|change t=10 val=0 nested=0",
+    ];
+    assert_eq!(got, want, "{out}");
+}
+
+/// IEEE 1800-2023 §9.6.2 / §38.36: a callback registered by a killed
+/// child retains that process's identity when later children are spawned.
+/// One FORK_CB per disable follows xezim's `vpi_cb.rs` rule: a cbDisable
+/// on a system-task call belongs to the calling process, not an LRM count.
+#[test]
+fn finished_fork_children_keep_vpi_callback_identity() {
+    let (out, ok) = run(
+        "finished_children",
+        include_str!("../dpi/finished_process_callbacks.c"),
+        include_str!("../dpi/finished_process_callbacks.sv"),
+        &[],
+    );
+    assert!(ok, "{out}");
+    assert_eq!(
+        lines_with(&out, &["FORK_CB ", "VPI_FORK_PASS"]),
+        [
+            "FORK_CB tag=1 t=2 type=57",
+            "FORK_CB tag=2 t=5 type=57",
+            "FORK_CB tag=3 t=8 type=57",
+            "FORK_CB tag=4 t=11 type=57",
+            "FORK_CB tag=5 t=14 type=57",
+            "VPI_FORK_PASS t=15",
+        ],
+        "{out}"
+    );
+    // vpiInitial is still the retained static process handle's type (§37).
+    assert!(
+        out.lines().any(
+            |line| line.starts_with("FORK_CB_END tags=5 ") && line.ends_with("initial_type=24")
+        ),
+        "{out}"
     );
 }

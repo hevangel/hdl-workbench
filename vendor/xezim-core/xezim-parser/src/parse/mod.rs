@@ -11,11 +11,25 @@ mod types;
 use crate::ast::decl::{ModuleItem, PackageItem};
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::stream::TokenStream;
 use crate::lexer::token::{Token, TokenKind};
 use items::ConstraintPos;
 
-pub struct Parser {
-    tokens: Vec<Token>,
+/// Finish an owned syntax list before its AST is published. A fresh buffer
+/// releases spare storage even when the allocator would keep a shrunk one.
+fn compact_syntax_list<T>(mut items: Vec<T>) -> Vec<T> {
+    if items.len() == items.capacity() || std::mem::size_of::<T>() == 0 {
+        return items;
+    }
+    let mut compact = Vec::with_capacity(items.len());
+    compact.append(&mut items);
+    compact
+}
+
+pub struct Parser<'a> {
+    // §22.8 directive transitions in source order, consumed outside the grammar.
+    default_net_pulls: Vec<(usize, Option<crate::ast::types::NetType>)>,
+    tokens: TokenStream<'a>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
     /// IEEE 1800-2017 §12.6: `.name` pattern bindings collected while parsing a
@@ -39,6 +53,9 @@ pub struct Parser {
     /// Parsing a function or task prototype's ports, where a formal's name
     /// may be omitted (A.2.7 footnote 28).
     prototype_ports: bool,
+    /// The items of the cross whose bin selects are being parsed, so
+    /// `binsof` can name a hierarchical item (XEZIM_RELAX_CROSS_HIER_ITEM).
+    cross_items: Vec<String>,
     /// The classes of this file so far, for the strict inheritance checks.
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
@@ -69,9 +86,12 @@ pub struct Parser {
     /// last (see `lets.rs`), and how many lets they hold in all.
     pub(super) let_scopes: Vec<lets::LetScope>,
     pub(super) let_live: usize,
+    /// §18.17.7: the productions of the randsequence rule being parsed. A
+    /// code block of the rule reads each as an implicit variable.
+    pub(super) rs_values: Vec<String>,
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     /// A.2.2.3 `delay_value ::= ... | 1step`: the lexer reads `1` and an
     /// adjacent `step`. Right after `#` or inside `#( )` they are one delay
     /// value, the global time precision (§3.14.3): rejoin them as the
@@ -80,13 +100,17 @@ impl Parser {
     /// delay, a clocking skew) reads it alike. Anywhere else (`x = 1step;`)
     /// they stay apart, an error. It was a delay of 1 and a stray `step`
     /// (#615).
-    fn join_one_step(tokens: Vec<Token>) -> Vec<Token> {
+    fn join_one_step(mut tokens: TokenStream<'a>) -> TokenStream<'a> {
         let joinable = |i: usize| {
-            tokens[i].kind == TokenKind::IntegerLiteral
-                && tokens[i].text == "1"
-                && tokens[i + 1].kind == TokenKind::Identifier
-                && tokens[i + 1].text == "step"
-                && tokens[i + 1].span.start == tokens[i].span.end
+            let tok = tokens[i];
+            let next = tokens[i + 1];
+            tok.kind == TokenKind::IntegerLiteral
+                && tok.raw_len() == 1
+                && next.kind == TokenKind::Identifier
+                && next.raw_len() == 4
+                && tokens.span(next).start == tokens.span(tok).end
+                && tokens.text(tok) == "1"
+                && tokens.text(next) == "step"
                 && (tokens[i - 1].kind == TokenKind::Hash
                     || (tokens[i - 1].kind == TokenKind::LParen
                         && i >= 2
@@ -96,7 +120,9 @@ impl Parser {
                     // `$__xz_intra_delay(d, b)` before parsing.
                     || (tokens[i - 1].kind == TokenKind::LParen
                         && i >= 2
-                        && tokens[i - 2].text == "$__xz_intra_delay"
+                        && tokens[i - 2].kind == TokenKind::SystemIdentifier
+                        && tokens[i - 2].raw_len() == 17
+                        && tokens.text_at(i - 2) == "$__xz_intra_delay"
                         && tokens.get(i + 2).is_some_and(|t| t.kind == TokenKind::Comma)))
         };
         let joins: Vec<usize> = (1..tokens.len().saturating_sub(1))
@@ -106,26 +132,85 @@ impl Parser {
             return tokens;
         }
         // One pass: removing each `step` in place shifted the whole tail.
-        let mut out = Vec::with_capacity(tokens.len() - joins.len());
-        let mut joins = joins.into_iter().peekable();
-        let mut rest = tokens.into_iter().enumerate();
-        while let Some((i, mut tok)) = rest.next() {
-            if joins.next_if_eq(&i).is_some()
-                && let Some((_, step)) = rest.next()
-            {
-                tok.kind = TokenKind::Identifier;
-                tok.text = crate::ast::decl::CLOCKING_ONE_STEP.to_string();
-                tok.span.end = step.span.end;
+        let long_ends = tokens.take_long_ends();
+        let mut out = TokenStream::with_long_ends(tokens.source(), long_ends);
+        let mut ji = 0usize;
+        let mut i = 0usize;
+        let n = tokens.len();
+        while i < n {
+            tokens.release_before(i);
+            if ji < joins.len() && joins[ji] == i {
+                ji += 1;
+                let tok = tokens[i];
+                // Adjacent `"1"` and `"step"` slice as `"1step"` (CLOCKING_ONE_STEP).
+                out.push_raw(Token::from_raw(
+                    TokenKind::Identifier,
+                    tok.start() as u32,
+                    5,
+                ));
+                i += 2;
+            } else {
+                out.push_raw(tokens[i]);
+                i += 1;
             }
-            out.push(tok);
         }
+        out.finish();
         out
     }
 
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: TokenStream<'a>) -> Self {
         crate::record_reference_census(&tokens);
         let tokens = Self::join_one_step(tokens);
+        let (tokens, default_net_pulls) = Self::take_default_net_pulls(tokens);
+        let mut parser = Self::new_sub(tokens);
+        parser.default_net_pulls = default_net_pulls;
+        parser
+    }
+
+    /// Drop each `` `default_nettype `` directive and its net type token,
+    /// keeping where it stands and whether it names a pull (tri0/tri1).
+    fn take_default_net_pulls(
+        mut tokens: TokenStream<'a>,
+    ) -> (TokenStream<'a>, Vec<(usize, Option<crate::ast::types::NetType>)>) {
+        let is_directive = |tokens: &TokenStream<'a>, tok: Token| {
+            tok.kind == TokenKind::Directive && tokens.text(tok) == "`default_nettype"
+        };
+        if !tokens.iter().any(|tok| is_directive(&tokens, tok)) {
+            return (tokens, Vec::new());
+        }
+        let mut default_net_pulls = Vec::new();
+        let long_ends = tokens.take_long_ends();
+        let mut out = TokenStream::with_long_ends(tokens.source(), long_ends);
+        let mut after_directive = false;
+        for i in 0..tokens.len() {
+            tokens.release_before(i);
+            let tok = tokens[i];
+            if after_directive {
+                after_directive = false;
+                let net = match tok.kind {
+                    TokenKind::KwTri0 => Some(crate::ast::types::NetType::Tri0),
+                    TokenKind::KwTri1 => Some(crate::ast::types::NetType::Tri1),
+                    TokenKind::Eof => {
+                        out.push_raw(tok);
+                        continue;
+                    }
+                    _ => None,
+                };
+                default_net_pulls.push((tokens.span(tok).start, net));
+                continue;
+            }
+            after_directive = is_directive(&tokens, tok);
+            if !after_directive {
+                out.push_raw(tok);
+            }
+        }
+        out.finish();
+        (out, default_net_pulls)
+    }
+
+    pub(super) fn new_sub(tokens: TokenStream<'a>) -> Self {
         Self {
+            default_net_pulls: Vec::new(),
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
@@ -134,6 +219,7 @@ impl Parser {
             in_sva_seq: false,
             sva_delay_count: false,
             prototype_ports: false,
+            cross_items: Vec::new(),
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
             in_constraint: false,
@@ -143,6 +229,7 @@ impl Parser {
             port_exprs: Vec::new(),
             let_scopes: Vec::new(),
             let_live: 0,
+            rs_values: Vec::new(),
         }
     }
 
@@ -158,7 +245,7 @@ impl Parser {
 
     /// source_text ::= { description }
     pub fn parse_source_text(&mut self) -> SourceText {
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         let mut descriptions = Vec::new();
         while !self.at(TokenKind::Eof) {
             let before = self.pos;
@@ -167,13 +254,16 @@ impl Parser {
                 // No progress — genuinely stuck, whether or not it produced a
                 // Description (a Some(..) from a branch that consumed nothing
                 // would otherwise loop forever). Force progress.
-                self.error(format!("unexpected token: {:?}", self.current().text));
+                let text = self.current_text().into_owned();
+                self.error(format!("unexpected token: {:?}", text));
                 self.bump();
+                self.release_consumed_tokens();
                 continue;
             }
             if let Some(desc) = desc {
                 descriptions.push(desc);
             }
+            self.release_consumed_tokens();
             // A None that advanced (e.g. a stray top-level `;` consumed by the
             // Semicolon arm) is a clean skip, not an error.
         }
@@ -246,7 +336,7 @@ impl Parser {
     /// §23.11: bind targets retain constant selects until elaboration, at
     /// both compilation-unit and module scope.
     pub(super) fn try_bind_directive(&mut self) -> Option<crate::ast::decl::BindDirective> {
-        let start_byte = self.current().span.start;
+        let start_byte = self.current_span().start;
         let restart = self.pos;
         let first = self.parse_bind_path();
         let target = first.first()?.name.clone();
@@ -267,37 +357,52 @@ impl Parser {
         // was never instantiated and every hierarchical call into it was a
         // no-op.
         let bind_params = self.parse_instantiation_params();
-        if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
-            let inst_start = self.current().span.start;
-            let iname = self.parse_identifier();
-            let dims = self.parse_unpacked_dimensions();
-            let conns = self.parse_port_connections();
-            if self.at(TokenKind::Semicolon) {
-                self.bump();
-                let span = self.span_from(start_byte);
-                let instance = crate::ast::decl::HierarchicalInstance {
-                    name: iname,
-                    dimensions: dims,
-                    connections: conns,
-                    span: self.span_from(inst_start),
-                };
-                let instantiation = crate::ast::decl::ModuleInstantiation {
-                    module_name: bind_mod,
-                    params: bind_params,
-                    instances: vec![instance],
-                    span,
-                };
-                return Some(crate::ast::decl::BindDirective {
-                    target_module: target,
-                    target_path,
-                    extra_paths,
-                    gen_scope: String::new(),
-                    instantiation,
-                    span,
-                });
+        // §23.11: the bind instantiation is an ordinary instantiation, so it
+        // can name several instances, `bind t c a(), b();`. Only the first
+        // was read, and the comma then dropped the whole directive.
+        let mut instances = Vec::new();
+        let mut complete = false;
+        while self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+            let inst_start = self.current_span().start;
+            let name = self.parse_identifier();
+            let dimensions = self.parse_unpacked_dimensions();
+            let connections = self.parse_port_connections();
+            instances.push(crate::ast::decl::HierarchicalInstance {
+                decl: crate::ast::binding::Bound::UNSET,
+                name,
+                dimensions,
+                connections,
+                gen_indices: Vec::new(),
+                span: self.span_from(inst_start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                complete = true;
+                break;
             }
         }
-        // Heuristic parse failed — rewind and swallow until the next ';'.
+        // `complete` is false when a comma was not followed by an instance.
+        if complete && self.at(TokenKind::Semicolon) {
+            self.bump();
+            let span = self.span_from(start_byte);
+            let instantiation = crate::ast::decl::ModuleInstantiation {
+                module_name: bind_mod,
+                params: bind_params,
+                instances,
+                scope: None,
+                span,
+            };
+            return Some(crate::ast::decl::BindDirective {
+                target_module: target,
+                target_path,
+                extra_paths,
+                gen_scope: String::new(),
+                instantiation,
+                span,
+            });
+        }
+        // Not a bind directive this parser reads. Report it rather than drop
+        // it silently, then rewind and swallow until the next ';'.
+        self.error("bind directive not understood: expected a bind target, a module name and instances (IEEE 1800-2017 §23.11)");
         self.pos = restart;
         let mut depth_paren = 0i32;
         while !self.at(TokenKind::Eof) {
@@ -328,12 +433,12 @@ impl Parser {
             // §23.11/§23.8: an absolute bind path may start at $root.
             let name = if path.is_empty()
                 && self.at(TokenKind::SystemIdentifier)
-                && self.current().text == "$root"
+                && self.current_text() == "$root"
             {
                 let token = self.bump();
                 crate::ast::Identifier {
                     name: "$root".into(),
-                    span: token.span,
+                    span: self.token_span(token),
                 }
             } else {
                 self.parse_identifier()
@@ -380,10 +485,10 @@ impl Parser {
             // aside with a warning; it was a stream of "unexpected token"
             // errors (#603).
             TokenKind::KwConfig => {
-                let start = self.current().span.start;
+                let start = self.current_span().start;
                 self.bump(); // config
                 let name = if self.at(TokenKind::Identifier) {
-                    self.current().text.clone()
+                    self.current_text().into_owned()
                 } else {
                     String::new()
                 };
@@ -653,7 +758,7 @@ impl Parser {
     /// malformed table never crashes the parse nor silently mis-simulates.
     fn parse_primitive(&mut self) -> Description {
         use crate::ast::decl::{UdpDecl, UdpOut, UdpSym, UdpTableRow};
-        let start = self.current().span.start;
+        let start = self.current_span().start;
         self.bump(); // `primitive`
         let name = self.parse_identifier();
 
@@ -662,8 +767,11 @@ impl Parser {
         // non-ANSI headers alike since port names are always identifiers.
         let mut ports: Vec<crate::ast::Identifier> = Vec::new();
         let mut is_sequential = false;
+        // A.5.2: `output reg q = v` gives the start state in either header form.
+        let mut init: Option<char> = None;
         if self.eat(TokenKind::LParen).is_some() {
             let mut depth = 1i32;
+            let mut init_val: Option<String> = None;
             while depth > 0 && !self.at(TokenKind::Eof) {
                 match self.current_kind() {
                     TokenKind::LParen => {
@@ -678,6 +786,23 @@ impl Parser {
                         is_sequential = true;
                         self.bump();
                     }
+                    TokenKind::Assign | TokenKind::Eq if depth == 1 && is_sequential => {
+                        init_val = Some(String::new());
+                        self.bump();
+                    }
+                    TokenKind::Comma if depth == 1 => {
+                        if let Some(v) = init_val.take() {
+                            init = Some(Self::udp_init_symbol(&v));
+                        }
+                        self.bump();
+                    }
+                    _ if depth == 1 && init_val.is_some() => {
+                        let txt = self.current_text();
+                        if let Some(v) = init_val.as_mut() {
+                            v.push_str(&txt);
+                        }
+                        self.bump();
+                    }
                     TokenKind::Identifier | TokenKind::EscapedIdentifier if depth == 1 => {
                         ports.push(self.parse_identifier());
                     }
@@ -686,12 +811,14 @@ impl Parser {
                     }
                 }
             }
+            if let Some(v) = init_val {
+                init = Some(Self::udp_init_symbol(&v));
+            }
         }
         self.eat(TokenKind::Semicolon);
 
         // --- Body declarations up to `table`: pick up `reg` (=> sequential)
         // and `initial out = 1'bX;` (start state).
-        let mut init: Option<char> = None;
         while !self.at(TokenKind::KwTable)
             && !self.at(TokenKind::KwEndprimitive)
             && !self.at(TokenKind::Eof)
@@ -714,24 +841,48 @@ impl Parser {
                         if k == TokenKind::Assign || k == TokenKind::Eq {
                             seen_eq = true;
                         } else if seen_eq {
-                            val.push_str(&self.current().text);
+                            val.push_str(&self.current_text());
                         }
                         self.bump();
                     }
                     self.eat(TokenKind::Semicolon);
-                    let low = val.to_ascii_lowercase();
-                    init = Some(if low.contains('x') || low.contains('z') {
-                        'x'
-                    } else if low.ends_with('1') {
-                        '1'
-                    } else if low.ends_with('0') {
-                        '0'
-                    } else {
-                        'x'
-                    });
+                    init = Some(Self::udp_init_symbol(&val));
                 }
+                // §29.3.2, A.5.2: in the body of a non-ANSI header the output
+                // may be declared `output reg q [= v];`, which is the reg
+                // declaration of a sequential UDP and may give its start
+                // state. It was skipped whole, so the UDP lost its state.
                 _ => {
-                    self.skip_udp_to_semi();
+                    let mut output = false;
+                    let mut reg = false;
+                    let mut val: Option<String> = None;
+                    while !self.at(TokenKind::Semicolon)
+                        && !self.at(TokenKind::Eof)
+                        && !self.at(TokenKind::KwTable)
+                        && !self.at(TokenKind::KwEndprimitive)
+                    {
+                        match self.current_kind() {
+                            TokenKind::KwOutput => output = true,
+                            TokenKind::KwReg if output => reg = true,
+                            TokenKind::Assign | TokenKind::Eq if reg => val = Some(String::new()),
+                            _ => {
+                                if val.is_some() {
+                                    let txt = self.current_text();
+                                    if let Some(v) = val.as_mut() {
+                                        v.push_str(&txt);
+                                    }
+                                }
+                            }
+                        }
+                        self.bump();
+                    }
+                    self.eat(TokenKind::Semicolon);
+                    if reg {
+                        is_sequential = true;
+                        if let Some(v) = val {
+                            init = Some(Self::udp_init_symbol(&v));
+                        }
+                    }
                 }
             }
         }
@@ -742,7 +893,7 @@ impl Parser {
         let mut table_ok = true;
         let mut fail_detail = String::new();
         // Where the warning points: the row that failed, else the table.
-        let mut fail_span = self.current().span;
+        let mut fail_span = self.current_span();
         if self.eat(TokenKind::KwTable).is_some() {
             // Gather raw table tokens up to `endtable`.
             let mut toks: Vec<Token> = Vec::new();
@@ -750,8 +901,7 @@ impl Parser {
                 && !self.at(TokenKind::Eof)
                 && !self.at(TokenKind::KwEndprimitive)
             {
-                toks.push(self.current().clone());
-                self.bump();
+                toks.push(self.bump());
             }
             self.eat(TokenKind::KwEndtable);
             // Split into rows on `;`.
@@ -766,26 +916,30 @@ impl Parser {
                     }
                     if crate::strict_checks()
                         && !ports.is_empty()
-                        && let Some(msg) = Self::udp_row_shape_error(slice, n_inputs)
+                        && let Some(msg) = Self::udp_row_shape_error(&self.tokens, slice, n_inputs)
                     {
-                        let span = Span::new(slice[0].span.start, slice[slice.len() - 1].span.end);
+                        let span = Span::new(
+                            self.tokens.span(slice[0]).start,
+                            self.tokens.span(slice[slice.len() - 1]).end,
+                        );
                         self.diagnostics.push(crate::diagnostics::Diagnostic::error(
                             format!("in primitive '{}': {}", name.name, msg),
                             span,
                         ));
                     }
-                    match Self::parse_udp_row(slice, n_inputs) {
+                    match Self::parse_udp_row(&self.tokens, slice, n_inputs) {
                         Some(r) => rows.push(r),
                         None => {
                             table_ok = false;
                             let txt: String = slice
                                 .iter()
-                                .map(|t| t.text.clone())
+                                .map(|&t| self.tokens.text(t))
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             fail_detail = txt;
-                            if let (Some(f), Some(l)) = (slice.first(), slice.last()) {
-                                fail_span = Span::new(f.span.start, l.span.end);
+                            if let (Some(&f), Some(&l)) = (slice.first(), slice.last()) {
+                                fail_span =
+                                    Span::new(self.tokens.span(f).start, self.tokens.span(l).end);
                             }
                             break;
                         }
@@ -835,6 +989,7 @@ impl Parser {
                     fail_span,
                 ));
             Description::Module(crate::ast::module::ModuleDeclaration {
+                lexical_parent: None,
                 attrs: Vec::new(),
                 kind: crate::ast::module::ModuleKind::Module,
                 lifetime: None,
@@ -849,6 +1004,21 @@ impl Parser {
     }
 
     /// Consume tokens up to and including the next `;` (UDP body decls).
+    /// The start state an initial value `1'b0`, `1`, `1'bx` gives a UDP
+    /// output (§29.3.3): 0, 1, or x for anything else.
+    fn udp_init_symbol(val: &str) -> char {
+        let low = val.to_ascii_lowercase();
+        if low.contains('x') || low.contains('z') {
+            'x'
+        } else if low.ends_with('1') {
+            '1'
+        } else if low.ends_with('0') {
+            '0'
+        } else {
+            'x'
+        }
+    }
+
     fn skip_udp_to_semi(&mut self) {
         while !self.at(TokenKind::Semicolon)
             && !self.at(TokenKind::Eof)
@@ -865,10 +1035,14 @@ impl Parser {
     /// state and output symbol. Symbols are counted per character (the lexer
     /// may join adjacent ones into one token) and a parenthesized edge counts
     /// once.
-    fn udp_row_shape_error(slice: &[Token], n_inputs: usize) -> Option<String> {
+    fn udp_row_shape_error(
+        stream: &TokenStream<'a>,
+        slice: &[Token],
+        n_inputs: usize,
+    ) -> Option<String> {
         let mut fields: Vec<usize> = vec![0];
         let mut in_edge = false;
-        for t in slice {
+        for &t in slice {
             match t.kind {
                 TokenKind::Colon if !in_edge => fields.push(0),
                 TokenKind::LParen => {
@@ -876,7 +1050,7 @@ impl Parser {
                     *fields.last_mut().unwrap() += 1;
                 }
                 TokenKind::RParen => in_edge = false,
-                _ if !in_edge => *fields.last_mut().unwrap() += t.text.chars().count(),
+                _ if !in_edge => *fields.last_mut().unwrap() += stream.text(t).chars().count(),
                 _ => {}
             }
         }
@@ -908,7 +1082,11 @@ impl Parser {
     /// Parse one truth-table row from a raw token slice (columns are
     /// `:`-separated; combinational = 2 fields, sequential = 3). Returns
     /// `None` on any unrecognised symbol or shape so the caller can fall back.
-    fn parse_udp_row(slice: &[Token], n_inputs: usize) -> Option<crate::ast::decl::UdpTableRow> {
+    fn parse_udp_row(
+        stream: &TokenStream<'a>,
+        slice: &[Token],
+        n_inputs: usize,
+    ) -> Option<crate::ast::decl::UdpTableRow> {
         use crate::ast::decl::{UdpOut, UdpTableRow};
         // Split fields on `:`.
         let mut fields: Vec<&[Token]> = Vec::new();
@@ -924,13 +1102,13 @@ impl Parser {
             3 => (fields[0], Some(fields[1]), fields[2]),
             _ => return None,
         };
-        let inputs = Self::parse_udp_syms(input_f)?;
+        let inputs = Self::parse_udp_syms(stream, input_f)?;
         if inputs.len() != n_inputs {
             return None;
         }
         let state = match state_f {
             Some(f) => {
-                let mut s = Self::parse_udp_syms(f)?;
+                let mut s = Self::parse_udp_syms(stream, f)?;
                 if s.len() != 1 {
                     return None;
                 }
@@ -942,7 +1120,7 @@ impl Parser {
         if out_f.len() != 1 {
             return None;
         }
-        let output = match out_f[0].text.as_str() {
+        let output = match stream.text(out_f[0]).as_ref() {
             "0" => UdpOut::Level('0'),
             "1" => UdpOut::Level('1'),
             "x" | "X" => UdpOut::Level('x'),
@@ -951,7 +1129,7 @@ impl Parser {
         };
         let span = slice
             .first()
-            .map(|t| t.span)
+            .map(|&t| stream.span(t))
             .unwrap_or(crate::ast::Span::dummy());
         Some(UdpTableRow {
             inputs,
@@ -962,19 +1140,22 @@ impl Parser {
     }
 
     /// Parse a sequence of input/state symbols from a token slice.
-    fn parse_udp_syms(field: &[Token]) -> Option<Vec<crate::ast::decl::UdpSym>> {
+    fn parse_udp_syms(
+        stream: &TokenStream<'a>,
+        field: &[Token],
+    ) -> Option<Vec<crate::ast::decl::UdpSym>> {
         use crate::ast::decl::UdpSym;
         let mut out = Vec::new();
         let mut i = 0usize;
         while i < field.len() {
-            let t = &field[i];
+            let t = field[i];
             match t.kind {
                 TokenKind::LParen => {
                     // Edge `(vw)` — concatenate token text until `)`.
                     let mut j = i + 1;
                     let mut txt = String::new();
                     while j < field.len() && field[j].kind != TokenKind::RParen {
-                        txt.push_str(&field[j].text);
+                        txt.push_str(&stream.text(field[j]));
                         j += 1;
                     }
                     if j >= field.len() {
@@ -989,22 +1170,26 @@ impl Parser {
                     let to = Self::udp_norm_level(chars[1])?;
                     out.push(UdpSym::Edge { from, to });
                 }
+                // A.5.3: each symbol is one character, and adjacent symbols
+                // (`01`, `bB`, `x0`) reach here as one token, so take every
+                // character of the token as its own symbol.
                 _ => {
-                    let sym = match t.text.as_str() {
-                        "0" => UdpSym::Level('0'),
-                        "1" => UdpSym::Level('1'),
-                        "x" | "X" => UdpSym::Level('x'),
-                        "z" | "Z" => UdpSym::Level('x'), // input z ⇒ x
-                        "?" => UdpSym::AnyQ,
-                        "b" | "B" => UdpSym::B,
-                        "r" | "R" => UdpSym::EdgeShort('r'),
-                        "f" | "F" => UdpSym::EdgeShort('f'),
-                        "p" | "P" => UdpSym::EdgeShort('p'),
-                        "n" | "N" => UdpSym::EdgeShort('n'),
-                        "*" => UdpSym::EdgeShort('*'),
-                        _ => return None,
-                    };
-                    out.push(sym);
+                    for c in stream.text(t).chars() {
+                        out.push(match c {
+                            '0' => UdpSym::Level('0'),
+                            '1' => UdpSym::Level('1'),
+                            'x' | 'X' => UdpSym::Level('x'),
+                            'z' | 'Z' => UdpSym::Level('x'), // input z ⇒ x
+                            '?' => UdpSym::AnyQ,
+                            'b' | 'B' => UdpSym::B,
+                            'r' | 'R' => UdpSym::EdgeShort('r'),
+                            'f' | 'F' => UdpSym::EdgeShort('f'),
+                            'p' | 'P' => UdpSym::EdgeShort('p'),
+                            'n' | 'N' => UdpSym::EdgeShort('n'),
+                            '*' => UdpSym::EdgeShort('*'),
+                            _ => return None,
+                        });
+                    }
                     i += 1;
                 }
             }

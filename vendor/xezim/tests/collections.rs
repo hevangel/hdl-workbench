@@ -38,16 +38,8 @@ mod assoc_missing_key_default;
 mod assoc_noparen_size;
 #[path = "collections/assoc_whole_copy_targets.rs"]
 mod assoc_whole_copy_targets;
-#[path = "collections/call_ret_store_into_local_coll.rs"]
-mod call_ret_store_into_local_coll;
 #[path = "collections/collection_write_open_gaps.rs"]
 mod collection_write_open_gaps;
-#[path = "classes/compiled_method_test_env.rs"]
-mod compiled_method_test_env;
-#[path = "collections/compiled_ret_coll_by_name.rs"]
-mod compiled_ret_coll_by_name;
-#[path = "collections/compiled_typedef_local_queue.rs"]
-mod compiled_typedef_local_queue;
 #[path = "collections/concurrent_local_dyn_arrays.rs"]
 mod concurrent_local_dyn_arrays;
 #[path = "collections/constant_array_index_dependency.rs"]
@@ -62,14 +54,14 @@ mod dyn_array_of_mailboxes;
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]
 mod fixed_array_member_pattern_forms;
+#[path = "collections/fixed_array_row_copy_order.rs"]
+mod fixed_array_row_copy_order;
 #[path = "collections/foreach_assoc_key_types.rs"]
 mod foreach_assoc_key_types;
 #[path = "collections/foreach_blocking_resume.rs"]
 mod foreach_blocking_resume;
 #[path = "collections/foreach_negative_dims.rs"]
 mod foreach_negative_dims;
-#[path = "collections/local_coll_init_fast_fn_eligible.rs"]
-mod local_coll_init_fast_fn_eligible;
 #[path = "collections/locator_item_index.rs"]
 mod locator_item_index;
 #[path = "collections/lrm_clause7_arrays.rs"]
@@ -82,6 +74,18 @@ mod mailbox_bounded;
 mod mailbox_handle_named_like_struct;
 #[path = "collections/member_off_handle_collection_elem.rs"]
 mod member_off_handle_collection_elem;
+#[path = "classes/compiled_method_test_env.rs"]
+mod compiled_method_test_env;
+#[path = "collections/bits_dynamic_operand.rs"]
+mod bits_dynamic_operand;
+#[path = "collections/compiled_ret_coll_by_name.rs"]
+mod compiled_ret_coll_by_name;
+#[path = "collections/compiled_typedef_local_queue.rs"]
+mod compiled_typedef_local_queue;
+#[path = "collections/call_ret_store_into_local_coll.rs"]
+mod call_ret_store_into_local_coll;
+#[path = "collections/local_coll_init_fast_fn_eligible.rs"]
+mod local_coll_init_fast_fn_eligible;
 #[path = "collections/multidim_assoc_array.rs"]
 mod multidim_assoc_array;
 #[path = "collections/nested_assoc_entries.rs"]
@@ -92,6 +96,8 @@ mod nested_assoc_under_outer_dim;
 mod noparen_array_methods;
 #[path = "collections/pp_queue_slice.rs"]
 mod pp_queue_slice;
+#[path = "collections/packed_pattern_compare.rs"]
+mod packed_pattern_compare;
 #[path = "collections/property_queue_and_context.rs"]
 mod property_queue_and_context;
 #[path = "collections/queue_eq_unknown_elems.rs"]
@@ -102,6 +108,8 @@ mod queue_local_shadow_restore;
 mod queue_member_init;
 #[path = "collections/queue_ops_and_dist.rs"]
 mod queue_ops_and_dist;
+#[path = "collections/queue_read_past_size.rs"]
+mod queue_read_past_size;
 #[path = "collections/queue_store_element_type.rs"]
 mod queue_store_element_type;
 #[path = "collections/sibling_static_collection_collision.rs"]
@@ -124,68 +132,68 @@ mod with_clause_class_receivers;
 #[path = "collections/queue_dyn_write_semantics.rs"]
 mod queue_dyn_write_semantics;
 
-#[path = "collections/array_actual_hier_pkg_writeback.rs"]
-mod array_actual_hier_pkg_writeback;
-#[path = "collections/assoc_formal_struct_elems.rs"]
-mod assoc_formal_struct_elems;
-#[path = "collections/assoc_locator_methods.rs"]
-mod assoc_locator_methods;
 #[path = "collections/assoc_of_struct.rs"]
 mod assoc_of_struct;
-#[path = "collections/block_local_shadow_module.rs"]
-mod block_local_shadow_module;
 #[path = "collections/builtin_class_construction_forms.rs"]
 mod builtin_class_construction_forms;
 #[path = "collections/callee_local_shadow_assoc_output.rs"]
 mod callee_local_shadow_assoc_output;
+#[path = "collections/array_actual_hier_pkg_writeback.rs"]
+mod array_actual_hier_pkg_writeback;
 #[path = "collections/callee_local_shadow_int_assoc.rs"]
 mod callee_local_shadow_int_assoc;
+#[path = "collections/output_array_formal_starts_default.rs"]
+mod output_array_formal_starts_default;
 #[path = "collections/class_member_semaphore_keys.rs"]
 mod class_member_semaphore_keys;
-#[path = "collections/compiled_string_queue_element_compare.rs"]
-mod compiled_string_queue_element_compare;
 #[path = "collections/count_methods_return_signed_int.rs"]
 mod count_methods_return_signed_int;
-#[path = "collections/declarator_typedef_dims.rs"]
-mod declarator_typedef_dims;
-#[path = "collections/deferred_retsnap_slow_path.rs"]
-mod deferred_retsnap_slow_path;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]
 mod foreach_packed_multidim;
-#[path = "collections/foreach_typedef_neighbours_312.rs"]
-mod foreach_typedef_neighbours_312;
-#[path = "collections/function_collection_return.rs"]
-mod function_collection_return;
 #[path = "collections/lrm_audit_argument_passing.rs"]
 mod lrm_audit_argument_passing;
 #[path = "collections/mailbox_unpacked_struct.rs"]
 mod mailbox_unpacked_struct;
-#[path = "collections/nested_assoc_foreach.rs"]
-mod nested_assoc_foreach;
-#[path = "collections/output_array_formal_starts_default.rs"]
-mod output_array_formal_starts_default;
-#[path = "collections/package_refs_in_subroutines.rs"]
-mod package_refs_in_subroutines;
-#[path = "collections/package_var_collisions.rs"]
-mod package_var_collisions;
-#[path = "collections/pattern_equality.rs"]
-mod pattern_equality;
 #[path = "collections/queue_concat_index_prefilled_prefix.rs"]
 mod queue_concat_index_prefilled_prefix;
-#[path = "collections/queue_struct_pop.rs"]
-mod queue_struct_pop;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
+#[path = "collections/queue_struct_pop.rs"]
+mod queue_struct_pop;
+#[path = "collections/deferred_retsnap_slow_path.rs"]
+mod deferred_retsnap_slow_path;
+#[path = "collections/assoc_locator_methods.rs"]
+mod assoc_locator_methods;
 #[path = "collections/struct_dynamic_members.rs"]
 mod struct_dynamic_members;
+#[path = "collections/typedef_and_fixed_collections.rs"]
+mod typedef_and_fixed_collections;
+#[path = "collections/block_local_shadow_module.rs"]
+mod block_local_shadow_module;
+#[path = "collections/pattern_equality.rs"]
+mod pattern_equality;
+#[path = "collections/compiled_string_queue_element_compare.rs"]
+mod compiled_string_queue_element_compare;
+#[path = "collections/package_refs_in_subroutines.rs"]
+mod package_refs_in_subroutines;
+#[path = "collections/nested_assoc_foreach.rs"]
+mod nested_assoc_foreach;
+#[path = "collections/assoc_formal_struct_elems.rs"]
+mod assoc_formal_struct_elems;
+#[path = "collections/function_collection_return.rs"]
+mod function_collection_return;
 #[path = "collections/struct_dynamic_members_instances.rs"]
 mod struct_dynamic_members_instances;
 #[path = "collections/typedef_alias_dims.rs"]
 mod typedef_alias_dims;
-#[path = "collections/typedef_and_fixed_collections.rs"]
-mod typedef_and_fixed_collections;
+#[path = "collections/declarator_typedef_dims.rs"]
+mod declarator_typedef_dims;
+#[path = "collections/package_var_collisions.rs"]
+mod package_var_collisions;
+#[path = "collections/foreach_typedef_neighbours_312.rs"]
+mod foreach_typedef_neighbours_312;
 
 #[path = "collections/member_stream_340.rs"]
 mod member_stream_340;
@@ -198,6 +206,9 @@ mod next_rest_whole_array_nba_381;
 
 #[path = "collections/collection_returns_387.rs"]
 mod collection_returns_387;
+
+#[path = "collections/unpacked_row_nonblocking_assign.rs"]
+mod unpacked_row_nonblocking_assign;
 
 #[path = "collections/review_package_collection_aliases.rs"]
 mod review_package_collection_aliases;
@@ -236,3 +247,169 @@ mod enclosing_value_parameter_specialization;
 
 #[path = "collections/lexical_value_parameter_specialization.rs"]
 mod lexical_value_parameter_specialization;
+
+#[path = "collections/parameterized_vif_specialization_cast.rs"]
+mod parameterized_vif_specialization_cast;
+
+#[path = "collections/coll_rows_typed_by_declaration.rs"]
+mod coll_rows_typed_by_declaration;
+
+#[path = "collections/coll_shape_iteration.rs"]
+mod coll_shape_iteration;
+
+#[path = "collections/review_coll_shape_rows.rs"]
+mod review_coll_shape_rows;
+#[path = "collections/review_aggregate_unknown_compare_1043.rs"]
+mod review_aggregate_unknown_compare_1043;
+#[path = "collections/review_packed_pattern_compare_1043.rs"]
+mod review_packed_pattern_compare_1043;
+#[path = "collections/review_packed_struct_member_select_1046.rs"]
+mod review_packed_struct_member_select_1046;
+
+#[path = "collections/string_key_escaping.rs"]
+mod string_key_escaping;
+
+#[path = "collections/assoc_locator_keys.rs"]
+mod assoc_locator_keys;
+
+#[path = "collections/review_wide_assoc_keys.rs"]
+mod review_wide_assoc_keys;
+
+#[path = "collections/numeric_string_keys_781.rs"]
+mod numeric_string_keys_781;
+
+#[path = "collections/locator_result_size_779.rs"]
+mod locator_result_size_779;
+
+#[path = "collections/nested_row_locators_780.rs"]
+mod nested_row_locators_780;
+
+#[path = "collections/enum_locator_p_782.rs"]
+mod enum_locator_p_782;
+#[path = "collections/assoc_store_context_width.rs"]
+mod assoc_store_context_width;
+#[path = "collections/locator_result_methods.rs"]
+mod locator_result_methods;
+
+#[path = "collections/nested_row_locators.rs"]
+mod nested_row_locators;
+
+#[path = "collections/string_key_order.rs"]
+mod string_key_order;
+
+#[path = "collections/review_real_assoc_store.rs"]
+mod review_real_assoc_store;
+
+#[path = "collections/reduction_with_struct_field.rs"]
+mod reduction_with_struct_field;
+
+#[path = "collections/compiled_queue_last_index.rs"]
+mod compiled_queue_last_index;
+#[path = "collections/unpacked_2d_element_width.rs"]
+mod unpacked_2d_element_width;
+#[path = "collections/assoc_pattern_ident_key.rs"]
+mod assoc_pattern_ident_key;
+#[path = "collections/review_940_exists_rows.rs"]
+mod review_940_exists_rows;
+#[path = "collections/review_959_assoc_part_selects.rs"]
+mod review_959_assoc_part_selects;
+#[path = "collections/review_queue_read_past_size_948.rs"]
+mod review_queue_read_past_size_948;
+
+#[path = "collections/dyn_collection_compiled_read.rs"]
+mod dyn_collection_compiled_read;
+#[path = "collections/dyn_collection_compiled_read_live.rs"]
+mod dyn_collection_compiled_read_live;
+#[path = "collections/dyn_row_array_queries.rs"]
+mod dyn_row_array_queries;
+#[path = "collections/dyn_row_sized_new_copy.rs"]
+mod dyn_row_sized_new_copy;
+
+#[path = "collections/assoc_elem_select_read.rs"]
+mod assoc_elem_select_read;
+#[path = "collections/assoc_packed_elem.rs"]
+mod assoc_packed_elem;
+#[path = "collections/packed_struct_member_idx_select.rs"]
+mod packed_struct_member_idx_select;
+#[path = "collections/real_unpacked_concat_items.rs"]
+mod real_unpacked_concat_items;
+#[path = "collections/review_unpacked_concat_1322.rs"]
+mod review_unpacked_concat_1322;
+#[path = "collections/unpacked_case_compare.rs"]
+mod unpacked_case_compare;
+#[path = "collections/unpacked_concat_fixed_row.rs"]
+mod unpacked_concat_fixed_row;
+#[path = "collections/unpacked_row_pattern_store.rs"]
+mod unpacked_row_pattern_store;
+#[path = "collections/unpacked_row_pattern_followups.rs"]
+mod unpacked_row_pattern_followups;
+
+#[path = "collections/concat_actual_queue_formal.rs"]
+mod concat_actual_queue_formal;
+
+#[path = "collections/concat_actual_fixed_array_formal.rs"]
+mod concat_actual_fixed_array_formal;
+
+#[path = "collections/unpacked_packed_elem_pattern.rs"]
+mod unpacked_packed_elem_pattern;
+
+#[path = "collections/package_array_operand_in_method.rs"]
+mod package_array_operand_in_method;
+
+#[path = "collections/unpacked_struct_concat_1035.rs"]
+mod unpacked_struct_concat_1035;
+#[path = "collections/struct_concat_registered.rs"]
+mod struct_concat_registered;
+
+#[path = "collections/call_returned_array_whole_value_1036.rs"]
+mod call_returned_array_whole_value_1036;
+
+#[path = "collections/struct_array_shape_copies_1057.rs"]
+mod struct_array_shape_copies_1057;
+
+#[path = "collections/queue_sort_packed_members_1059.rs"]
+mod queue_sort_packed_members_1059;
+
+#[path = "collections/paren_aggregate_compare_1085.rs"]
+mod paren_aggregate_compare_1085;
+#[path = "collections/queue_of_queues_push_concat.rs"]
+mod queue_of_queues_push_concat;
+#[path = "collections/typedef_row_queue_of_queues_locals.rs"]
+mod typedef_row_queue_of_queues_locals;
+#[path = "collections/review_queue_of_queues_push_1086.rs"]
+mod review_queue_of_queues_push_1086;
+
+#[path = "collections/assoc_struct_delete_1124.rs"]
+mod assoc_struct_delete_1124;
+#[path = "collections/review_typedef_row_class_properties_216.rs"]
+mod review_typedef_row_class_properties_216;
+
+#[path = "collections/dyn_array_of_dyn_array_rows.rs"]
+mod dyn_array_of_dyn_array_rows;
+
+#[path = "collections/pattern_array_items.rs"]
+mod pattern_array_items;
+#[path = "collections/pattern_replication_evaluated_once.rs"]
+mod pattern_replication_evaluated_once;
+#[path = "collections/pattern_struct_array_and_slice_items.rs"]
+mod pattern_struct_array_and_slice_items;
+#[path = "collections/pattern_struct_element_items.rs"]
+mod pattern_struct_element_items;
+#[path = "collections/struct_concat_forms.rs"]
+mod struct_concat_forms;
+#[path = "collections/queue_front_shift.rs"]
+mod queue_front_shift;
+#[path = "collections/stream_with_range_1197.rs"]
+mod stream_with_range_1197;
+#[path = "collections/stream_with_range_unpack.rs"]
+mod stream_with_range_unpack;
+#[path = "collections/pattern_self_read.rs"]
+mod pattern_self_read;
+#[path = "collections/pattern_self_read_scopes.rs"]
+mod pattern_self_read_scopes;
+#[path = "collections/queue_pop_drain_loop_1210.rs"]
+mod queue_pop_drain_loop_1210;
+#[path = "collections/unpacked_concat_targets.rs"]
+mod unpacked_concat_targets;
+#[path = "collections/concat_operand_effects.rs"]
+mod concat_operand_effects;

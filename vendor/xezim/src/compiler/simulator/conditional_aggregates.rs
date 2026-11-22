@@ -26,6 +26,11 @@ enum AggregateKind {
         dynamic: bool,
     },
     Struct(Vec<(String, AggregateValue)>),
+    Assoc {
+        entries: Vec<(String, AggregateValue)>,
+        string_keyed: bool,
+        default: Option<Value>,
+    },
 }
 
 impl AggregateValue {
@@ -42,6 +47,24 @@ impl AggregateValue {
                     && a.iter()
                         .zip(b)
                         .all(|((an, a), (bn, b))| an == bn && a.equivalent(b))
+            }
+            (
+                AggregateKind::Assoc {
+                    entries: a,
+                    default: ad,
+                    ..
+                },
+                AggregateKind::Assoc {
+                    entries: b,
+                    default: bd,
+                    ..
+                },
+            ) => {
+                ad == bd
+                    && a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|((ak, av), (bk, bv))| ak == bk && av.equivalent(bv))
             }
             _ => false,
         }
@@ -69,6 +92,7 @@ impl AggregateValue {
                     *v = v.clone().defaulted();
                 }
             }
+            AggregateKind::Assoc { entries, .. } => entries.clear(),
         }
         self
     }
@@ -95,6 +119,135 @@ impl AggregateValue {
 }
 
 impl Simulator {
+    /// §10.10: unpacked struct elements are member values, not packed
+    /// placeholders. Snapshot every operand before writing a possibly aliased
+    /// destination, preserving strings, reals and nested member arrays.
+    pub(super) fn assign_struct_concat(&mut self, name: &str, items: Vec<&Expression>) -> bool {
+        let Some(su) = self.queue_elem_struct(name) else {
+            return false;
+        };
+        let dt = DataType::Struct(su);
+        let mut values = Vec::new();
+        for item in items {
+            self.snapshot_struct_concat_item(item, &dt, &mut values);
+        }
+        let dynamic = self.module.dynamic_arrays.contains(name);
+        let (lo, hi, _) = self.module.arrays.get(name).copied().unwrap_or((0, -1, 32));
+        let descending = self.module.descending_arrays.contains(name);
+        for (pos, value) in values.iter().enumerate() {
+            if !dynamic && pos as i64 > hi - lo {
+                break;
+            }
+            let idx = if descending {
+                hi - pos as i64
+            } else {
+                lo + pos as i64
+            };
+            self.store_conditional_aggregate(&format!("{name}[{idx}]"), value);
+        }
+        if dynamic {
+            self.set_queue_size(name, values.len() as u64);
+        }
+        true
+    }
+
+    fn snapshot_struct_concat_item(
+        &mut self,
+        item: &Expression,
+        dt: &DataType,
+        values: &mut Vec<AggregateValue>,
+    ) {
+        let item = Self::unparen(item);
+        if let ExprKind::Concatenation(parts) = &item.kind {
+            for part in parts {
+                self.snapshot_struct_concat_item(part, dt, values);
+            }
+            return;
+        }
+        if let Some(selected) = self.selected_aggregate_rhs(None, item) {
+            self.snapshot_struct_concat_item(&selected, dt, values);
+            return;
+        }
+        let frozen = self.freeze_conditional_path(item, true);
+        let (source, slice) = match &frozen.kind {
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let base = self.freeze_conditional_path(expr, true);
+                let source = self.queue_actual_storage(&base);
+                let upper = source.as_deref().map_or(-1, |n| {
+                    if self.module.dynamic_arrays.contains(n) {
+                        self.get_queue_size(n) as i64 - 1
+                    } else {
+                        self.module.arrays.get(n).map_or(-1, |a| a.1)
+                    }
+                });
+                self.dollar_bound.push(upper);
+                let l = self.eval_expr(left).to_i64();
+                let r = self.eval_expr(right).to_i64();
+                self.dollar_bound.pop();
+                let slice = l.zip(r).map(|(l, r)| match kind {
+                    RangeKind::Constant => (l, r),
+                    RangeKind::IndexedUp => (l, l.saturating_add(r).saturating_sub(1)),
+                    RangeKind::IndexedDown => (l.saturating_sub(r).saturating_add(1), l),
+                });
+                (source, Some(slice))
+            }
+            _ => (self.queue_actual_storage(&frozen), None),
+        };
+        if let Some(source) = source {
+            let (lo, hi, _) = self
+                .module
+                .arrays
+                .get(&source)
+                .copied()
+                .unwrap_or((0, -1, 32));
+            let hi = if self.module.dynamic_arrays.contains(&source) {
+                self.get_queue_size(&source) as i64 - 1
+            } else {
+                hi
+            };
+            let mut indices: Vec<i64> = match slice {
+                Some(Some((l, r))) => (l.max(lo)..=r.min(hi)).collect(),
+                Some(None) => Vec::new(),
+                None => (lo..=hi).collect(),
+            };
+            if self.module.descending_arrays.contains(&source) {
+                indices.reverse();
+            }
+            let base = Self::hier_ident_expr(
+                vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: source,
+                        span: item.span,
+                    },
+                    selects: Vec::new(),
+                }],
+                item.span,
+            );
+            for idx in indices {
+                values.push(self.snapshot_aggregate_shape(
+                    &Self::index_expr(&base, idx),
+                    dt,
+                    &[],
+                    false,
+                ));
+            }
+        } else {
+            if matches!(frozen.kind, ExprKind::Call { .. })
+                && let Some(value) = self.snapshot_aggregate_operand(&frozen, None)
+            {
+                values.push(value);
+                return;
+            }
+            let item = self.unpacked_pattern(&frozen).clone();
+            values.push(self.snapshot_aggregate_shape(&item, dt, &[], false));
+        }
+    }
+
     pub(super) fn is_unpacked_aggregate_operand(&mut self, e: &Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(inner) => return self.is_unpacked_aggregate_operand(inner),
@@ -297,7 +450,7 @@ impl Simulator {
                             LogicBit::Z => 'z',
                         })
                         .collect(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 span,
             )
@@ -306,8 +459,8 @@ impl Simulator {
             ExprKind::Paren(inner) => return self.freeze_conditional_path(inner, evaluate),
             ExprKind::Ident(h) => {
                 let mut h = h.clone();
-                h.cached_signal_id = std::cell::Cell::new(None);
-                h.cached_resolved_name = std::cell::OnceCell::new();
+                h.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                h.cached_resolved_name = crate::ast::cache::NameCache::new();
                 for seg in &mut h.path {
                     for sel in &mut seg.selects {
                         let value = if evaluate {
@@ -396,8 +549,9 @@ impl Simulator {
         if let ExprKind::Call { func, .. } = &e.kind {
             let dt = self.call_return_type(func)?;
             self.pending_ret_collection = None;
+            self.vm_ret_vals = None;
             let value = self.eval_expr(e);
-            if let Some(name) = self.pending_ret_collection.take() {
+            if let Some(name) = self.take_pending_ret_collection() {
                 let ident = Self::hier_ident_expr(
                     vec![crate::ast::expr::HierPathSegment {
                         name: crate::ast::Identifier {
@@ -554,12 +708,13 @@ impl Simulator {
                         None => Some(Self::struct_member_lvalue(e, &decl.name.name)),
                     };
                     if let Some(child) = child {
-                        let dims = self
-                            .member_dim_indices(&decl.dimensions)
-                            .unwrap_or_default();
                         fields.push((
                             decl.name.name.clone(),
-                            self.snapshot_aggregate_shape(&child, &member.data_type, &dims, false),
+                            self.snapshot_declared_member(
+                                &child,
+                                &member.data_type,
+                                &decl.dimensions,
+                            ),
                         ));
                     }
                     pos += 1;
@@ -570,9 +725,9 @@ impl Simulator {
             let resolved = self.resolve_dt(dt);
             let value = match Self::ret_conv_of(&resolved, &self.module.typedef_types) {
                 RetConv::Keep => self.eval_expr(e),
-                RetConv::Real => {
+                conv @ (RetConv::Real | RetConv::ShortReal) => {
                     let raw = self.eval_expr(e);
-                    Self::ret_convert(raw, RetConv::Real, 64, None)
+                    Self::ret_convert(raw, conv, 64, None)
                 }
                 RetConv::Int { two_state } => {
                     let width = super::elaborate::resolve_type_width(
@@ -631,6 +786,295 @@ impl Simulator {
         }
     }
 
+    fn snapshot_declared_member(
+        &mut self,
+        expr: &Expression,
+        dt: &DataType,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> AggregateValue {
+        use crate::ast::types::UnpackedDimension as UD;
+        if matches!(
+            dims.first(),
+            Some(UD::Queue { .. } | UD::Unsized(_) | UD::Associative { .. })
+        ) && let Some(name) = self.flat_member_name(expr)
+        {
+            self.ensure_struct_member_coll(&name);
+            if matches!(dims.first(), Some(UD::Associative { .. })) {
+                let string_keyed = self.string_keyed_dim(&dims[0]);
+                let default = self
+                    .module
+                    .assoc_defaults
+                    .get(&name)
+                    .cloned()
+                    .map(|e| self.eval_expr(&e));
+                let keys = self.assoc_top_level_keys(&name);
+                let entries = keys
+                    .into_iter()
+                    .map(|key| {
+                        let leaf = Self::hier_ident_expr(
+                            vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: format!("{name}[{key}]"),
+                                    span: expr.span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            expr.span,
+                        );
+                        (key, self.snapshot_declared_member(&leaf, dt, &dims[1..]))
+                    })
+                    .collect();
+                return AggregateValue {
+                    data_type: dt.clone(),
+                    kind: AggregateKind::Assoc {
+                        entries,
+                        string_keyed,
+                        default,
+                    },
+                };
+            }
+            let mut indices = vec![(0..self.get_queue_size(&name) as i64).collect()];
+            indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
+            return self.snapshot_aggregate_shape(expr, dt, &indices, true);
+        }
+        // §10.9.1: a pattern for a queue or dynamic array member has one
+        // element per item.
+        if matches!(dims.first(), Some(UD::Queue { .. } | UD::Unsized(_)))
+            && let ExprKind::AssignmentPattern(items) = &Self::unparen(expr).kind
+        {
+            let mut indices = vec![(0..self.pattern_ordered(items).len() as i64).collect()];
+            indices.extend(self.member_dim_indices(&dims[1..]).unwrap_or_default());
+            return self.snapshot_aggregate_shape(Self::unparen(expr), dt, &indices, true);
+        }
+        let indices = self.member_dim_indices(dims).unwrap_or_default();
+        self.snapshot_aggregate_shape(expr, dt, &indices, false)
+    }
+
+    /// The pattern of the typed pattern `e`, `T'{...}`, when `T` is not
+    /// packed. An unpacked target has an equivalent type (§6.22.2), so the
+    /// items place as an untyped pattern's; a packed `T'{...}` is a value.
+    pub(super) fn unpacked_typed_pattern<'e>(
+        &mut self,
+        e: &'e Expression,
+    ) -> Option<&'e Expression> {
+        match &e.kind {
+            ExprKind::TypedPattern { ty, pattern } if !is_packed(ty, self) => Some(pattern),
+            _ => None,
+        }
+    }
+
+    /// `e`, or its pattern when it is an unpacked typed pattern.
+    pub(super) fn unpacked_pattern<'e>(&mut self, e: &'e Expression) -> &'e Expression {
+        self.unpacked_typed_pattern(e).unwrap_or(e)
+    }
+
+    /// The element type and unpacked dimensions of the unpacked type `ty`
+    /// (an unpacked array typedef, or an unpacked struct).
+    fn unpacked_type_shape(
+        &mut self,
+        ty: &DataType,
+    ) -> Option<(DataType, Vec<crate::ast::types::UnpackedDimension>)> {
+        let mut dims = Vec::new();
+        let mut cur = ty.clone();
+        for _ in 0..16 {
+            let DataType::TypeReference { name, .. } = &cur else {
+                break;
+            };
+            let key = if name.has_scope() {
+                name.qualified()
+            } else {
+                name.name.name.clone()
+            };
+            let Some(d) = self
+                .typedef_unpacked_dims_of(&key)
+                .filter(|d| !d.is_empty())
+            else {
+                break;
+            };
+            dims.extend(d.iter().cloned());
+            let base = if name.has_scope() {
+                super::elaborate::lookup_scoped_type(name, &self.module.typedef_types).cloned()
+            } else {
+                self.lookup_typedef_target(&key)
+            };
+            cur = base?;
+        }
+        if dims.is_empty() && self.unpacked_struct_of(&cur).is_none() {
+            return None;
+        }
+        Some((cur, dims))
+    }
+
+    /// §10.9: run `f` on storage holding the value of the typed pattern `e`
+    /// of an unpacked type `T`, a variable of type `T` initialized with the
+    /// pattern, then release it. None for any other expression.
+    pub(super) fn with_typed_pattern_storage<R>(
+        &mut self,
+        e: &Expression,
+        f: impl FnOnce(&mut Self, &Expression) -> R,
+    ) -> Option<R> {
+        let ExprKind::TypedPattern { ty, pattern } = &e.kind else {
+            return None;
+        };
+        self.with_pattern_storage(pattern, ty, e.span, f)
+    }
+
+    /// §10.9: run `f` on storage holding the value of `pattern` taken in
+    /// the unpacked type `ty` — a variable of type `ty` initialized with
+    /// the pattern — then release it. None when `ty` is not an unpacked
+    /// aggregate type or the pattern cannot be snapshotted against it.
+    /// The snapshot goes through `snapshot_aggregate_operand`, so a
+    /// conditional pattern is selected arm by arm, as an assignment's
+    /// conditional aggregate is.
+    fn with_pattern_storage<R>(
+        &mut self,
+        pattern: &Expression,
+        ty: &DataType,
+        span: crate::ast::Span,
+        f: impl FnOnce(&mut Self, &Expression) -> R,
+    ) -> Option<R> {
+        let (dt, dims) = self.unpacked_type_shape(ty)?;
+        let value =
+            self.snapshot_aggregate_operand(pattern, Some(AggregateContext::Declared(&dt, &dims)))?;
+        self.typed_pattern_seq += 1;
+        let name = format!("__xz_typed_pattern_{}__", self.typed_pattern_seq);
+        self.store_conditional_aggregate(&name, &value);
+        let held = Self::hier_ident_expr(
+            vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: name.clone(),
+                    span,
+                },
+                selects: Vec::new(),
+            }],
+            span,
+        );
+        let out = f(self, &held);
+        self.release_conditional_aggregate(&name, &value);
+        self.typed_pattern_seq -= 1;
+        Some(out)
+    }
+
+    /// The packed transport value of the typed pattern `e` with an unpacked
+    /// struct type, as an unpacked struct return carries it.
+    pub(super) fn typed_struct_pattern_value(&mut self, e: &Expression) -> Option<Value> {
+        let ExprKind::TypedPattern { ty, .. } = &e.kind else {
+            return None;
+        };
+        let su = self.unpacked_struct_of(ty)?;
+        self.with_typed_pattern_storage(e, |sim, held| {
+            let ExprKind::Ident(h) = &held.kind else {
+                return None;
+            };
+            sim.pack_unpacked_struct(&h.path[0].name.name, &su)
+        })?
+    }
+
+    /// The packed transport value of the pattern `pattern` taken in the
+    /// unpacked struct type `dt` (§10.9, §13.4.1): a pattern returned from
+    /// a function or method of that type, carried as an unpacked struct
+    /// return carries a struct variable. None when `dt` is not an unpacked
+    /// struct, or carries unpacked dimensions of its own (an array of
+    /// structs is a collection return, not a struct return).
+    pub(super) fn unpacked_struct_pattern_value(
+        &mut self,
+        pattern: &Expression,
+        dt: &DataType,
+    ) -> Option<Value> {
+        let su = self.unpacked_struct_of(dt)?;
+        let (_, dims) = self.unpacked_type_shape(dt)?;
+        if !dims.is_empty() {
+            return None;
+        }
+        self.with_pattern_storage(pattern, dt, pattern.span, |sim, held| {
+            let ExprKind::Ident(h) = &held.kind else {
+                return None;
+            };
+            let v = sim.pack_unpacked_struct(&h.path[0].name.name, &su);
+            // §7.10, §7.5: queue, dynamic and associative members do not
+            // fit the packed transport; they are staged beside it.
+            if v.is_some() && sim.struct_colls_possible() {
+                sim.stage_ret_struct_colls(held);
+            }
+            v
+        })?
+    }
+
+    /// §10.9, §13.4.1: execute `return e` for a pattern `e` returned as an
+    /// unpacked array or queue of unpacked structs. The pattern is built in
+    /// storage of the return type and that storage is returned, as a
+    /// variable of the type is. False for any other return.
+    pub(super) fn return_pattern_in_storage(
+        &mut self,
+        e: &Expression,
+        span: crate::ast::Span,
+    ) -> bool {
+        let e = self.unpacked_pattern(Self::unparen(e));
+        if !matches!(
+            e.kind,
+            ExprKind::AssignmentPattern(_) | ExprKind::Conditional { .. }
+        ) || !crate::compiler::packed_assignment_pattern_plan::has_pattern(e)
+        {
+            return false;
+        }
+        let Some(dt) = self.return_frame_type() else {
+            return false;
+        };
+        let Some((elem, dims)) = self.unpacked_type_shape(&dt) else {
+            return false;
+        };
+        if dims.is_empty() || self.unpacked_struct_of(&elem).is_none() {
+            return false;
+        }
+        self.with_pattern_storage(e, &dt, e.span, |sim, held| {
+            sim.exec_statement(&Statement::new(
+                StatementKind::Return(Some(held.clone())),
+                span,
+            ));
+        })
+        .is_some()
+    }
+
+    /// Remove what `store_conditional_aggregate` stored for `value`.
+    fn release_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
+        self.module.var_decl_types.remove(name);
+        self.module.arrays.remove(name);
+        self.module.arrays_2d.remove(name);
+        self.module.arrays_nd.remove(name);
+        self.module.dynamic_arrays.remove(name);
+        self.module.unpacked_decl_dims.remove(name);
+        self.module.descending_arrays.remove(name);
+        self.module.associative_arrays.remove(name);
+        self.module.assoc_defaults.remove(name);
+        match &value.kind {
+            AggregateKind::Scalar { .. } => {
+                self.signals.remove(name);
+            }
+            AggregateKind::Struct(fields) => {
+                for (field, value) in fields {
+                    self.release_conditional_aggregate(&format!("{name}.{field}"), value);
+                }
+            }
+            AggregateKind::Assoc { entries, .. } => {
+                for (key, child) in entries {
+                    self.release_conditional_aggregate(&format!("{name}[{key}]"), child);
+                }
+            }
+            AggregateKind::Array {
+                indices,
+                values,
+                dynamic,
+            } => {
+                if *dynamic {
+                    self.signals.remove(&Self::name_with_suffix(name, ".size"));
+                }
+                for (i, child) in indices.iter().zip(values) {
+                    self.release_conditional_aggregate(&format!("{name}[{i}]"), child);
+                }
+            }
+        }
+    }
+
     fn store_conditional_aggregate(&mut self, name: &str, value: &AggregateValue) {
         self.module
             .var_decl_types
@@ -643,11 +1087,39 @@ impl Simulator {
         self.module.descending_arrays.remove(name);
         match &value.kind {
             AggregateKind::Scalar { value, .. } => {
-                self.signals.insert(name.into(), value.clone());
+                // §10.10: storing an element must update its live member cells,
+                // including change notification. Temporaries and queue leaves
+                // without registered cells retain their map-backed storage.
+                if self.signal_name_to_id.contains_key(name)
+                    || resolve_array_elem_id(name, &self.array_first_id).is_some()
+                {
+                    self.set_signal_value_by_name(name, value.clone());
+                } else {
+                    self.signals.insert(name.into(), value.clone());
+                }
             }
             AggregateKind::Struct(fields) => {
                 for (field, value) in fields {
                     self.store_conditional_aggregate(&format!("{name}.{field}"), value);
+                }
+            }
+            AggregateKind::Assoc {
+                entries,
+                string_keyed,
+                default,
+            } => {
+                self.module
+                    .associative_arrays
+                    .insert(name.into(), *string_keyed);
+                self.eval_builtin_method(name, "delete", &[]);
+                if let Some(default) = default {
+                    let expr = self.value_method_arg_expr(default);
+                    self.module.assoc_defaults.insert(name.into(), expr);
+                } else {
+                    self.module.assoc_defaults.remove(name);
+                }
+                for (key, child) in entries {
+                    self.store_conditional_aggregate(&format!("{name}[{key}]"), child);
                 }
             }
             AggregateKind::Array {

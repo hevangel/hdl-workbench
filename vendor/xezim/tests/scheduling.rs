@@ -14,6 +14,9 @@
 #[path = "scheduling/concurrent_struct_formal_geometry.rs"]
 mod concurrent_struct_formal_geometry;
 
+#[path = "scheduling/finite_zero_delay_phase.rs"]
+mod finite_zero_delay_phase;
+
 #[path = "scheduling/named_branch_frames.rs"]
 mod named_branch_frames;
 
@@ -88,6 +91,8 @@ mod comb_result_clobbered_by_process;
 mod computed_edge_expressions;
 #[path = "scheduling/condition_waiter_name_gate.rs"]
 mod condition_waiter_name_gate;
+#[path = "scheduling/continuous_assign_time_unit.rs"]
+mod continuous_assign_time_unit;
 #[path = "scheduling/dead_clock_watchdog.rs"]
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
@@ -102,6 +107,10 @@ mod delay_spike_warning;
 mod determinism_and_stall;
 #[path = "scheduling/disable_loop_label.rs"]
 mod disable_loop_label;
+#[path = "scheduling/disable_own_block_and_loop_jumps.rs"]
+mod disable_own_block_and_loop_jumps;
+#[path = "scheduling/disable_same_named_blocks.rs"]
+mod disable_same_named_blocks;
 #[path = "scheduling/edge_delivery.rs"]
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
@@ -130,6 +139,8 @@ mod forever_break_and_disable_fork_label;
 mod fork_automatic_capture;
 #[path = "scheduling/fork_children_start_in_spawn_slot.rs"]
 mod fork_children_start_in_spawn_slot;
+#[path = "scheduling/fork_intra_assignment_child_start.rs"]
+mod fork_intra_assignment_child_start;
 #[path = "scheduling/fork_join_edge.rs"]
 mod fork_join_edge;
 #[path = "scheduling/fork_join_none_await_context.rs"]
@@ -146,10 +157,16 @@ mod gap_fixes_scoping_and_nba;
 mod gate_rise_fall_delay;
 #[path = "scheduling/iff_guard_module_scope.rs"]
 mod iff_guard_module_scope;
+#[path = "scheduling/intra_assignment_array_capture.rs"]
+mod intra_assignment_array_capture;
 #[path = "scheduling/intra_assignment_delay.rs"]
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]
 mod intra_assignment_event_identifier;
+#[path = "scheduling/intra_delay_assignment_pattern.rs"]
+mod intra_delay_assignment_pattern;
+#[path = "scheduling/intra_delay_unpacked_array_shapes.rs"]
+mod intra_delay_unpacked_array_shapes;
 #[path = "scheduling/issue_237_mixed_clock_configs.rs"]
 mod issue_237_mixed_clock_configs;
 #[path = "scheduling/ivtest_always_cluster.rs"]
@@ -180,6 +197,8 @@ mod nba_fast_vs_queue_order;
 mod nba_index_freeze_and_elem_selects;
 #[path = "scheduling/nba_intra_event_control.rs"]
 mod nba_intra_event_control;
+#[path = "scheduling/nonblocking_update_rewakes_star_block.rs"]
+mod nonblocking_update_rewakes_star_block;
 #[path = "scheduling/nba_leak_waiter_active_region.rs"]
 mod nba_leak_waiter_active_region;
 #[path = "scheduling/nba_region_join_none_order.rs"]
@@ -192,6 +211,8 @@ mod null_mailbox_and_stall_location;
 mod oracle_timing_semantics;
 #[path = "scheduling/parallel_dispatch_expr_fallback.rs"]
 mod parallel_dispatch_expr_fallback;
+#[path = "scheduling/unit_assertion_contexts_721.rs"]
+mod unit_assertion_contexts_721;
 #[path = "scheduling/preprocessor_diagnostic_location.rs"]
 mod preprocessor_diagnostic_location;
 #[path = "scheduling/preprocessor_github_issues.rs"]
@@ -216,6 +237,8 @@ mod select_event_terms;
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]
 mod shared_edge_outputs;
+#[path = "scheduling/shared_task_frames.rs"]
+mod shared_task_frames;
 #[path = "scheduling/specify_delays_and_event_list.rs"]
 mod specify_delays_and_event_list;
 #[path = "scheduling/star_sensitivity_and_implicit_port_net.rs"]
@@ -226,6 +249,10 @@ mod static_local_nba_per_instance;
 mod struct_member_read_sensitivity;
 #[path = "scheduling/suspending_loop_depth_and_continue.rs"]
 mod suspending_loop_depth_and_continue;
+#[path = "scheduling/sva_delay_operand_forms.rs"]
+mod sva_delay_operand_forms;
+#[path = "scheduling/sva_multiclock_delay_then_clock.rs"]
+mod sva_multiclock_delay_then_clock;
 #[path = "scheduling/sva_time0_default_samples.rs"]
 mod sva_time0_default_samples;
 #[path = "scheduling/task_body_delay_scaling.rs"]
@@ -254,6 +281,8 @@ mod waiter_edge_ordering;
 mod xtrace_conformance;
 #[path = "scheduling/zero_delay_inactive_region.rs"]
 mod zero_delay_inactive_region;
+#[path = "scheduling/zero_delay_task_recursion.rs"]
+mod zero_delay_task_recursion;
 
 #[path = "scheduling/compiled_for_loops.rs"]
 mod compiled_for_loops;
@@ -264,6 +293,8 @@ mod always_value_change_after_edge_continuation;
 mod bare_randomize_in_method;
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/class_event_parked_watchers.rs"]
+mod class_event_parked_watchers;
 #[path = "scheduling/class_nonevent_prop_wait.rs"]
 mod class_nonevent_prop_wait;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
@@ -272,10 +303,15 @@ mod clock_gen_dotted_target;
 mod clock_gen_fifo_rank;
 #[path = "scheduling/clocking_cont_trigger_same_step.rs"]
 mod clocking_cont_trigger_same_step;
+#[path = "scheduling/comb_packed_element_sensitivity.rs"]
+mod comb_packed_element_sensitivity;
+#[path = "scheduling/comb_sens_param_range.rs"]
+mod comb_sens_param_range;
 #[path = "scheduling/comb_self_member_sensitivity.rs"]
 mod comb_self_member_sensitivity;
 #[path = "scheduling/delay_always_compound_body.rs"]
 mod delay_always_compound_body;
+#[path = "scheduling/delayed_struct_array_member.rs"] mod delayed_struct_array_member;
 #[path = "scheduling/delayed_write_pending_semantics.rs"]
 mod delayed_write_pending_semantics;
 #[path = "scheduling/edge_skip_shared_output.rs"]
@@ -310,6 +346,12 @@ mod package_and_unit_delays_scale_by_timescale;
 mod package_cli_timescale_delay;
 #[path = "scheduling/phase_jump_static_latch.rs"]
 mod phase_jump_static_latch;
+#[path = "scheduling/release_constant_driver_from_always.rs"]
+mod release_constant_driver_from_always;
+#[path = "scheduling/release_redrive_writers_each_clock.rs"]
+mod release_redrive_writers_each_clock;
+#[path = "scheduling/partial_force_redrive_each_clock.rs"]
+mod partial_force_redrive_each_clock;
 #[path = "scheduling/release_from_level_sensitive_block.rs"]
 mod release_from_level_sensitive_block;
 #[path = "scheduling/seq_grant_nba_region_order.rs"]
@@ -387,6 +429,8 @@ mod sampled_action_468;
 #[path = "scheduling/sampled_action_array_509.rs"]
 mod sampled_action_array_509;
 
+#[path = "scheduling/sva_abort_properties.rs"]
+mod sva_abort_properties;
 #[path = "scheduling/sva_until_properties.rs"]
 mod sva_until_properties;
 
@@ -430,6 +474,106 @@ mod class_collection_named_wait;
 
 #[path = "scheduling/class_or_value_change.rs"]
 mod class_or_value_change;
+#[path = "scheduling/event_control_class_prop_expr.rs"]
+mod event_control_class_prop_expr;
 
 #[path = "scheduling/preprocessor_linear_join.rs"]
 mod preprocessor_linear_join;
+
+#[path = "scheduling/review_parked_wait_writes.rs"]
+mod review_parked_wait_writes;
+
+#[path = "scheduling/labeled_block_local_events.rs"]
+mod labeled_block_local_events;
+
+#[path = "scheduling/program_implicit_finish.rs"]
+mod program_implicit_finish;
+
+#[path = "scheduling/delay_always_constant_scaled_delay.rs"]
+mod delay_always_constant_scaled_delay;
+
+#[path = "scheduling/packed_comb_sensitivity_844.rs"]
+mod packed_comb_sensitivity_844;
+#[path = "scheduling/packed_struct_member_event.rs"]
+mod packed_struct_member_event;
+
+#[path = "scheduling/review_fork_baseline_935.rs"]
+mod review_fork_baseline_935;
+
+#[path = "scheduling/review_watchdog_drivers_938.rs"]
+mod review_watchdog_drivers_938;
+
+#[path = "scheduling/fork_child_hidden_locals_943.rs"]
+mod fork_child_hidden_locals_943;
+
+#[path = "scheduling/unpacked_struct_copy_chain.rs"]
+mod unpacked_struct_copy_chain;
+#[path = "scheduling/unpacked_struct_array_sens.rs"]
+mod unpacked_struct_array_sens;
+
+#[path = "scheduling/clocking_edge_regressions.rs"]
+mod clocking_edge_regressions;
+
+#[path = "scheduling/static_local_in_clocked_call.rs"]
+mod static_local_in_clocked_call;
+
+#[path = "scheduling/hierarchical_subroutine_static.rs"]
+mod hierarchical_subroutine_static;
+#[path = "scheduling/review_loop_jumps_and_block_disables.rs"]
+mod review_loop_jumps_and_block_disables;
+#[path = "scheduling/nba_partial_commit_order.rs"]
+mod nba_partial_commit_order;
+#[path = "scheduling/finished_process_metadata.rs"]
+mod finished_process_metadata;
+#[path = "scheduling/review_intra_delay_capture_1162.rs"]
+mod review_intra_delay_capture_1162;
+#[path = "scheduling/review_sva_abort_order_1155.rs"]
+mod review_sva_abort_order_1155;
+#[path = "scheduling/review_sva_property_operators_220.rs"]
+mod review_sva_property_operators_220;
+#[path = "scheduling/review_sva_abort_first_tick_1155.rs"]
+mod review_sva_abort_first_tick_1155;
+#[path = "scheduling/deferred_assign_reads_1149.rs"]
+mod deferred_assign_reads_1149;
+#[path = "scheduling/function_call_assign_reads_1126.rs"]
+mod function_call_assign_reads_1126;
+#[path = "scheduling/instance_array_member_reads_1108.rs"]
+mod instance_array_member_reads_1108;
+#[path = "scheduling/instance_array_member_arrays_1108.rs"]
+mod instance_array_member_arrays_1108;
+#[path = "scheduling/struct_array_actual_paths_1110.rs"]
+mod struct_array_actual_paths_1110;
+
+#[path = "scheduling/pattern_nba_1199.rs"]
+mod pattern_nba_1199;
+#[path = "scheduling/event_call_operands_1205.rs"]
+mod event_call_operands_1205;
+#[path = "scheduling/event_call_struct_arguments.rs"]
+mod event_call_struct_arguments;
+
+#[path = "scheduling/array_capture_1217.rs"]
+mod array_capture_1217;
+#[path = "scheduling/intra_delay_pattern_item_width.rs"]
+mod intra_delay_pattern_item_width;
+
+#[path = "scheduling/parked_waiter_signal_index.rs"]
+mod parked_waiter_signal_index;
+#[path = "scheduling/replication_pattern_capture.rs"]
+mod replication_pattern_capture;
+#[path = "scheduling/nettype_relay_chain_1239.rs"]
+mod nettype_relay_chain_1239;
+#[path = "scheduling/time_literal_exact_1299.rs"]
+mod time_literal_exact_1299;
+#[path = "scheduling/intra_delay_array_items.rs"]
+mod intra_delay_array_items;
+#[path = "scheduling/review_intra_delay_array_items.rs"]
+mod review_intra_delay_array_items;
+#[path = "scheduling/time0_effect_entries_1314.rs"]
+mod time0_effect_entries_1314;
+#[path = "scheduling/sva_default_actuals_1309.rs"]
+mod sva_default_actuals_1309;
+#[path = "scheduling/indexed_member_event.rs"]
+mod indexed_member_event;
+
+#[path = "scheduling/variable_assign_delay.rs"]
+mod variable_assign_delay;

@@ -10,27 +10,54 @@ impl Simulator {
         let DataType::TypeReference { name: tn, .. } = dt else {
             return None;
         };
-        // The name text may carry its package (`pkg::e_t`) while the table
-        // is keyed by the typedef's bare name, or the reverse.
-        let bare = tn.name.name.rsplit("::").next().unwrap_or(&tn.name.name);
         let members = self
             .module
             .enum_members
             .get(&tn.qualified())
-            .or_else(|| self.module.enum_members.get(&tn.name.name))
-            .or_else(|| self.module.enum_members.get(bare))
-            .or_else(|| {
-                // `import pkg::*` leaves the bare name: the one package
-                // declaring it.
-                let suffix = format!("::{bare}");
-                let mut hits = self
-                    .module
-                    .enum_members
-                    .iter()
-                    .filter(|(k, _)| k.ends_with(&suffix));
-                let first = hits.next();
-                if hits.next().is_some() { None } else { first.map(|(_, m)| m) }
-            })?;
+            .or_else(|| self.enum_members_named(&tn.name.name))?;
+        Self::enum_label(members, v)
+    }
+
+    /// The members of the enum type named `name`, following typedef aliases.
+    pub(super) fn enum_members_named(&self, name: &str) -> Option<&Vec<(String, u64)>> {
+        let mut name = name;
+        for _ in 0..8 {
+            // The name text may carry its package (`pkg::e_t`) while the
+            // table is keyed by the typedef's bare name, or the reverse.
+            let bare = name.rsplit("::").next().unwrap_or(name);
+            if let Some(m) = self
+                .module
+                .enum_members
+                .get(name)
+                .or_else(|| self.module.enum_members.get(bare))
+            {
+                return Some(m);
+            }
+            match self.module.typedef_types.get(bare) {
+                Some(DataType::TypeReference { name: next, .. }) => name = &next.name.name,
+                // A local typedef of another type hides package enums.
+                Some(_) => return None,
+                None => break,
+            }
+        }
+        // `import pkg::*` leaves the bare name: the one package declaring it.
+        let bare = name.rsplit("::").next().unwrap_or(name);
+        let suffix = format!("::{bare}");
+        let mut hits = self
+            .module
+            .enum_members
+            .iter()
+            .filter(|(k, _)| k.ends_with(&suffix));
+        let first = hits.next();
+        if hits.next().is_some() {
+            None
+        } else {
+            first.map(|(_, m)| m)
+        }
+    }
+
+    /// The label of `v` among `members`; `None` for x/z or an invalid value.
+    pub(super) fn enum_label(members: &[(String, u64)], v: &Value) -> Option<String> {
         if v.has_xz() {
             return None;
         }
@@ -159,16 +186,60 @@ impl Simulator {
             .return_type
             .clone();
         let su = self.unpacked_struct_of(&rt)?;
-        let plain = su.members.iter().all(|m| {
-            m.declarators.iter().all(|d| d.dimensions.is_empty())
-                && !matches!(self.resolve_dt_ref(&m.data_type), DataType::Struct(_))
-        });
-        if !plain {
+        if !self.struct_members_plain(&su) {
             return None;
         }
         let v = self.eval_expr(arg);
+        self.render_p_plain_struct_value(&su, &v)
+    }
+
+    /// Whether every member of `su` is a scalar of a non-struct type.
+    fn struct_members_plain(&self, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().all(|m| {
+            m.declarators.iter().all(|d| d.dimensions.is_empty())
+                && !matches!(self.resolve_dt_ref(&m.data_type), DataType::Struct(_))
+        })
+    }
+
+    /// §21.2.1.7: `%p` of a value-parameter declared with a structure type
+    /// (`localparam s_t P = '{3, 4};`), member by member. The parameter holds
+    /// the members' packed concatenation, so it printed as one number.
+    /// `None` for any other name, or an unpacked structure with an
+    /// aggregate member.
+    pub(super) fn render_p_struct_param(&mut self, name: &str) -> Option<String> {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
+            return None;
+        }
+        let dt = self.module.param_decl_types.get(name)?.clone();
+        // A packed array of structures (`ps_t [1:0] P`) is not one structure.
+        if matches!(&dt, DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()) {
+            return None;
+        }
+        let v = self.module.parameters.get(name)?.clone();
+        let DataType::Struct(su) = self.resolve_dt(&dt) else {
+            return None;
+        };
+        if su.packed {
+            return Some(self.render_p_packed(&v, &su));
+        }
+        if !self.struct_members_plain(&su) {
+            return None;
+        }
+        self.render_p_plain_struct_value(&su, &v)
+    }
+
+    /// The members of the plain unpacked structure `su` held packed in `v`.
+    fn render_p_plain_struct_value(
+        &mut self,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+    ) -> Option<String> {
         let leaves: HashMap<String, Value> =
-            self.split_packed_struct("", &su, &v).into_iter().collect();
+            self.split_packed_struct("", su, v).into_iter().collect();
         let mut parts = Vec::new();
         for m in &su.members {
             for d in &m.declarators {
@@ -428,8 +499,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span: arg.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         arg.span,
                     );
@@ -449,8 +521,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: arg.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 };
                 let resolved = self.resolve_hier_name(&ident).to_string();
                 if resolved != base
@@ -519,8 +592,18 @@ impl Simulator {
         if let Some(p) = td.ports.iter().find(|p| p.name.name == name) {
             return Some(p.data_type.clone());
         }
-        for st in &td.items {
-            if let StatementKind::VarDecl { data_type, declarators, .. } = &st.kind
+        let items = self.module.resolved_task_items(task, td);
+        for st in items.iter() {
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            }
+            | StatementKind::ParamDecl {
+                data_type,
+                declarators,
+                ..
+            } = &st.kind
                 && declarators.iter().any(|d| d.name.name == name)
             {
                 return Some(data_type.clone());
@@ -557,6 +640,7 @@ impl Simulator {
                         span: crate::ast::Span::dummy(),
                     },
                     span: crate::ast::Span::dummy(),
+                    bound: Default::default(),
                 },
                 dimensions: Vec::new(),
                 type_args: Vec::new(),
@@ -859,7 +943,7 @@ impl Simulator {
                 && self.static_struct_names.contains(prop)
                 && let Some(su) = self
                     .class_prop_struct(handle, prop)
-                    .filter(Self::spreads_member_wise)
+                    .filter(|su| Self::spreads_member_wise(su))
             {
                 return Some(self.render_p_class_prop_struct(handle, prop, &su));
             }
@@ -960,7 +1044,7 @@ impl Simulator {
         }
         let su = self
             .class_prop_struct(handle, &prop)
-            .filter(Self::spreads_member_wise)?;
+            .filter(|su| Self::spreads_member_wise(su))?;
         let mut key = prop;
         for e in idx {
             let i = self.eval_expr(e).to_i64()?;
@@ -1158,14 +1242,14 @@ impl Simulator {
                 },
                 selects: Vec::new(),
             });
-            fh.cached_signal_id = std::cell::Cell::new(None);
-            fh.cached_resolved_name = std::cell::OnceCell::new();
+            fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            fh.cached_resolved_name = crate::ast::cache::NameCache::new();
             out.push((
                 fname.clone(),
                 Expression {
                     kind: ExprKind::Ident(fh),
                     span: a.span,
-                    cached_width: std::cell::Cell::new(None),
+                    cached_width: crate::ast::cache::WidthCache::new(None),
                 },
             ));
         }
@@ -1271,13 +1355,13 @@ impl Simulator {
                 },
                 selects: Vec::new(),
             });
-            fh.cached_signal_id = std::cell::Cell::new(None);
-            fh.cached_resolved_name = std::cell::OnceCell::new();
+            fh.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+            fh.cached_resolved_name = crate::ast::cache::NameCache::new();
             let name = self.resolve_hier_name(&fh).into_owned();
             let fexpr = Expression {
                 kind: ExprKind::Ident(fh),
                 span: a.span,
-                cached_width: std::cell::Cell::new(None),
+                cached_width: crate::ast::cache::WidthCache::new(None),
             };
             out.push((name, fexpr));
         }

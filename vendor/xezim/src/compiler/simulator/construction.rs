@@ -15,24 +15,35 @@ impl Simulator {
     pub(super) fn register_dyn_member_shape(
         &mut self,
         cdef: &crate::compiler::elaborate::ElaboratedClass,
-        params: &HashMap<String, Value>,
+        overrides: &HashMap<String, Value>,
         prop: &str,
         scoped: &str,
         width: u32,
     ) {
+        let params = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: overrides,
+        };
         let fixed_tail: Option<Vec<(i64, i64)>> =
             cdef.dynamic_tail_properties.get(prop).and_then(|tail| {
                 tail.iter()
                     .map(|d| match d {
                         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
-                            let l =
-                                super::elaborate::const_eval_i64_with_params(left, Some(params))?;
-                            let r =
-                                super::elaborate::const_eval_i64_with_params(right, Some(params))?;
+                            let l = super::elaborate::const_eval_i64_with_params_env(
+                                left,
+                                Some(&params),
+                            )?;
+                            let r = super::elaborate::const_eval_i64_with_params_env(
+                                right,
+                                Some(&params),
+                            )?;
                             Some((l.min(r), l.max(r)))
                         }
                         crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
-                            match super::elaborate::const_eval_i64_with_params(expr, Some(params)) {
+                            match super::elaborate::const_eval_i64_with_params_env(
+                                expr,
+                                Some(&params),
+                            ) {
                                 Some(n) if n > 0 => Some((0, n - 1)),
                                 _ => None,
                             }
@@ -90,6 +101,9 @@ impl Simulator {
             for (prop, &(w, max)) in &cd.queue_properties {
                 let s_name = format!("{}#{}", src_handle, prop);
                 let n_name = format!("{}#{}", new_handle, prop);
+                if cd.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(n_name.clone());
+                }
                 self.module.dynamic_arrays.insert(n_name.clone());
                 if let Some(&t) = self.module.arrays_2d.get(&s_name) {
                     self.module.arrays_2d.insert(n_name.clone(), t);
@@ -140,18 +154,29 @@ impl Simulator {
                 if let Some(&kw) = widths.get(&s_pre[..s_pre.len() - 1]) {
                     widths.insert(n_name.clone(), kw);
                 }
+                // §7.4.5: a row that is a queue or dynamic array keeps its
+                // size (`<h>#m[k].size`) and its registration in the copy.
                 let entries: Vec<(String, Value)> = self
                     .signals
                     .keys_with_elem_prefix(&s_pre)
                     .into_iter()
-                    .filter(|k| k.ends_with(']'))
+                    .filter(|k| k.ends_with(']') || k.ends_with("].size"))
                     .filter_map(|k| {
                         let v = self.signals.get(&k)?.clone();
-                        Some((k[s_pre.len()..k.len() - 1].to_string(), v))
+                        Some((k[s_pre.len()..].to_string(), v))
                     })
                     .collect();
-                for (key, v) in entries {
-                    self.signals.insert(format!("{}[{}]", n_name, key), v);
+                for (rest, v) in entries {
+                    if let Some(row) = rest.strip_suffix(".size") {
+                        let (srow, nrow) = (format!("{s_pre}{row}"), format!("{n_name}[{row}"));
+                        if self.module.dynamic_arrays.contains(&srow) {
+                            self.module.dynamic_arrays.insert(nrow.clone());
+                        }
+                        if let Some(&t) = self.module.arrays.get(&srow) {
+                            self.module.arrays.insert(nrow, t);
+                        }
+                    }
+                    self.signals.insert(format!("{}[{}", n_name, rest), v);
                 }
             }
             // §8.12: a shallow copy copies every property's value — a fixed
@@ -475,7 +500,27 @@ impl Simulator {
             .map(|(_, d)| d.clone())
     }
 
-    pub(super) fn params_with_class_spec(&mut self) -> Option<HashMap<String, Value>> {
+    /// The design parameters with `spec` (`class_spec_value_params`) laid
+    /// over them, borrowed: copying the design's whole parameter table on
+    /// every evaluation inside a class method cost time linear in the
+    /// design's parameter count (#1276).
+    pub(super) fn spec_param_env<'a>(
+        &'a self,
+        spec: &'a Option<HashMap<String, Value>>,
+    ) -> super::elaborate::ParamEnv<'a> {
+        match spec {
+            Some(top) => super::elaborate::ParamEnv::Overlay {
+                base: &self.module.parameters,
+                top,
+            },
+            None => super::elaborate::ParamEnv::Single(&self.module.parameters),
+        }
+    }
+
+    /// Just the active specialization's value parameters, which
+    /// `spec_param_env` lays over `module.parameters` instead of copying
+    /// every design parameter.
+    pub(super) fn class_spec_value_params(&mut self) -> Option<HashMap<String, Value>> {
         let (base, _) = self.current_spec.clone()?;
         let names: Vec<String> = {
             let cd = self.module.classes.get(&base)?;
@@ -488,13 +533,96 @@ impl Simulator {
         if names.is_empty() {
             return None;
         }
-        let mut m = self.module.parameters.clone();
+        let mut m = HashMap::default();
         for n in names {
             if let Some(v) = self.resolve_value_param_from_spec(&n) {
                 m.insert(n, v);
             }
         }
         Some(m)
+    }
+
+    /// §8.5, §6.20.4: the parameters that size a type written inside a class
+    /// method: the active specialization's value parameters
+    /// (`class_spec_value_params`) plus the class-body constants the packed
+    /// dimensions of `dt` name (`localparam int W = 4;` ...
+    /// `$bits(logic [W-1:0])`), own or inherited. The design parameter map
+    /// holds a class constant only under its class-qualified name, so the
+    /// dimension was dropped and the type came out one bit wide (#1273).
+    pub(super) fn class_type_env(&mut self, dt: &DataType) -> Option<HashMap<String, Value>> {
+        let mut env = self.class_spec_value_params();
+        let Some(Some(ctx)) = self.class_context_stack.last().cloned() else {
+            return env;
+        };
+        let mut names: Vec<String> = Vec::new();
+        Self::type_dim_idents(dt, 0, &mut names);
+        for n in names {
+            if env.as_ref().is_some_and(|m| m.contains_key(&n)) || !self.class_body_const(&ctx, &n)
+            {
+                continue;
+            }
+            let v = self.eval_expr(&super::vpi_model::ident_expr(&n));
+            env.get_or_insert_with(HashMap::default).insert(n, v);
+        }
+        env
+    }
+
+    /// Whether `name` is a body constant (`parameter` / `localparam`, not a
+    /// header parameter) of class `cls` or of a class it extends.
+    fn class_body_const(&self, cls: &str, name: &str) -> bool {
+        let mut cur = self.module.classes.get(cls);
+        let mut depth = 0;
+        while let Some(cd) = cur {
+            if cd.param_defaults.iter().any(|(n, _)| n == name) {
+                return !cd.param_order.iter().any(|p| p == name);
+            }
+            depth += 1;
+            if depth > 64 {
+                break;
+            }
+            cur = cd.extends.as_ref().and_then(|e| self.module.classes.get(e));
+        }
+        false
+    }
+
+    /// The plain identifiers the packed dimensions of `dt` read.
+    fn type_dim_idents(dt: &DataType, depth: u32, out: &mut Vec<String>) {
+        use crate::ast::types::PackedDimension;
+        if depth > 8 {
+            return;
+        }
+        let dims = |dimensions: &[PackedDimension], out: &mut Vec<String>| {
+            for d in dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    for e in [left, right] {
+                        Self::walk_operands(e, &mut |x| {
+                            if let ExprKind::Ident(h) = &x.kind
+                                && h.path.len() == 1
+                                && !out.contains(&h.path[0].name.name)
+                            {
+                                out.push(h.path[0].name.name.clone());
+                            }
+                        });
+                    }
+                }
+            }
+        };
+        match dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => dims(dimensions, out),
+            DataType::Struct(su) => {
+                for m in &su.members {
+                    Self::type_dim_idents(&m.data_type, depth + 1, out);
+                }
+            }
+            DataType::Enum(et) => {
+                if let Some(bt) = &et.base_type {
+                    Self::type_dim_idents(bt, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Resolve a value parameter `name` against the ACTIVE specialization,
@@ -808,8 +936,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span: crate::ast::Span::dummy(),
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             crate::ast::Span::dummy(),
         );
@@ -843,7 +972,7 @@ impl Simulator {
                 signed: false,
                 base,
                 value: val_str.trim().to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         // Plain decimal integer (optional leading sign).
@@ -855,7 +984,7 @@ impl Simulator {
                 signed: neg,
                 base: NumberBase::Decimal,
                 value: body.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             });
         }
         None
@@ -1235,9 +1364,9 @@ impl Simulator {
     }
 
     /// Split a virtual-interface type fragment — `virtual [interface]
-    /// I[#(args)][.modport]` in any spacing, including the whitespace-free
-    /// canonical form — into the interface name, its raw `#(...)` arguments
-    /// and the modport. None for anything else.
+    /// I[#(args)][.modport]` in any spacing, including the canonical form —
+    /// into the interface name, its raw `#(...)` arguments and the modport.
+    /// None for anything else, including a class named `virtualI`.
     pub(super) fn parse_vif_frag(
         &self,
         frag: &str,
@@ -1246,6 +1375,9 @@ impl Simulator {
             return None;
         }
         let rest = frag.trim().strip_prefix("virtual")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let head_end = rest.find(['#', '.']).unwrap_or(rest.len());
         let head: String = rest[..head_end]
             .chars()
@@ -1295,7 +1427,7 @@ impl Simulator {
         Some((name, args, modport))
     }
 
-    /// The canonical (whitespace-free) key of `virtual name#(args).modport`
+    /// The canonical (`normalize_spec_ws`) key of `virtual name#(args).modport`
     /// (§6.22.1): named arguments moved to their slots and omitted trailing
     /// parameters filled with the interface's defaults, so `virtual I`,
     /// `virtual interface I#(int)` and `virtual I#(.T(int), .N(4))` key one
@@ -1331,7 +1463,7 @@ impl Simulator {
                 args.push(d);
             }
         }
-        let mut out = format!("virtual{}", name);
+        let mut out = format!("virtual {}", name);
         if !args.is_empty() {
             out.push_str("#(");
             out.push_str(&args.join(","));
@@ -1741,7 +1873,11 @@ impl Simulator {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if integral && signing {
+                // §25.9: `virtual bus_if` is an interface type, while
+                // `virtualbus_if` can name an unrelated class.
+                let vif = word == "virtual"
+                    && tail.starts_with(|c: char| c.is_alphabetic() || c == '_');
+                if (integral && signing) || vif {
                     out.push(' ');
                 }
             } else {
@@ -1846,12 +1982,76 @@ impl Simulator {
                 return Some(ta.clone());
             }
         }
+        if let Some(ta) = self.member_target_type_args(lvalue) {
+            return Some(ta);
+        }
         if let ExprKind::Ident(lh) = &lvalue.kind {
             if let Some(leaf) = lh.path.last() {
                 if let Some(ta) = self.this_property_type_args(&leaf.name.name) {
                     return Some(ta);
                 }
             }
+        }
+        None
+    }
+
+    /// §8.8, §8.25: `obj.m = new` (or `this.m = new`) where the class of
+    /// `obj` declares `C #(args) m;` constructs that specialization, as a
+    /// bare `m = new` in a method of `obj` would. Only where `args` mean the
+    /// same in the running scope: `obj` is `this`, or the declaring class
+    /// has no parameters (a parameterized owner's member specialization is
+    /// `receiver_member_spec`'s).
+    fn member_target_type_args(&self, lvalue: &Expression) -> Option<Vec<Expression>> {
+        let (owner, cn, prop) = self.member_target_decl(lvalue)?;
+        let cd = self.module.classes.get(&cn)?;
+        let is_this = self.this_stack.last().copied().flatten() == Some(owner);
+        if !is_this && self.class_is_parameterized(&cn) {
+            return None;
+        }
+        cd.property_type_args
+            .get(&prop)
+            .filter(|ta| !ta.is_empty())
+            .cloned()
+    }
+
+    /// For a `new` target naming a member through an object (`obj.m`,
+    /// `this.m`): the object, the class in its chain that declares the
+    /// member, and the member's name. `None` for any other target, a null
+    /// object, or a collection member (an element of one is constructed on
+    /// the element path of `exec_stmt_blocking_assign_body`).
+    fn member_target_decl(&self, lvalue: &Expression) -> Option<(usize, String, String)> {
+        let (owner, prop) = match &lvalue.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                (self.eval_handle_expr(expr)?, member.name.as_str())
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    self.eval_ident_handle(&h.path[0].name.name)?,
+                    h.path[1].name.name.as_str(),
+                )
+            }
+            _ => return None,
+        };
+        if owner == 0 {
+            return None;
+        }
+        let mut cur = Some(self.heap.get(owner)?.as_ref()?.class_name.clone());
+        for _ in 0..64 {
+            let cn = cur?;
+            let cd = self.module.classes.get(&cn)?;
+            if cd.properties.contains_key(prop) {
+                let coll = cd.array_properties.contains_key(prop)
+                    || cd.array_nd_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop);
+                if coll {
+                    return None;
+                }
+                return Some((owner, cn, prop.to_string()));
+            }
+            cur = cd.extends.clone();
         }
         None
     }
@@ -1872,6 +2072,15 @@ impl Simulator {
     /// `this`-instance inheritance chain so a base-class property (e.g.
     /// `uvm_component.event_pool`) resolves from a derived component.
     pub(super) fn this_member_typedef_spec(&self, lvalue: &Expression) -> Option<(String, String)> {
+        // §8.8: `obj.m = new` through another object (or an element of its
+        // member array) declares `m` in `obj`'s class, not in `this`'s.
+        if let Some((owner, cn, prop)) = self.member_target_decl(lvalue)
+            && self.this_stack.last().copied().flatten() != Some(owner)
+            && !self.class_is_parameterized(&cn)
+        {
+            let raw = self.module.classes.get(&cn)?.properties.get(&prop)?.type_name.as_ref()?;
+            return self.resolve_typedef_spec(raw);
+        }
         let leaf = match &lvalue.kind {
             ExprKind::Ident(h) => h.path.last()?.name.name.clone(),
             ExprKind::MemberAccess { member, .. } => member.name.clone(),
@@ -1966,6 +2175,7 @@ impl Simulator {
                             span: crate::ast::Span::dummy(),
                         },
                         span: crate::ast::Span::dummy(),
+                        bound: Default::default(),
                     },
                     dimensions: Vec::new(),
                     type_args,
@@ -2130,8 +2340,9 @@ impl Simulator {
                                 selects: Vec::new(),
                             }],
                             span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
+                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                            bound: crate::ast::binding::Bound::UNSET,
                         }),
                         span,
                     )
@@ -2152,7 +2363,7 @@ impl Simulator {
                         signed: false,
                         base: crate::ast::expr::NumberBase::Decimal,
                         value: v.to_u64()?.to_string(),
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     span,
                 )
@@ -2167,6 +2378,17 @@ impl Simulator {
         class_def: &crate::compiler::elaborate::ElaboratedClass,
         args: &[Expression],
         type_args: Option<&[Expression]>,
+    ) -> Value {
+        self.instantiate_class_in_scope(class_def, args, type_args, None)
+    }
+
+    /// §13.5.1: typed constructor actuals retain the caller's specialization.
+    pub(super) fn instantiate_class_in_scope(
+        &mut self,
+        class_def: &crate::compiler::elaborate::ElaboratedClass,
+        args: &[Expression],
+        type_args: Option<&[Expression]>,
+        caller_spec: Option<Option<(String, String)>>,
     ) -> Value {
         // Per-specialization static initialization for a PARAMETERIZED
         // class: run its static-call initializers (e.g. callback registration
@@ -2217,7 +2439,48 @@ impl Simulator {
                         .collect();
                     (frags.len() == ta.len()).then(|| frags.join(","))
                 }
-                _ => Some(String::new()),
+                // An UNSPECIALIZED `new()` (or a `create()` whose receiver
+                // lost its `#(...)` args) of a parameterized class built
+                // while a specialization of the SAME class is active: carry
+                // the active spec's type-argument signature instead of
+                // falling back to the declared DEFAULTS. The factory
+                // `reg_agent#(dut_rw)::type_id::create("bus",..)` resolves
+                // `current_spec=("reg_agent","test.dut_rw")` for the call,
+                // and the registry's body constructs with a bare `new()` —
+                // dropping the args rebuilt `reg_agent#(int)` (the default),
+                // so its member `reg_driver#(DO)` bound `DO` to `int` and
+                // `DO::rw` silently no-op'd. The bare `new` takes the active
+                // specialization of this same class (reconciling scoped
+                // `test.reg_agent` vs bare `reg_agent` spellings behind
+                // `same_class_declaration`).
+                _ => {
+                    let mut inherited: Option<String> = None;
+                    if let Some((cb, cs)) = &self.current_spec {
+                        let same = if *cb == class_name_owned {
+                            true
+                        } else {
+                            (|| {
+                                let cb2 = cb.split('#').next().unwrap_or(cb);
+                                let cn2 = class_name_owned.split('#').next().unwrap_or(&class_name_owned);
+                                if cb2 == cn2 {
+                                    return true;
+                                }
+                                match (self.module.classes.get(cb2), self.module.classes.get(cn2)) {
+                                    (Some(a), Some(b)) => {
+                                        a.name == b.name
+                                            && a.enclosing == b.enclosing
+                                            && a.declaring_module == b.declaring_module
+                                    }
+                                    _ => false,
+                                }
+                            })()
+                        };
+                        if same && !cs.trim().is_empty() {
+                            inherited = Some(cs.clone());
+                        }
+                    }
+                    inherited.or_else(|| Some(String::new()))
+                }
             };
             if let Some(raw_sig) = raw_sig {
                 let sig = self.canonicalize_spec_sig(&class_name_owned, &raw_sig);
@@ -2516,8 +2779,9 @@ impl Simulator {
                     self.shadowed_prop_names.insert(sp.clone());
                 }
             }
+            // The object is not on the heap yet, so no parked waiter reads
+            // these properties: seeding them notes no name.
             if t.property_seed_keys.is_none() {
-                bump_store_gen();
                 instance.properties = PropMap(t.base_props.clone());
             }
         }
@@ -2542,6 +2806,16 @@ impl Simulator {
                     if cdef.static_properties.contains(prop_name)
                         || cdef.assoc_properties.contains_key(prop_name)
                     {
+                        // §8.14: see `inst_template`.
+                        if cdef.static_properties.contains(prop_name)
+                            && leaf_declarer
+                                .get(prop_name.as_str())
+                                .is_some_and(|l| *l != cdef.name.as_str())
+                            && !self.shadowed_prop_names.contains(prop_name.as_str())
+                        {
+                            self.shadowed_prop_mask |= meta_key_bits(prop_name);
+                            self.shadowed_prop_names.insert(prop_name.clone());
+                        }
                         continue;
                     }
                     let seed = if leaf_declarer
@@ -2706,8 +2980,12 @@ impl Simulator {
         // Register per-instance associative-array members under an
         // instance-scoped name `<handle>#<member>` so the existing
         // signal-keyed assoc machinery gives each instance its own map.
+        let mut hidden_collections: HashSet<&str> = HashSet::default();
         for cdef in classes_to_init {
             for (prop, &is_str) in &cdef.assoc_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 self.module
                     .associative_arrays
                     .insert(format!("{}#{}", handle, prop), is_str);
@@ -2715,6 +2993,9 @@ impl Simulator {
             // §8.25: a key sized by a class parameter takes this object's
             // specialization, not the default `assoc_index_props` holds.
             for (prop, kdt) in &cdef.assoc_key_decl_types {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 if let Some(kw) = self.param_sized_key_width(kdt, &instance, &classes_to_init) {
                     let signed = cdef.assoc_index_props.get(prop).is_some_and(|&(_, s)| s);
                     self.module
@@ -2727,6 +3008,9 @@ impl Simulator {
             // package/module array path) so push_back/size/index/foreach resolve
             // to independent storage with size starting at 0.
             for (prop, &(width, max)) in &cdef.queue_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 if cdef.property_types.get(prop).is_some_and(|dt| {
                     matches!(
@@ -2736,16 +3020,19 @@ impl Simulator {
                 }) {
                     self.signed_class_colls.insert(scoped.clone());
                 }
+                if cdef.queue_property_names.contains(prop) {
+                    self.module.queue_vars.insert(scoped.clone());
+                }
                 self.module.dynamic_arrays.insert(scoped.clone());
                 // The object is not on the heap yet: its value parameters
                 // are read from the instance being built.
-                let mut params = self.module.parameters.clone();
+                let mut overrides: HashMap<String, Value> = HashMap::default();
                 for (pn, _) in &cdef.param_defaults {
                     if let Some(v) = instance.properties.get(pn) {
-                        params.insert(pn.clone(), v.clone());
+                        overrides.insert(pn.clone(), v.clone());
                     }
                 }
-                self.register_dyn_member_shape(cdef, &params, prop, &scoped, width);
+                self.register_dyn_member_shape(cdef, &overrides, prop, &scoped, width);
                 if let Some(m) = max {
                     self.module.queue_max_sizes.insert(scoped.clone(), m);
                 }
@@ -2755,6 +3042,9 @@ impl Simulator {
             // the instance-scoped name as a real fixed array and default every
             // element to 0 so index reads / foreach see a populated range.
             for (prop, &(lo, hi, width)) in &cdef.array_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's size.
                 let (lo, hi) = match cdef
@@ -2773,6 +3063,18 @@ impl Simulator {
                 // An unpacked-struct element keeps its member cells in the
                 // instance (`sta[1].f`), where member reads and writes go.
                 let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
+                // Consecutive scalar elements share the same key prefix.
+                // Keep their Values in the existing dense run while preserving
+                // every indexed cell, its declared width and its typed default.
+                let dense = elem_su.is_none() && lo < hi && (0..1_000_000_000).contains(&lo);
+                if dense {
+                    self.signals.register_element_run(&scoped, false);
+                }
+                // Width ranges use the same canonical indices as dense values.
+                let shared_width = dense && hi < 1_000_000_000;
+                if shared_width {
+                    self.widths.declare_fixed(&scoped, lo as u64, hi as u64, width);
+                }
                 for i in lo..=hi {
                     let elem = format!("{}[{}]", scoped, i);
                     if let Some(su) = &elem_su {
@@ -2787,8 +3089,10 @@ impl Simulator {
                             instance.properties.insert(k, v);
                         }
                     }
-                    self.signals.insert(elem.clone(), fill.clone());
-                    self.widths.insert(elem, width);
+                    if !shared_width {
+                        self.widths.insert(elem.clone(), width);
+                    }
+                    self.signals.insert(elem, fill.clone());
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
@@ -2796,6 +3100,9 @@ impl Simulator {
             // foreach resolve, and default every element to 0 (a class-handle
             // element's default is null). Oversized shapes stay lazy.
             for (prop, (shape, width)) in &cdef.array_nd_properties {
+                if hidden_collections.contains(prop.as_str()) {
+                    continue;
+                }
                 let scoped = format!("{}#{}", handle, prop);
                 // §8.25: sized by a value parameter — this object's shape.
                 let own_shape = cdef
@@ -2848,6 +3155,11 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            // The chain is leaf-first: a base declaration cannot change the
+            // shape of a property hidden by the derived class (§8.14).
+            if classes_to_init.len() > 1 {
+                hidden_collections.extend(cdef.properties.keys().map(String::as_str));
             }
         }
         // Record concrete bindings for the leaf class's TYPE parameters
@@ -2990,6 +3302,10 @@ impl Simulator {
                 }
             }
         }
+        // §8.25: retain typed defaults before parameter fields initialize.
+        if caller_spec.is_some() && instance.spec.is_none() {
+            instance.spec = computed_spec.clone();
+        }
         self.heap.push(Some(Box::new(instance)));
         // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
         // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
@@ -3094,7 +3410,7 @@ impl Simulator {
                 {
                     let Some(su) = self
                         .class_prop_struct(handle, prop)
-                        .filter(Self::spreads_member_wise)
+                        .filter(|su| Self::spreads_member_wise(su))
                     else {
                         continue;
                     };
@@ -3124,7 +3440,7 @@ impl Simulator {
                 let raw = self.eval_expr_ctx(&init, w);
                 let two_state =
                     super::elaborate::is_type_two_state_resolved(&mdt, &self.module.typedef_types);
-                let is_real = super::elaborate::is_type_real(&mdt);
+                let is_real = self.dt_is_real(&mdt);
                 let signed = self.type_is_signed_concrete(&mdt);
                 let v = Self::fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -3136,7 +3452,9 @@ impl Simulator {
             .insert(handle, classes_to_init.to_vec());
         self.this_stack.pop();
         let saved_spec = self.clone_spec_pooled();
-        if computed_spec.is_some() {
+        if let Some(caller_spec) = caller_spec {
+            self.current_spec = caller_spec;
+        } else if computed_spec.is_some() {
             self.current_spec = computed_spec.clone();
         }
         self.exec_method_call(handle, "new", args);
@@ -3181,6 +3499,141 @@ impl Simulator {
         self.record_output(m.clone());
         self.stdout_writeln(&m);
         self.abort_run();
+    }
+
+    /// §8.4: a method call through a null handle whose receiver is declared
+    /// `decl` (a class name, possibly specialized). Only an access to a
+    /// non-static member or a virtual method is illegal through null, so a
+    /// non-virtual method runs, bound to the declared class as §8.20 binds
+    /// it for a live object, with a null `this`. None when `decl` declares
+    /// no such method, a static one (it dispatches elsewhere) or a virtual
+    /// one (illegal through null; the caller reports it).
+    pub(super) fn call_on_null_receiver(
+        &mut self,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        self.call_on_null_receiver_of(None, decl, method_name, args)
+    }
+
+    /// `call_on_null_receiver` for a receiver that is the variable `var`,
+    /// whose declaration names its specialization (`C #(8) h`).
+    pub(super) fn call_on_null_receiver_of(
+        &mut self,
+        var: Option<&str>,
+        decl: &str,
+        method_name: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        let resolved = self.class_through_typedefs(decl)?;
+        let decl = resolved.as_str();
+        let base = decl.split('#').next().unwrap_or(decl).trim();
+        if method_name == "new"
+            || !self.class_has_method(base, method_name)
+            || self.is_static_method(base, method_name)
+        {
+            return None;
+        }
+        // A virtual method through null is illegal (§8.4); the caller's own
+        // handling (a report, or its later fallbacks) stays in charge.
+        let target = self.nonvirtual_target_class(base, method_name)?;
+        // §8.25: the declared specialization supplies the body's parameters.
+        let saved = self
+            .spec_for_null_receiver(var, decl)
+            .map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let v = self.exec_method_in_class_hierarchy(0, &target, method_name, args);
+        if let Some(prev) = saved {
+            self.current_spec = prev;
+        }
+        Some(v)
+    }
+
+    /// The declared class of a receiver expression whose value is null: a
+    /// variable, a property, an element of a collection of handles, a
+    /// function's return type.
+    pub(super) fn null_receiver_class(&mut self, expr: &Expression) -> Option<String> {
+        // With no object, a bare name is a property of the class in scope;
+        // the general lookups answer with that class itself.
+        let in_class_scope = self.this_stack.last().copied().flatten().is_none();
+        in_class_scope
+            .then(|| self.context_class_prop_class(expr))
+            .flatten()
+            .or_else(|| self.receiver_static_class(expr, 0))
+            .or_else(|| self.call_return_class(expr))
+            .or_else(|| self.get_expr_type_name(expr))
+            .and_then(|t| self.class_through_typedefs(&t))
+    }
+
+    /// The declared class of a bare property of the class whose scope is
+    /// current when no object is (`sp` in `static int y = sp.m();`, a
+    /// static property initializer).
+    fn context_class_prop_class(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::Ident(h) = &expr.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        self.class_prop_type_named(ctx, &h.path[0].name.name)
+    }
+
+    /// The declared return class of a call receiver: a free function
+    /// (`get_null().m()`) or a method of a live object (`h.nullh().m()`).
+    fn call_return_class(&mut self, expr: &Expression) -> Option<String> {
+        let ExprKind::Call { func, .. } = &expr.kind else {
+            return None;
+        };
+        let dt = match &func.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => self
+                .fn_decl_rc(&h.path[0].name.name)
+                .map(|fd| fd.return_type.clone())?,
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let recv = Expression::new(ExprKind::Ident(hier_prefix(h)), func.span);
+                let cls = self.receiver_class_of(&recv)?;
+                self.class_method_return_type(&cls, &h.path.last()?.name.name)?
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let cls = self.receiver_class_of(recv)?;
+                self.class_method_return_type(&cls, &member.name)?
+            }
+            _ => return None,
+        };
+        match dt {
+            crate::ast::types::DataType::TypeReference { name, .. } => Some(name.name.name),
+            _ => None,
+        }
+    }
+
+    /// The class of a receiver: its object's runtime class when it is live,
+    /// else its declared class.
+    fn receiver_class_of(&self, recv: &Expression) -> Option<String> {
+        let h = self.eval_handle_expr(recv).unwrap_or(0);
+        self.receiver_static_class(recv, h)
+            .or_else(|| self.get_expr_type_name(recv))
+            .map(|c| c.split('#').next().unwrap_or(&c).trim().to_string())
+    }
+
+    /// `t` when it names a class (possibly specialized), or the class a
+    /// typedef chain from it ends at (§6.18).
+    pub(super) fn class_through_typedefs(&self, t: &str) -> Option<String> {
+        let mut t = t.trim().to_string();
+        for _ in 0..8 {
+            let base = t.split('#').next().unwrap_or(&t).trim();
+            if self.module.classes.contains_key(base) {
+                return Some(t);
+            }
+            match self.module.typedef_types.get(base) {
+                Some(crate::ast::types::DataType::TypeReference { name, .. }) => {
+                    t = name.name.name.clone();
+                }
+                _ => return None,
+            }
+        }
+        None
     }
 
     pub(super) fn exec_method_call(

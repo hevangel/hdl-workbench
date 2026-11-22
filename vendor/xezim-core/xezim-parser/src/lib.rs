@@ -104,10 +104,34 @@ impl std::hash::Hasher for CensusHasher {
 pub type CensusSet = std::collections::HashSet<String, std::hash::BuildHasherDefault<CensusHasher>>;
 
 static REFERENCE_CENSUS: std::sync::Mutex<Option<ReferenceCensus>> = std::sync::Mutex::new(None);
+static CENSUS_ACTIVE_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII guard for scoping the lifetime of [`ReferenceCensus`].
+/// When all session guards are dropped, the process-wide census is cleared.
+/// Sessions that overlap (compilations on several threads) share one census
+/// until the last of them ends: a name another compilation spelled only makes
+/// the elaborator keep a port net it could have dropped, while a census
+/// cleared under a running compilation would let it drop one still in use.
+pub struct CensusSession;
+
+impl Drop for CensusSession {
+    fn drop(&mut self) {
+        if CENSUS_ACTIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            clear_reference_census();
+        }
+    }
+}
+
+/// Begin a compilation or parse session with an explicit lifetime.
+pub fn census_session() -> CensusSession {
+    CENSUS_ACTIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CensusSession
+}
 
 /// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
 /// every stream the parser is built over, so nothing parsed escapes it.
-pub fn record_reference_census(tokens: &[lexer::Token]) {
+pub fn record_reference_census(tokens: &lexer::TokenStream<'_>) {
     use lexer::token::TokenKind as K;
     let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let census = guard.get_or_insert_with(ReferenceCensus::default);
@@ -183,7 +207,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 let unit_level =
                     regions.last() != Some(&Region::Unit) || regions.contains(&Region::Class);
                 if unit_level {
-                    let n = bare(&tok.text);
+                    let text = tokens.text(tok);
+                    let n = bare(&text);
                     if !census.unit_idents.contains(n) {
                         census.unit_idents.insert(n.to_string());
                     }
@@ -199,7 +224,8 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 }
                 if let Some(next) = tokens.get(i + 1) {
                     if matches!(next.kind, K::Identifier | K::EscapedIdentifier) {
-                        let n = bare(&next.text);
+                        let text = tokens.text(next);
+                        let n = bare(&text);
                         if !census.dotted.contains(n) {
                             census.dotted.insert(n.to_string());
                         }
@@ -209,19 +235,23 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
             // `\a.b ` is ONE identifier whose name holds a dot; the flat
             // namespace cannot tell it from the path `a.b`, so count every
             // component after a dot as dotted too.
-            K::EscapedIdentifier if tok.text.contains('.') => {
-                for part in bare(&tok.text).split('.').skip(1) {
-                    census.dotted.insert(part.to_string());
+            K::EscapedIdentifier => {
+                let text = tokens.text(tok);
+                if text.contains('.') {
+                    for part in bare(&text).split('.').skip(1) {
+                        census.dotted.insert(part.to_string());
+                    }
                 }
             }
             K::SystemIdentifier => {
-                if !census.system_names.contains(tok.text.as_str()) {
-                    census.system_names.insert(tok.text.clone());
+                let text = tokens.text(tok);
+                if !census.system_names.contains(text.as_ref()) {
+                    census.system_names.insert(text.into_owned());
                 }
             }
             K::KwImport | K::KwExport => {
                 if let Some(next) = tokens.get(i + 1) {
-                    if matches!(next.kind, K::StringLiteral) && next.text.contains("DPI") {
+                    if matches!(next.kind, K::StringLiteral) && tokens.text(next).contains("DPI") {
                         census.dpi = true;
                         return;
                     }
@@ -240,6 +270,12 @@ pub fn reference_census() -> ReferenceCensus {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default()
+}
+
+/// Reset the process-wide [`ReferenceCensus`], releasing any retained identifiers.
+pub fn clear_reference_census() {
+    let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// Reserved storage name for a compilation-unit (`$unit`) declaration that a
@@ -367,15 +403,34 @@ pub static RELAX_NUL_BYTES: RelaxFlag = RelaxFlag::new(
     "XEZIM_RELAX_NUL_BYTES",
     "read a NUL byte in the source as white space (§5.3)",
 );
-/// §19.6: a hierarchical cross item gets an implicit coverpoint.
+/// §19.6: a hierarchical cross item gets an implicit coverpoint, and a
+/// `binsof` of the cross's bin selects may name it (§19.6.1).
 pub static RELAX_CROSS_HIER_ITEM: RelaxFlag = RelaxFlag::new(
     "cross-hier-item",
     "XEZIM_RELAX_CROSS_HIER_ITEM",
-    "accept a hierarchical reference as a cross item, with an implicit coverpoint (§19.6)",
+    "accept a hierarchical reference as a cross item, with an implicit coverpoint, and in \
+     binsof() (§19.6, §19.6.1)",
+);
+
+/// §6.5: a module net or variable used ahead of its declaration (checked
+/// at elaboration; the flag lives here with the others).
+pub static RELAX_USE_BEFORE_DECL: RelaxFlag = RelaxFlag::new(
+    "use-before-decl",
+    "XEZIM_RELAX_USE_BEFORE_DECL",
+    "accept a net or variable that a module reads or writes ahead of its declaration (§6.5)",
+);
+
+/// A `-v` library file's packages are compiled (a library file otherwise
+/// supplies only modules, interfaces, programs and primitives; checked when
+/// the design is parsed, the flag lives here with the others).
+pub static RELAX_LIBRARY_PACKAGES: RelaxFlag = RelaxFlag::new(
+    "library-packages",
+    "XEZIM_RELAX_LIBRARY_PACKAGES",
+    "compile the packages a -v library file declares, as if the file were also a source file",
 );
 
 /// Every parser relaxation, for command-line options and cache keys.
-pub fn relax_flags() -> [&'static RelaxFlag; 8] {
+pub fn relax_flags() -> [&'static RelaxFlag; 10] {
     [
         &RELAX_DUPLICATE_DECLS,
         &RELAX_ENUM_NO_BASE,
@@ -385,6 +440,8 @@ pub fn relax_flags() -> [&'static RelaxFlag; 8] {
         &RELAX_MACRO_SPACE,
         &RELAX_NUL_BYTES,
         &RELAX_CROSS_HIER_ITEM,
+        &RELAX_USE_BEFORE_DECL,
+        &RELAX_LIBRARY_PACKAGES,
     ]
 }
 
@@ -531,6 +588,7 @@ fn parse_impl(
     let source_text = parser.parse_source_text();
 
     let (errors, warnings) = partition_diagnostics(parser.diagnostics());
+    drop(parser);
 
     ParseResult {
         source_text: processed,
@@ -600,10 +658,10 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
 }
 
 /// Tokenize a SystemVerilog source string (lex only, no parsing).
-pub fn tokenize(source: &str) -> Vec<lexer::Token> {
+pub fn tokenize(source: &str) -> Vec<lexer::OwnedToken> {
     let mut pp = preprocessor::Preprocessor::new();
     let processed = pp.preprocess(source);
-    lexer::Lexer::new(&processed).tokenize()
+    lexer::Lexer::new(&processed).tokenize().to_owned_tokens()
 }
 
 /// Preprocess a SystemVerilog source string (macro expansion, include handling).

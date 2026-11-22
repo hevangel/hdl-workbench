@@ -9,14 +9,16 @@
 
 ## Requirements
 
-* **Rust 1.92 or newer** (the minimum supported version is checked in CI).
+* **Rust 1.100 or newer** (the minimum supported version is checked in CI).
   Install it from https://www.rust-lang.org/tools/install.
 * **Git access to GitHub.** The parser and elaborator live in a second
   repository, [xezim-core](https://github.com/aionhw/xezim-core), which Cargo
   fetches automatically as a pinned git dependency. There is no submodule and
   nothing else to clone.
-* **A C compiler** (`cc`) for the DPI and VPI tests, and for building DPI
-  libraries of your own.
+* **Clang and LLVM tools** (`clang`, `clang++`, `llvm-ar`, `llvm-ranlib`)
+  on `PATH` for native dependencies, DPI and VPI. Install `clang llvm` with
+  your package manager on Linux. On macOS, install `llvm` with Homebrew and
+  add `$(brew --prefix llvm)/bin` to `PATH`.
 
 ## Build
 
@@ -26,6 +28,10 @@ cd xezim
 cargo build --release    # optimized
 ./scripts/build-pgo.sh   # optimized + profile-guided (recommended for release)
 ```
+
+The tracked `.cargo/config.toml` selects Clang and LLVM archive tools;
+`CC`, `CXX`, `AR` and `RANLIB` environment variables override these defaults.
+Linux x86_64 Rust builds use Clang as the driver for Rust's bundled LLD.
 
 The release binary is `target/release/xezim`; the profile-guided one is
 `pgo-target/release/xezim`. `cargo build` without `--release` gives a debug
@@ -44,6 +50,14 @@ machine, host instructions): a C906 SoC CoreMark −0.4% to −0.7%, a C910 SoC
 CoreMark −0.3% to −0.7%, and a loop-heavy DRAM-model stress −12%. Output is
 bit-exact. The bundled trainer covers the executors and the scheduler; what it
 cannot know is *your* design's hot mix, so the SoC gain is modest.
+
+`PGO_TARGET_DIR` selects the build directory (default `pgo-target`). Raw
+profiles, `merged.profdata`, training logs and toolchain/flag metadata stay
+in its `profile` subdirectory; `PGO_PROFILE_DIR` can select another location.
+Each new training run replaces only the generated raw profiles. Caller
+`RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS` are retained with Cargo's usual
+precedence, and the PGO flag is appended. The local build wrapper also
+selects this machine's CPU when encoded flags are used.
 
 Run **with a training command** (`./scripts/build-pgo.sh xezim --simulate …`,
 the binary path is substituted) it trains on that run instead. A profile
@@ -120,8 +134,9 @@ git clone https://github.com/aionhw/xezim-core.git ../xezim-core
 cargo build --release              # builds against the local checkout
 ```
 
-The script writes a git-ignored `.cargo/config.toml` with a `[patch]` that
-overrides the pinned dependency; `./scripts/use-local-core.sh --remove`
+The script writes a git-ignored `.cargo/local-core.toml` with a `[patch]` that
+overrides the pinned dependency. The tracked `.cargo/config.toml` includes
+this file and retains the compiler settings; `./scripts/use-local-core.sh --remove`
 returns to the pin. For a one-off invocation without persistent state,
 `./scripts/cargo-local.sh build --release` applies the same patch for a
 single command when `../xezim-core` exists.

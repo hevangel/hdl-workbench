@@ -1,14 +1,20 @@
 # Vendored simulator sources
 
-`xezim/` is Xezim revision `e8266416d52b0bed45c0b78b8b7db39098221391` (release 0.11.4).
+`xezim/` is Xezim revision `31674d0ec44e99320411f601113645d058073cbb` (release 0.11.7).
 `xezim-core/` (including `xezim-parser/`) is revision
-`8ebdf4a3f1346fe758e98f4a6a6c822f17f38e54`.
+`ebd7886043e8ba50029d09f2a9ef56a7909702a0` (release 0.11.7).
 
 Both upstream projects are licensed `MIT OR Apache-2.0`; their license files
 are kept in the corresponding source trees. The local copies were created from
 `git archive` at those commits, without `.git` metadata. LUNA-03 portability
 changes are applied directly to the vendored Xezim manifest, build script,
 and library entry points. Native behavior remains the upstream default.
+
+The 0.11.7 update (2026-11-22) re-vendors both trees from the tagged commits
+and re-applies the local patches with a three-way merge. Xezim 0.11.7 requires
+Rust 1.100 or newer, so `rust-toolchain.toml` and `scripts/build-browser.mjs`
+pin 1.100.0; the build also needs clang and LLVM archive tools for `zstd`.
+Surfer stays at v0.7.0, which is still the latest upstream release.
 
 LUNA-11 adds a `wasm32`-only scalar DPI import dispatcher in
 `xezim/src/compiler/simulator/dpi_imports.rs`. The WASM implementation binds

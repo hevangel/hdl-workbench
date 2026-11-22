@@ -2,8 +2,11 @@
 
 Changes to HDL Workbench are recorded here.
 
-## Unreleased — v1 hardening
+## Unreleased
 
+## 1.0.0 — 2026-11-22
+
+- Updated Xezim to 0.11.7 and xezim-core to 0.11.7 (Rust 1.100). Surfer stays at v0.7.0, the latest upstream release.
 - Added a New file action and a right-click Rename/Delete menu in the explorer, a waveform dump selector (VCD, FST, Off) and a simulator Arguments field for `+plusargs` and `-sv_seed`. FST is converted from the simulator's VCD inside the WASM module; the MCP `run_simulation` tool takes `plusargs` and `waveform_format`.
 - Fixed runs whose design never calls `$dumpvars` failing with "Xezim did not return a supported VCD timescale".
 - Added authenticated MCP-to-browser execution and persisted VCD viewing in the integrated browser workflow.

@@ -17,30 +17,34 @@ how to use them together, see the [user guide](user-guide.md).
 | `-I<dir>` | Add an include directory |
 | `-uvm`, `--uvm` | Add the UVM library that `XEZIM_UVM_DIR` names: its `src` directory goes on the include path and its `uvm_pkg.sv` becomes the first source file, unless the file list already has a `uvm_pkg.sv`. Works in every mode and inside `-f`/`-F` files. Without `-uvm` nothing is added. See the [UVM guide](uvm-guide.md#adding-the-uvm-library-with--uvm) |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
-| `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
+| `-s <module>`, `-top <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
 | `--sv2017` | Parse with the IEEE 1800-2017 grammar instead of the default 1800-2023 |
 | `--no-strict` (`--lenient`) | Accept some LRM-illegal constructs that are errors by default, among them a hierarchical name that does not resolve (§23.8), which is then left unchecked |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
+| `<file>.c`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.C` | A DPI-C source, on the command line or in a `-f`/`-F` file. The C/C++ sources of a run are compiled with `$CC`/`$CXX` (else `clang`/`clang++`, else `cc`/`c++`), with xezim's `svdpi.h`, `vpi_user.h`, `sv_vpi_user.h` and `veriuser.h` on the include path, linked with any `.o`/`.a` files named the same way into one shared library, and loaded like `--dpi-lib`. The build is cached under `xezim/dpi` in `$XEZIM_CACHE_DIR`, `$XDG_CACHE_HOME` or `~/.cache` (else in a private `xezim-<uid>` in the temporary directory), keyed by the preprocessed sources and the commands, so an unchanged build is not recompiled; with `-LDFLAGS` the library is linked again every run. A `.so`/`.dylib`/`.dll` named among the files is loaded as `--dpi-lib`. See the [DPI and VPI guide](dpi-guide.md#c-and-c-sources-in-the-file-list) |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines`. Repeatable. See the [DPI and VPI guide](dpi-guide.md) |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. Repeatable. See the [user guide](user-guide.md#module-timescale-extension) |
 | `--dump-timescales` | Print every module's resolved timescale before the run (no source `$printtimescale` needed); modules with no `` `timescale `` are flagged |
-| `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
+| `--max-time <N>[fs\|ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time (default `100ms`) — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
+| `--save-at <time>[,<file>]` | Save a checkpoint at the end of the last time slot at or before `<time>` (`<n>[fs\|ps\|ns\|us\|ms\|s]`, **nanoseconds** when no unit is given) into `<file>` (default `xezim.ckpt`); repeatable, and the run continues. See the [user guide](user-guide.md#checkpoints) |
+| `--restore <file>` | Start from a checkpoint (`--save-at`, `$save`) of the same design written by the same xezim build |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
-| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
+| `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects). The run prints `[xezim] seed: <n>` on stdout, so the output and the `-l` log name the seed; `+seed=random` prints `[xezim] random seed: <n> (replay with +seed=<n>)`. With several seeds, the last one counts |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate SDF delays (IOPATH/INTERCONNECT) and TIMINGCHECK limits |
 | `--upf <file>`, `--upf-top <instance>` | Apply IEEE 1801 power intent. See the [UPF guide](upf-guide.md) |
 | `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted); implies `--verbose`'s engine lines |
 | `--verbose` | Internal engine lines, off by default: the version banner, `[PHASE]` timings, the end-of-run engine counters (`[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]`), compile-time notes such as `[EDGE-MERGE]` and `[CACHE]` hits, and `--compile`'s design summary; plus per-file compile progress (each file as it is parsed, and the modules/blocks it contributed). Same as `XEZIM_VERBOSE=1` |
 | `--dump-files-list` | Print the fully resolved file list after `-f` expansion, then exit — confirms *which* sources a build actually reads |
 | `--dump-merged-sv <file>` | Write the sources as one preprocessed, self-contained `.sv`. With `-s <top>`, keeps only the files that top needs. See the [user guide](user-guide.md#reducing-a-multi-file-build) |
+| `-o <file>` | With `--compile`, write the elaborated design to a compiled artifact; `xezim <file>` runs it. DPI C/C++ sources named among the files are not part of it: name them again when running it (`xezim design.xzc add.c`); `--compile` warns when it leaves them out |
 | `--artifact-compression <none\|1-22>` | Compression level for the `-o` compiled artifact (`none` writes it raw) |
 | `--cache-dir <dir>` | Select the automatic elaborated-design cache directory |
 | `--no-cache` | Disable the automatic elaborated-design cache |
 | `-l`, `--log <file>` | Redirect all stdout/stderr — including DPI/VPI C output — to a log file |
 | `--tee <file>` | Copy stdout/stderr, including DPI/VPI C output, to a log file while retaining each stream on the console |
-| `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
-| `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
+| `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations. A library file is preprocessed with the macros of the design files and of the library files read before it, and the macros it defines stay defined for the library files read after it (§22.5.1). Bytes that are not UTF-8 (a Latin-1 comment) are replaced, not a reason to drop the file |
+| `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand, preprocessed like a `-v` file |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
 | `+nospecify` | Suppress specify-block path delays and timing checks — zero-delay gate simulation (`-nospecify` also accepted) |
 | `+notimingcheck` | Disable the specify-block timing checks (`$setup`, `$hold`, `$width`, …; also `+notimingchecks`/`-notimingchecks`). A violation otherwise prints one `** Error:` line (counted by `--error-exit`) and toggles the check's notifier |
@@ -55,6 +59,9 @@ how to use them together, see the [user guide](user-guide.md).
 | `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
+| `--wave-suppress <entry>` | Exclude signals from the VCD, FST and XTrace dumps (repeatable, `=` form). A bare name is a module definition and excludes every instance of it at any depth (`--wave-suppress mem_bank`). A dotted name is one hierarchical path, top-module name optional: an instance and everything below it, an instance array or generate loop, or a variable with its array elements (`--wave-suppress tb_top.u_blk.u_bank0`). A bare name that is not a module is a path below the top module. An `--fst-scope`, `--xtrace-scope` or `$dumpvars` argument naming an excluded scope dumps what it names |
+| `--wave-suppress-module <name>` | Like `--wave-suppress`, but reads `<name>` as a module definition even when an instance carries the same name (repeatable, `=` form) |
+| `-wave_suppress_file <file>` (also `--wave-suppress-file`, `=` form) | Exclusions from a file, one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--wave-suppress`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
 | `--relax-driver-conflicts` | Report a variable with conflicting drivers — two continuous assigns, a continuous assign plus procedural writes, or an `always_comb`/`always_latch`/`always_ff` variable also written by another process (§6.5, §9.2.2) — as a warning instead of an error, so existing designs (e.g. an `initial` block that initializes an `always_ff` register) still run |
 | `--relax-duplicate-decls` | Ignore a second declaration of a name in a task, function, class method or `begin`/`fork` block, keeping the first's type and initializer (§3.13), with a warning — for sources written against tools that accept it |
@@ -64,7 +71,8 @@ how to use them together, see the [user guide](user-guide.md).
 | `--relax-casex-inside` | Read `casex (e) inside` and `casez (e) inside` as `case (e) inside` (§12.5.4), with a warning — for sources written against tools that accept it |
 | `--relax-macro-space` | Read white space between a backtick and a macro or directive name (`` ` NAME ``) as none (§22.5.1), with a warning — for sources written against tools that accept it |
 | `--relax-nul-bytes` | Read a NUL byte in the source as white space (§5.3), with a warning — for sources written against tools that accept it |
-| `--relax-cross-hier-item` | Accept a hierarchical reference as a cross item (`cross vif.mode, cp;`), with an implicit coverpoint (§19.6), with a warning — for sources written against tools that accept it |
+| `--relax-cross-hier-item` | Accept a hierarchical reference as a cross item (`cross vif.mode, cp;`) and in `binsof(hier)` in a cross bin select (§19.6.1), with an implicit coverpoint (§19.6), with a warning — for sources written against tools that accept it |
+| `--relax-use-before-decl` | Accept a reference to module data before its declaration (§6.5), including in call arguments, with a warning naming the module and data |
 | `--keywords <ver>` | Keyword set outside `` `begin_keywords `` regions (§22.14): `1364-1995`, `1364-2001`, `1364-2005`, `1800-2005` … `1800-2023`, each also with `-noconfig`; an explicit region still wins |
 | `--no-config-keywords` | Read the ten configuration keywords (`instance`, `cell`, `use`, `library`, …) as names outside `` `begin_keywords `` regions |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
@@ -89,6 +97,7 @@ unless noted.
 | `XEZIM_METHOD_CACHE=<dir>` | Persistent compiled-method cache directory across runs. `1` uses `~/.cache/xezim/method-cache`; unset (default) disables it. Corrupt entries transparently trigger recompilation |
 | `XEZIM_METHOD_PROFILE=1` | In-process sampling profiler for class methods. When `1`, prints AST-vs-bytecode execution-time histograms on simulation completion (default off) |
 | `XEZIM_FALLBACK_SITES=1` | Log each construct handed to the AST interpreter: the reason, source byte span and scope of the compile-fail / plan-decline site (default off) |
+| `XEZIM_GROWTH_TRACE=<ticks>` | Every `<ticks>` of simulated time, print to stderr the heap size, live objects, collections, process contexts and waiter-table sizes, to find what grows over a long run (default off) |
 | `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
 | `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` instead of cranelift. **Requires `XEZIM_JIT=1` as well** — on its own it is a no-op. Needs `--features jit`. See the [user guide](user-guide.md#native-compilation) |
 | `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |
@@ -113,6 +122,7 @@ unless noted.
 | `XEZIM_RELAX_MACRO_SPACE=1` | Same as `--relax-macro-space` |
 | `XEZIM_RELAX_NUL_BYTES=1` | Same as `--relax-nul-bytes` |
 | `XEZIM_RELAX_CROSS_HIER_ITEM=1` | Same as `--relax-cross-hier-item` |
+| `XEZIM_RELAX_USE_BEFORE_DECL=1` | Same as `--relax-use-before-decl` |
 | `XEZIM_KEYWORDS=<ver>` | Same as `--keywords <ver>` |
 | `XEZIM_NO_CONFIG_KEYWORDS=1` | Same as `--no-config-keywords` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
@@ -120,7 +130,10 @@ unless noted.
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
-| `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
+| `XEZIM_MAX_PACKED_WIDTH=N` | Widest live packed declaration, in bits (default 16,777,216, at most 134,217,728), also inside parameterized instances; elaboration reports a live declaration wider than the limit |
+| `XEZIM_STALL_LIMIT=N` | Stall guard: the zero-delay activations of one process, and the nested calls of tasks that do not wait, after which the run is stopped as a zero-delay loop. Unset, the activation count trips only after a window that changes no state, and the nesting count at 100,000; `0` turns both off |
+| `XEZIM_WAITER_INDEX=0` | On by default: a process parked on an event control over signals, or plain expressions of them, is examined only when one of those signals is written; clocking events, variable-index array cells, memory cells and terms with a function call are examined at every pass. `0` examines every parked waiter at each pass, as before 0.11.7 (results are the same) |
+| `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread); if creation fails, the CLI retries smaller stacks (1024, 512, 256, 128, 64 MiB, below the requested size), then the current thread, and warns with the selected stack and remedy. |
 | `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
 | `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
@@ -148,8 +161,9 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. `log`, `add wave`, `coverage save` and `coverage report` are accepted with one warning each and do nothing. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. Parameters in generate blocks, and body `parameter`s of a module that has a parameter port list, are local and not reached. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
-| `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
+| `-sv_seed <n>`, `-sv_seed random` (also `-svseed`, `-seed`, and the `=` forms such as `-sv_seed=<n>`) | Same as `+seed=<n>` / `+seed=random`, on the command line and in args files |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
+| `-CFLAGS "<args>"`, `-LDFLAGS "<args>"` (also `-ccflags`, `-ldflags`) | Extra arguments, split on white space, for compiling and for linking the DPI C/C++ sources named among the files. Repeatable; they come after xezim's own (`-fPIC -O2 -I<headers>`), so `-CFLAGS "-O0 -g"` wins |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
 | `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
 | `-l <file>`, `-logfile <file>` | xezim's `-l`: all output goes to the file, none to the terminal |
@@ -165,6 +179,6 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 Where a spelling means something else in xezim, xezim's meaning is kept:
 `-l` redirects rather than copies the transcript; `-c <file>` reads an args
 file. The glued forms `-s<top>`, `-l<file>` and `-f<file>` lose to the
-spellings above (`-sv`, `-sv_seed`, `-suppress`, `-lib`, `-logfile`,
-`-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
+spellings above (`-sv`, `-sv_seed`, `-svseed`, `-seed`, `-suppress`,
+`-lib`, `-logfile`, `-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
 names.

@@ -18,8 +18,8 @@ cargo build --release --features jit     # the normal build (jit feature ≠ jit
 ./target/release/xezim -V                # version + git hash/date + release tag
 ```
 
-Rust ≥ 1.92. The `xezim-core` dependency is pinned by exact rev and fetched
-automatically; for local co-development of both repos run
+Rust ≥ 1.100 and Clang/LLVM tools on `PATH`. The `xezim-core` dependency is
+pinned by exact rev and fetched automatically; for local co-development of both repos run
 `./scripts/use-local-core.sh` once. A maximum-performance binary comes from
 profile-guided optimization: `./scripts/build-pgo.sh <training-command>`
 (measured −15..18% wall on large SoCs; train on a workload shaped like the
@@ -80,6 +80,9 @@ prints the seed for replay.
 xezim --simulate --fst wave.fst --fst-scope tb.dut ...        # GTKWave FST
 xezim --simulate --xtrace t.xt --xtrace-scope tb.dut \
       --xtrace-from 10000 --xtrace-to 20000 ...               # windowed text dump
+xezim --simulate --wave ... --wave-suppress mem_bank \
+      --wave-suppress tb.dut.u_bank0 ...      # exclude a module or one subtree
+                                              # from all three formats
 ```
 
 Dumping is OPT-IN: pass `--wave` to compile the model with waveform support.
@@ -156,7 +159,9 @@ What's left for the user:
   dominate short runs; `--cache` (experimental warm-start design cache) and
   `--artifact-compression` help repeated runs of an unchanged design.
 - `--report-stats[=json]` prints an end-of-run footer for dashboards.
-- There is no user-facing thread knob; the engine parallelizes internally where safe.
+- Edge-dispatch plans run serially by default. Set
+  `XEZIM_PARALLEL_SERIALIZE=0` to allow worker threads when the dispatcher
+  qualifies and calibration selects that path.
 
 ## Debugging a misbehaving simulation
 

@@ -2,7 +2,168 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+enum SampleType {
+    Real,
+    Integral(u32, bool),
+    Other,
+}
+
 impl Simulator {
+    /// Resolve a formal where the covergroup was declared (§19.8.1).
+    fn cg_sample_type(&self, group: &str, owner: Option<usize>, dt: &DataType) -> SampleType {
+        let mut dt = dt;
+        if let DataType::TypeReference {
+            name, dimensions, ..
+        } = dt
+            && dimensions.is_empty()
+            && !name.has_scope()
+        {
+            let leaf = &name.name.name;
+            if let Some((class, _)) = group.rsplit_once("::") {
+                if let Some(bound) = owner.and_then(|h| self.obj_type_param(h, class, leaf)) {
+                    if self.concrete_type_real(&bound) {
+                        return SampleType::Real;
+                    }
+                    if let Some(w) = self.concrete_type_width(&bound) {
+                        return SampleType::Integral(
+                            w,
+                            self.concrete_type_signed(&bound).unwrap_or(false),
+                        );
+                    }
+                }
+                if let Some(local) = self.class_local_typedef(class, leaf) {
+                    dt = local;
+                }
+            } else if let Some((scope, _)) = group.rsplit_once('.')
+                && let Some(local) = self.module.typedef_types.get(&format!("{scope}.{leaf}"))
+            {
+                dt = local;
+            }
+        }
+        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+            SampleType::Real
+        } else if let Some((w, signed)) = self.scalar_formal_integral(dt) {
+            SampleType::Integral(w, signed)
+        } else {
+            SampleType::Other
+        }
+    }
+
+    fn cg_real_points(
+        &mut self,
+        def: &CovergroupDeclaration,
+        owner: Option<usize>,
+    ) -> HashSet<String> {
+        // Give expression type inference the declared formals, including when
+        // the coverage query precedes the first sample.
+        let mut frame = HashMap::default();
+        if let Some(obj) = owner
+            .and_then(|h| self.heap.get(h))
+            .and_then(Option::as_ref)
+        {
+            for name in obj.properties.keys() {
+                let real = self
+                    .class_property_decl_type(&obj.class_name, name)
+                    .is_some_and(|(dt, dims)| {
+                        dims.is_empty()
+                            && matches!(
+                                self.cg_sample_type(&def.name.name, owner, &dt),
+                                SampleType::Real
+                            )
+                    });
+
+                frame.insert(
+                    name.clone(),
+                    if real {
+                        Value::from_f64(0.0)
+                    } else {
+                        Value::zero(1)
+                    },
+                );
+            }
+        }
+        for port in def.ports.iter().chain(&def.sample_ports) {
+            let value = match self.cg_sample_type(&def.name.name, owner, &port.data_type) {
+                SampleType::Real => Value::from_f64(0.0),
+                _ => Value::zero(1),
+            };
+            frame.insert(port.name.name.clone(), value);
+        }
+        let scope = def
+            .name
+            .name
+            .rsplit_once('.')
+            .filter(|_| !def.name.name.contains("::"));
+        let saved_hint =
+            scope.map(|(scope, _)| self.name_resolve_hint.replace(Some(scope.to_owned())));
+        self.push_local_frame(frame);
+        let points = def
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                CovergroupItem::Coverpoint(cp)
+                    if cp.is_real || self.expr_is_real_static(&cp.expr) =>
+                {
+                    Some(Self::cg_point_name(cp))
+                }
+                _ => None,
+            })
+            .collect();
+        self.pop_local_frame();
+        if let Some(hint) = saved_hint {
+            *self.name_resolve_hint.borrow_mut() = hint;
+        }
+        points
+    }
+
+    // Preserve numeric order in the interval representation shared with
+    // integral bins. Both signed zeroes denote the same sample.
+    fn cg_real_key(f: f64) -> Option<i64> {
+        if f.is_nan() {
+            return None;
+        }
+        let bits = (if f == 0.0 { 0.0 } else { f }).to_bits() as i64;
+        Some(if bits < 0 {
+            i64::MIN.wrapping_sub(bits)
+        } else {
+            bits
+        })
+    }
+
+    fn cg_real_ranges(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        ctor: &[(String, Value)],
+    ) -> Vec<(i64, i64)> {
+        let params: HashMap<String, Value> = ctor.iter().cloned().collect();
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &params,
+        };
+        let bound = |e: &Expression, unbounded| {
+            if matches!(e.kind, ExprKind::Dollar) {
+                return Self::cg_real_key(unbounded);
+            }
+            let v = super::elaborate::eval_const_expr_val_env(e, &env);
+            if v.has_xz() {
+                None
+            } else {
+                Self::cg_real_key(v.to_f64())
+            }
+        };
+        bin.values
+            .iter()
+            .filter_map(|r| match r {
+                ConstraintRange::Value(e) => bound(e, f64::NAN).map(|v| (v, v)),
+                ConstraintRange::Range { lo, hi } => {
+                    let (lo, hi) = (bound(lo, f64::NEG_INFINITY)?, bound(hi, f64::INFINITY)?);
+                    (lo <= hi).then_some((lo, hi))
+                }
+            })
+            .collect()
+    }
+
     /// The covergroup definition `new` instantiates for a type name: inside
     /// a class, the class's OWN `Class::cg` (walking `extends`) wins over
     /// the bare name, so a derived class that redeclares `cg` gets its own
@@ -76,11 +237,49 @@ impl Simulator {
         self.module.covergroups.get(tname).cloned()
     }
 
+    /// §19.3, §19.4: `cg[i] = new(args)` whose element type `tname` is a
+    /// covergroup builds an instance of that covergroup into the element.
+    /// The target's type says what `new` builds (§8.7): left to the plain
+    /// assignment, `new(args)` was taken for the enclosing class's
+    /// constructor, which a constructor re-entered until the stack
+    /// overflowed. False when `tname` names no covergroup.
+    pub(super) fn construct_covergroup_into(
+        &mut self,
+        tname: &str,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> bool {
+        if self.module.covergroups.is_empty() || self.module.classes.contains_key(tname) {
+            return false;
+        }
+        let Some(cg_def) = self.covergroup_def_for(tname) else {
+            return false;
+        };
+        let args: &[Expression] = match &rvalue.kind {
+            ExprKind::Call { args, .. } => args,
+            _ => &[],
+        };
+        let handle = self.instantiate_covergroup(&cg_def, args);
+        self.assign_value(lvalue, &handle);
+        true
+    }
+
     pub(super) fn instantiate_covergroup(
         &mut self,
         cg_def: &CovergroupDeclaration,
-        _args: &[Expression],
+        args: &[Expression],
     ) -> Value {
+        // §13.5.3, §13.5.4: the actuals bind like any subroutine call's,
+        // `.name(expr)` to the named formal and an omitted one from its
+        // default; they were taken by position only.
+        let named;
+        let args: &[Expression] = match Self::normalize_call_args(&cg_def.ports, args) {
+            Some(v) => {
+                named = v;
+                &named
+            }
+            None => args,
+        };
         let handle = self.cg_heap.len();
         let owner = self
             .this_stack
@@ -93,7 +292,15 @@ impl Simulator {
         // constructor's `cg = new` after the base constructor's — leaves the
         // older instance unreachable. Drop it so it no longer counts in type
         // coverage (§19.11; the reference simulator does not count it).
-        if owner.is_some() {
+        // Only an embedded covergroup (`Class::cg`): an object may hold any
+        // number of instances of a covergroup type declared outside it
+        // (`cg_t a, b;`, `cg_t arr[4];`), and building one dropped the rest.
+        let embedded = cg_def
+            .name
+            .name
+            .rsplit_once("::")
+            .is_some_and(|(c, _)| self.module.classes.contains_key(c));
+        if owner.is_some() && embedded {
             for slot in self.cg_heap.iter_mut() {
                 if slot
                     .as_ref()
@@ -104,15 +311,22 @@ impl Simulator {
             }
         }
         let instance = CovergroupInstance {
+            real_points: self.cg_real_points(cg_def, owner),
             cg_name: cg_def.name.name.clone(),
             owner,
             ctor_args: {
                 let mut bound = Vec::new();
                 for (i, port) in cg_def.ports.iter().enumerate() {
-                    let v = if let Some(a) = _args.get(i) {
-                        self.eval_expr(a)
+                    // §13.5, §11.6.1: an input actual (or default) is
+                    // context-determined by its formal, so `new(x + y)` over
+                    // 8-bit operands into an `int` formal keeps the carry.
+                    let v = if let Some(a) = args.get(i) {
+                        match self.actual_context_width(port) {
+                            Some(w) => self.eval_expr_ctx(a, w),
+                            None => self.eval_expr(a),
+                        }
                     } else if let Some(d) = &port.default {
-                        self.eval_expr(d)
+                        self.eval_formal_default(port, d)
                     } else {
                         Value::zero(32)
                     };
@@ -125,7 +339,7 @@ impl Simulator {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| matches!(p.direction, crate::ast::types::PortDirection::Ref))
-                .filter_map(|(i, p)| _args.get(i).map(|a| (p.name.name.clone(), a.clone())))
+                .filter_map(|(i, p)| args.get(i).map(|a| (p.name.name.clone(), a.clone())))
                 .collect(),
             class_params: owner
                 .map(|h| {
@@ -188,6 +402,7 @@ impl Simulator {
                     value_of: None,
                     wake_rank: 0,
                     cell: false,
+                    alias_t0: 0,
                 });
             }
             if !resolved.is_empty() {
@@ -427,11 +642,19 @@ impl Simulator {
                             None => Value::zero(32),
                         },
                     };
-                    if let Some((w, signed)) = self.scalar_formal_integral(&port.data_type) {
-                        if w > 0 && w != v.width {
-                            v = v.resize(w);
+                    if let Some(inst) = self.cg_heap[handle].as_ref() {
+                        match self.cg_sample_type(&inst.cg_name, inst.owner, &port.data_type) {
+                            SampleType::Real => v = Value::from_f64(v.to_f64()),
+                            SampleType::Integral(w, signed) => {
+                                if v.is_real {
+                                    v = Value::from_real_wrapped(v.to_f64(), w);
+                                } else if w > 0 && w != v.width {
+                                    v = v.resize(w);
+                                }
+                                v.is_signed = signed;
+                            }
+                            SampleType::Other => {}
                         }
-                        v.is_signed = signed;
                     }
                     frame.insert(port.name.name.clone(), v);
                 }
@@ -685,9 +908,11 @@ impl Simulator {
         {
             return Some(v);
         }
-        let mut all = self.module.parameters.clone();
-        all.extend(params);
-        super::elaborate::const_eval_i64_with_params(e, Some(&all))
+        let all = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &params,
+        };
+        super::elaborate::const_eval_i64_with_params_env(e, Some(&all))
     }
 
     /// The names a bin bound or option of covergroup instance `inst` sees
@@ -813,8 +1038,43 @@ impl Simulator {
             .map(|i| Self::cg_bin_scope(i))
             .unwrap_or_default();
         let ctor: &[(String, Value)] = &scope;
-        let excl = self.cg_excluded_ranges(cp, ctor);
         let cp_name = Self::cg_point_name(cp);
+        if cp.is_real
+            || insts
+                .first()
+                .is_some_and(|i| i.real_points.contains(&cp_name))
+        {
+            use crate::ast::decl::CoverBinKind;
+            let excl = Self::cg_merge_ranges(
+                cp.bins
+                    .iter()
+                    .filter(|b| matches!(b.kind, CoverBinKind::Ignore | CoverBinKind::Illegal))
+                    .flat_map(|b| self.cg_real_ranges(b, ctor))
+                    .collect(),
+            );
+            let bins = cp
+                .bins
+                .iter()
+                .filter(|b| b.kind == CoverBinKind::Bins)
+                .filter_map(|b| {
+                    let ranges = self.cg_real_ranges(b, ctor);
+                    ranges
+                        .iter()
+                        .any(|&(lo, hi)| !excl.iter().any(|&(l, h)| l <= lo && hi <= h))
+                        .then(|| CgBin {
+                            key: Some(format!("{}.{}", cp_name, b.name.name)),
+                            name: b.name.name.clone(),
+                            ranges,
+                        })
+                })
+                .collect();
+            return CpShape {
+                bins,
+                auto: None,
+                excl,
+            };
+        }
+        let excl = self.cg_excluded_ranges(cp, ctor);
         let explicit: Vec<&crate::ast::decl::CoverBin> = cp
             .bins
             .iter()
@@ -1594,7 +1854,12 @@ impl Simulator {
     /// sub-bin index for `name[N]`).
     /// §19.5.1.1: whether bin `bin`'s `with (expr)` filter admits value `v`
     /// (`item` bound to it). The filter is a constant expression of `item`.
-    pub(super) fn cg_with_admits(&self, bin: &crate::ast::decl::CoverBin, v: i64) -> bool {
+    pub(super) fn cg_with_admits(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        v: i64,
+        ctor: &[(String, Value)],
+    ) -> bool {
         let Some(f) = &bin.with_filter else {
             return true;
         };
@@ -1605,12 +1870,137 @@ impl Simulator {
                 signed: true,
                 base: crate::ast::expr::NumberBase::Decimal,
                 value: v.to_string(),
-                cached_val: std::cell::Cell::new(None),
+                cached_val: crate::ast::cache::LiteralCache::new(None),
             }),
             f.span,
         );
         Self::subst_ident_expr(&mut e, "item", &lit);
-        self.cg_const_bool(&e).unwrap_or(true)
+        self.cg_const_bool(&e, ctor).unwrap_or(true)
+    }
+
+    /// Whether `with` filter `f` uses `item` only compared to constants, so
+    /// its result changes only at cut points pushed onto `cuts`.
+    fn cg_with_cuts(
+        f: &Expression,
+        ctor: &[(String, Value)],
+        sim: &Self,
+        cuts: &mut Vec<i64>,
+    ) -> bool {
+        use crate::ast::expr::{BinaryOp as B, UnaryOp as U};
+        let point = |c: i64, cuts: &mut Vec<i64>| {
+            cuts.push(c);
+            cuts.extend(c.checked_add(1));
+        };
+        if !Self::cg_mentions_item(f) {
+            return true;
+        }
+        match &f.kind {
+            _ if Self::cg_is_item(f) => {
+                point(0, cuts);
+                true
+            }
+            ExprKind::Paren(x)
+            | ExprKind::Unary {
+                op: U::LogNot,
+                operand: x,
+            } => Self::cg_with_cuts(x, ctor, sim, cuts),
+            ExprKind::Binary {
+                op: B::LogAnd | B::LogOr | B::LogImplies | B::LogEquiv,
+                left,
+                right,
+            } => {
+                Self::cg_with_cuts(left, ctor, sim, cuts)
+                    && Self::cg_with_cuts(right, ctor, sim, cuts)
+            }
+            ExprKind::Binary {
+                op: B::Eq | B::Neq | B::CaseEq | B::CaseNeq | B::Lt | B::Leq | B::Gt | B::Geq,
+                left,
+                right,
+            } => {
+                let other = match (Self::cg_is_item(left), Self::cg_is_item(right)) {
+                    (true, false) => right,
+                    (false, true) => left,
+                    _ => return false,
+                };
+                match sim.cg_const_i64(other, ctor) {
+                    Some(c) if !Self::cg_mentions_item(other) => {
+                        point(c, cuts);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Inside { expr, ranges } if Self::cg_is_item(expr) => {
+                ranges.iter().all(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => {
+                        match (sim.cg_const_i64(lo, ctor), sim.cg_const_i64(hi, ctor)) {
+                            (Some(l), Some(h)) => {
+                                point(l.min(h), cuts);
+                                point(l.max(h), cuts);
+                                true
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => match sim.cg_const_i64(r, ctor) {
+                        Some(c) => {
+                            point(c, cuts);
+                            true
+                        }
+                        None => false,
+                    },
+                })
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::cg_with_cuts(condition, ctor, sim, cuts)
+                    && Self::cg_with_cuts(then_expr, ctor, sim, cuts)
+                    && Self::cg_with_cuts(else_expr, ctor, sim, cuts)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `e` is the bare `item` of a `with` filter.
+    fn cg_is_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => Self::cg_is_item(x),
+            ExprKind::Ident(h) => {
+                h.path.len() == 1 && h.path[0].selects.is_empty() && h.path[0].name.name == "item"
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `e` may read `item`. A form not walked here counts as reading
+    /// it, so `cg_with_cuts` declines and every value is checked.
+    fn cg_mentions_item(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => false,
+            ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].name.name == "item",
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::cg_mentions_item(x),
+            ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+                Self::cg_mentions_item(left) || Self::cg_mentions_item(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => [condition, then_expr, else_expr]
+                .iter()
+                .any(|x| Self::cg_mentions_item(x)),
+            ExprKind::Inside { expr, ranges } => {
+                Self::cg_mentions_item(expr) || ranges.iter().any(Self::cg_mentions_item)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().any(Self::cg_mentions_item),
+            ExprKind::Index { expr, index } => {
+                Self::cg_mentions_item(expr) || Self::cg_mentions_item(index)
+            }
+            _ => true,
+        }
     }
 
     /// The constant value ranges of bin `bin`, in the order written, keeping
@@ -1623,12 +2013,36 @@ impl Simulator {
         bin: &crate::ast::decl::CoverBin,
         ctor: &[(String, Value)],
     ) -> Vec<(i64, i64)> {
-        let segs = bin
+        let segs: Vec<(i64, i64)> = bin
             .values
             .iter()
-            .filter_map(|r| self.cg_range_bounds(r, ctor));
-        if bin.with_filter.is_none() {
-            return segs.collect();
+            .filter_map(|r| self.cg_range_bounds(r, ctor))
+            .collect();
+        let Some(f) = &bin.with_filter else {
+            return segs;
+        };
+        let mut cuts = Vec::new();
+        if Self::cg_with_cuts(f, ctor, self, &mut cuts) {
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut out: Vec<(i64, i64)> = Vec::new();
+            let mut keep = |a: i64, b: i64| match out.last_mut() {
+                Some(last) if last.1.checked_add(1) == Some(a) => last.1 = b,
+                _ => out.push((a, b)),
+            };
+            for &(l, h) in &segs {
+                let mut a = l;
+                for &c in cuts.iter().filter(|&&c| c > l && c <= h) {
+                    if self.cg_with_admits(bin, a, ctor) {
+                        keep(a, c - 1);
+                    }
+                    a = c;
+                }
+                if self.cg_with_admits(bin, a, ctor) {
+                    keep(a, h);
+                }
+            }
+            return out;
         }
         let mut out: Vec<(i64, i64)> = Vec::new();
         let mut tried = 0u64;
@@ -1640,7 +2054,7 @@ impl Simulator {
                     break 'segs;
                 }
                 tried += 1;
-                if self.cg_with_admits(bin, v) {
+                if self.cg_with_admits(bin, v, ctor) {
                     run = Some(run.map_or((v, v), |(a, _)| (a, v)));
                 } else if let Some(r) = run.take() {
                     out.push(r);
@@ -1654,27 +2068,25 @@ impl Simulator {
     /// A constant Boolean: `inside` (values and `[lo:hi]` ranges), `&&`,
     /// `||`, `!` and parentheses here, anything else through the constant
     /// evaluator. None when it is not constant.
-    fn cg_const_bool(&self, e: &Expression) -> Option<bool> {
+    fn cg_const_bool(&self, e: &Expression, ctor: &[(String, Value)]) -> Option<bool> {
         use crate::ast::expr::{BinaryOp, UnaryOp};
-        let num = |x: &Expression| {
-            super::elaborate::const_eval_i64_with_params(x, Some(&self.module.parameters))
-        };
+        let num = |x: &Expression| self.cg_const_i64(x, ctor);
         match &e.kind {
-            ExprKind::Paren(x) => self.cg_const_bool(x),
+            ExprKind::Paren(x) => self.cg_const_bool(x, ctor),
             ExprKind::Unary {
                 op: UnaryOp::LogNot,
                 operand,
-            } => self.cg_const_bool(operand).map(|b| !b),
+            } => self.cg_const_bool(operand, ctor).map(|b| !b),
             ExprKind::Binary {
                 op: BinaryOp::LogAnd,
                 left,
                 right,
-            } => Some(self.cg_const_bool(left)? && self.cg_const_bool(right)?),
+            } => Some(self.cg_const_bool(left, ctor)? && self.cg_const_bool(right, ctor)?),
             ExprKind::Binary {
                 op: BinaryOp::LogOr,
                 left,
                 right,
-            } => Some(self.cg_const_bool(left)? || self.cg_const_bool(right)?),
+            } => Some(self.cg_const_bool(left, ctor)? || self.cg_const_bool(right, ctor)?),
             ExprKind::Inside { expr, ranges } => {
                 let v = num(expr)?;
                 for r in ranges {
@@ -1762,7 +2174,15 @@ impl Simulator {
         }
         let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
         for (k, v) in t.iter().enumerate() {
-            let ids = Self::cg_axis_bins_of(&axes[k], v.to_u64().unwrap_or(0) as i64);
+            let value = if v.is_real {
+                Self::cg_real_key(v.to_f64())
+            } else {
+                v.to_u64().map(|i| i as i64)
+            };
+            let Some(value) = value else {
+                return Vec::new();
+            };
+            let ids = Self::cg_axis_bins_of(&axes[k], value);
             let mut next = Vec::with_capacity(combos.len() * ids.len());
             for c in &combos {
                 for &id in &ids {
@@ -1821,9 +2241,26 @@ impl Simulator {
         if let Some(h) = owner {
             self.this_stack.push(Some(h));
         }
+        // An instance covergroup is named `<instance path>.cg`, so the text
+        // before the last dot is the scope its operand names resolve in. A
+        // class covergroup is `Class::cg` and resolves through `this_stack`,
+        // so it is skipped. The hint is restored after sampling because the
+        // caller may be sampling from a different scope.
+        let scope = self
+            .cg_heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .filter(|i| !i.cg_name.contains("::"))
+            .and_then(|i| i.cg_name.rsplit_once('.').map(|(s, _)| s.to_string()));
+        let saved_hint = scope
+            .as_ref()
+            .map(|s| self.name_resolve_hint.replace(Some(s.clone())));
         // The guard reads the instance's scope (its object and formals).
         if guard.is_none_or(|g| self.eval_expr(g).is_true()) {
             self.sample_covergroup_inner(handle);
+        }
+        if let Some(h) = saved_hint {
+            *self.name_resolve_hint.borrow_mut() = h;
         }
         if owner.is_some() {
             self.this_stack.pop();
@@ -1879,7 +2316,16 @@ impl Simulator {
                     }
                     let val = self.eval_expr(&cp.expr);
                     let cp_name = Self::cg_point_name(cp);
-                    let vi: Option<i64> = if val.has_xz() { None } else { val.to_i64() };
+                    let real = self.cg_heap[handle]
+                        .as_ref()
+                        .is_some_and(|i| i.real_points.contains(&cp_name));
+                    let vi = if val.has_xz() {
+                        None
+                    } else if real {
+                        Self::cg_real_key(val.to_f64())
+                    } else {
+                        val.to_i64()
+                    };
                     let ctor: Vec<(String, Value)> = self
                         .cg_heap
                         .get(handle)
@@ -1897,7 +2343,20 @@ impl Simulator {
                     });
                     let excluded = has_excl
                         && vi.is_some_and(|v| {
-                            Self::cg_in_ranges(v, &self.cg_excluded_ranges(cp, &ctor))
+                            if real {
+                                cp.bins
+                                    .iter()
+                                    .filter(|b| {
+                                        matches!(
+                                            b.kind,
+                                            crate::ast::decl::CoverBinKind::Ignore
+                                                | crate::ast::decl::CoverBinKind::Illegal
+                                        )
+                                    })
+                                    .any(|b| Self::cg_in_ranges(v, &self.cg_real_ranges(b, &ctor)))
+                            } else {
+                                Self::cg_in_ranges(v, &self.cg_excluded_ranges(cp, &ctor))
+                            }
                         });
                     // `default` bins count only the values no other value
                     // bin (bins, ignore_bins or illegal_bins) holds.
@@ -1914,7 +2373,11 @@ impl Simulator {
                         if !bin.transitions.is_empty() {
                             continue;
                         }
-                        let matched = if bin.is_wildcard {
+                        let matched = if real {
+                            vi.is_some_and(|v| {
+                                Self::cg_in_ranges(v, &self.cg_real_ranges(bin, &ctor))
+                            })
+                        } else if bin.is_wildcard {
                             // LRM §19.5 wildcard match: bit-wise compare with
                             // the bin pattern; pattern bits that are X/Z/?
                             // are don't-cares.
@@ -1936,7 +2399,7 @@ impl Simulator {
                         };
                         // §19.5.1.1: a value the bin's `with` filter rejects
                         // is not in the bin at all (a `default` bin may take it).
-                        if !matched || vi.is_some_and(|v| !self.cg_with_admits(bin, v)) {
+                        if !matched || vi.is_some_and(|v| !self.cg_with_admits(bin, v, &ctor)) {
                             continue;
                         }
                         any_value_match = true;
@@ -2033,8 +2496,9 @@ impl Simulator {
                                         })
                                         .collect(),
                                         span: id.span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                        cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                        cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                        bound: crate::ast::binding::Bound::UNSET,
                                     }),
                                     id.span,
                                 );
@@ -2163,6 +2627,8 @@ impl Simulator {
     pub(super) fn cg_value_text(val: &Value) -> String {
         if val.has_xz() {
             format!("{}'b{}", val.width, val.to_bin_string())
+        } else if val.is_real {
+            val.to_f64().to_string()
         } else if val.is_signed {
             val.to_i64().unwrap_or(0).to_string()
         } else {

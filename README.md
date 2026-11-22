@@ -19,7 +19,7 @@ For a visual walkthrough of how the pieces fit together, open [`docs/index.html`
 
 ## Quick start
 
-Prerequisites: Node.js 24–26, pnpm 11.25.0, Rust 1.99.1 with the `wasm32-unknown-unknown` target (pinned by `rust-toolchain.toml`), clang, and `wasm-bindgen-cli` 0.2.129.
+Prerequisites: Node.js 24–26, pnpm 11.25.0, Rust 1.100.0 with the `wasm32-unknown-unknown` target (pinned by `rust-toolchain.toml`), clang, and `wasm-bindgen-cli` 0.2.129.
 
 ```sh
 pnpm install --frozen-lockfile

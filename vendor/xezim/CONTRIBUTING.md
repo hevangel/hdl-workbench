@@ -14,7 +14,7 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
   or another simulator's result. When you checked against a commercial
   simulator, say "the reference simulator" rather than naming a product.
 * **The xezim version or commit.** `--verbose` prints the version banner
-  (`=== xezim 0.11.4 ===`).
+  (`=== xezim 0.11.7 ===`).
 
 ## Pull requests
 
@@ -39,23 +39,25 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
 ## Test suites
 
 Each suite is one test binary, `tests/<suite>.rs`, with its cases in
-`tests/<suite>/`. In 0.11.4, the default suite passes 5,838 tests: 5,728
-integration tests in eleven suites, 109 unit tests and one documentation test.
-One additional scheduling test is marked `#[ignore]`:
+`tests/<suite>/`. In 0.11.7, the default suite passes 8,159 tests: 7,998
+integration tests in eleven suites, 160 unit tests and one documentation test.
+Five more are marked `#[ignore]`: a scheduling test that pins a deliberate
+difference from the reference simulator, and four that pin open gaps (one in
+`classes`, one in `scheduling`, two in `types`):
 
 | Suite | Tests | Covers |
 |---|---:|---|
-| `classes` | 1,287 | classes, UVM, randomization, covergroups |
-| `collections` | 374 | queues, dynamic and associative arrays, array methods |
-| `gates` | 195 | gate primitives, UDPs, drive strengths, waveform dumps |
-| `hierarchy` | 614 | instances, ports, interfaces, binds, hierarchical references |
-| `lrm` | 177 | IEEE 1800-2023 conformance cases |
-| `misc` | 1,260 | CLI, lint, elaboration, assignments and other cases |
-| `perf` | 48 | deterministic work counters that catch performance regressions |
-| `scheduling` | 710 | event regions, sensitivity, timing, assertions |
-| `strings` | 261 | strings, formatting, DPI and VPI |
-| `types` | 798 | data types, widths, selects, operators |
-| `upf` | 4 | power intent (`--upf`) |
+| `classes` | 1,575 | classes, UVM, randomization, covergroups |
+| `collections` | 618 | queues, dynamic and associative arrays, array methods |
+| `gates` | 287 | gate primitives, UDPs, drive strengths, waveform dumps |
+| `hierarchy` | 1,205 | instances, ports, interfaces, binds, hierarchical references |
+| `lrm` | 210 | IEEE 1800-2023 conformance cases |
+| `misc` | 1,491 | CLI, lint, elaboration, assignments and other cases |
+| `perf` | 82 | deterministic work counters that catch performance regressions |
+| `scheduling` | 965 | event regions, sensitivity, timing, assertions |
+| `strings` | 330 | strings, formatting, DPI and VPI |
+| `types` | 1,230 | data types, widths, selects, operators |
+| `upf` | 5 | power intent (`--upf`) |
 
 The xezim-core repository has its own tests for the parser and elaboration.
 
@@ -84,6 +86,42 @@ No manual setup is needed: `cargo build` clones it into `target/uvm-checkout`
 when no checkout is found (and the tests clone on demand as a fallback). To use
 an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
 `../UVM` sibling of this repository.
+
+The `classes` target registers the 67 UVM cases as eight grouped tests. Each
+case runs on a fresh thread, preserving isolation of thread-local simulator state;
+the group continues after a panic and reports every failed case by its
+original module/function name. The case bodies and their assertions remain
+in the original `tests/classes/uvm*.rs` files. The complete case-to-group
+mapping is in [`uvm_groups.rs`](tests/classes/uvm_groups.rs).
+
+| Group selector (`uvm_groups::` prefix) | Cases | Coverage |
+| --- | ---: | --- |
+| `uvm_foundation_config_factory` | 11 | Configuration/resource databases, factory overrides and linkage |
+| `uvm_phasing_versions` | 10 | Library versions, phase completion, objections and timeout |
+| `uvm_sequences_traffic` | 8 | Sequencers, responses, locks, traffic and method policies |
+| `uvm_tlm` | 8 | TLM-1/TLM-2 ports, channels, sockets and connection errors |
+| `uvm_ral` | 10 | Register/memory policies, prediction and frontdoor/backdoor access |
+| `uvm_dpi` | 6 | Regex, command line, HDL backdoor and assertion sampling |
+| `uvm_printing_reporting` | 10 | Printers, strings, package calls and report controls |
+| `uvm_objects_features` | 4 | Object automation, callbacks, events and barriers |
+
+Run all groups or one group with the existing test binary:
+
+```bash
+cargo test --release --test classes uvm_groups::
+cargo test --release --test classes uvm_groups::uvm_tlm
+```
+
+To select one original case, use its full name from the mapping:
+
+```bash
+XEZIM_UVM_CASE=uvm_integration_tests::uvm_2020_traffic_is_independent_of_method_policy \
+  cargo test --release --test classes uvm_groups:: -- --nocapture
+```
+
+Unknown case names fail explicitly. Existing optional-library skips retain
+their original messages. The method-policy case still runs its three
+isolated process policies; its child selects the group and that one case.
 
 ### cocotb runner tests
 

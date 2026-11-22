@@ -26,11 +26,8 @@ impl Simulator {
                         .join(".")
                 });
                 let td = self
-                    .module
-                    .tasks
-                    .get(&*name)
-                    .or_else(|| raw.as_deref().and_then(|r| self.module.tasks.get(r)))
-                    .cloned();
+                    .task_decl_rc(&name)
+                    .or_else(|| raw.as_deref().and_then(|r| self.task_decl_rc(r)));
                 if let Some(td) = td {
                     // Execute a bare task-enable unless the body genuinely needs
                     // a suspendable process (event control, `wait`, `fork…join`,
@@ -232,7 +229,7 @@ impl Simulator {
                 | "$atan2" | "$hypot"
                 | "$sinh" | "$cosh" | "$tanh" | "$asinh" | "$acosh" | "$atanh"
                 | "$shortrealtobits" | "$bitstoshortreal"
-                | "$dimensions" | "$unpacked_dimensions" | "$typename"
+                | "$dimensions" | "$unpacked_dimensions" | "$typename" | "$__xz_scoped_typename"
                 | "$isunbounded"
                 | "$countbits" | "$countones" | "$onehot" | "$onehot0"
                 | "$left" | "$right" | "$high" | "$low" | "$size" | "$increment"
@@ -306,6 +303,14 @@ impl Simulator {
     }
 
     pub(super) fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
+        if name == INTRA_RELEASE_MARKER {
+            for a in args {
+                if let Some(idx) = self.eval_expr(a).to_u64() {
+                    self.intra_saved.remove(&idx);
+                }
+            }
+            return;
+        }
         if name == SYNC_WAKE_MARKER {
             if let Some(id) = args.first().and_then(|a| self.eval_expr(a).to_u64()) {
                 self.sync_wakes.insert(id);
@@ -889,12 +894,48 @@ impl Simulator {
                 );
                 let mut scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        let s = self.resolve_hier_name(hier);
-                        if !s.is_empty() {
-                            scopes.push(s.to_string());
+                    // A plain identifier keeps the signal resolver, which knows
+                    // the current-scope and package binding of a bare name. An
+                    // INDEXED path is not an `ExprKind::Ident` at all — the
+                    // parser builds `Index`/`MemberAccess` around it — so it
+                    // used to be dropped here without a word and the dump fell
+                    // back to the whole design; `dump_scope_arg` is the
+                    // `$dumpvars` renderer for that spelling.
+                    let name = match &a.kind {
+                        ExprKind::Ident(hier)
+                            if hier.root.as_deref() != Some("$root")
+                                && hier.path.len() == 1
+                                && hier.path[0].selects.is_empty() =>
+                        {
+                            let s = self.resolve_hier_name(hier);
+                            (!s.is_empty()).then(|| s.to_string())
+                        }
+                        _ => self.dump_scope_arg(a),
+                    };
+                    match name {
+                        Some(s) => scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$fsdbDumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $fsdbDumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
+                }
+                // Same fail-closed rule as `$dumpvars`: an empty scope list
+                // means "no filter", not "select nothing".
+                self.fst_dump_none = false;
+                if args.len() > 1 && scopes.is_empty() {
+                    self.warn_system_task_once(
+                        "$fsdbDumpvars no usable argument",
+                        "Warning: no $fsdbDumpvars argument named a scope or variable, so the \
+                         dump selects nothing (an empty scope list would dump the whole design)",
+                    );
+                    self.fst_dump_none = true;
                 }
                 self.fst_scopes = scopes;
                 if self.fst_writer.is_none() {
@@ -915,7 +956,9 @@ impl Simulator {
                         self.vcd_file = Some("vcdplus.vcd".to_string());
                     }
                     self.vcd_filter_scopes = Vec::new();
+                    self.vcd_dump_none = false;
                     self.vcd_dump_depth = 0;
+                    self.vcd_earlier_selections.clear();
                     self.vcd_start_dump();
                 } else {
                     self.vcd_dump_on();
@@ -935,24 +978,59 @@ impl Simulator {
                     .unwrap_or(0) as u32;
                 let mut filter_scopes: Vec<String> = Vec::new();
                 for a in args.iter().skip(1) {
-                    if let ExprKind::Ident(hier) = &a.kind {
-                        // The argument names a SCOPE path. Join it verbatim —
-                        // `resolve_hier_name` is a SIGNAL resolver whose
-                        // scope-stripping heuristics collapsed
+                    match self.dump_scope_arg(a) {
+                        // The argument names a SCOPE or a VARIABLE. Join it
+                        // verbatim — `resolve_hier_name` is a SIGNAL resolver
+                        // whose scope-stripping heuristics collapsed
                         // `tb.u_m.u_i` to the leaf `u_i`, so a hierarchical
                         // `$dumpvars(0, top.a.b)` selected nothing.
                         // `dump_filter_prefixes` strips the top-module prefix.
-                        let s = hier
-                            .path
-                            .iter()
-                            .map(|seg| seg.name.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        if !s.is_empty() {
-                            filter_scopes.push(s);
+                        Some(s) => filter_scopes.push(s),
+                        None => {
+                            let text = self.expr_snippet_in(a, None);
+                            self.warn_system_task_once(
+                                &format!("$dumpvars arg {text}"),
+                                &format!(
+                                    "Warning: $dumpvars argument '{text}' is not a scope or \
+                                     variable name and was ignored"
+                                ),
+                            );
                         }
                     }
                 }
+                // An EMPTY filter list means "no filter" — the whole design. So
+                // when the user DID name arguments and not one of them survived
+                // as a name, the run must not fail open into a full dump: say
+                // so, and select nothing.
+                let dump_none = args.len() > 1 && filter_scopes.is_empty();
+                if dump_none {
+                    self.warn_system_task_once(
+                        "$dumpvars no usable argument",
+                        "Warning: no $dumpvars argument named a scope or variable, so the dump \
+                         selects nothing (an empty $dumpvars filter would dump the whole \
+                         design)",
+                    );
+                }
+                // §21.7.1.2: "$dumpvars can be invoked as often as desired
+                // throughout the model ... but the execution of all the
+                // $dumpvars tasks shall be at the same simulation time", and
+                // dumping starts at the end of that time unit, so a further
+                // call at the start time adds its objects: restart the dump
+                // with every selection. A call at a later time stays a
+                // checkpoint of the running dump (`vcd_start_dump`).
+                if self.vcd_writer.is_some() && self.vcd_start_time == self.time {
+                    if !self.vcd_dump_none {
+                        let earlier = std::mem::take(&mut self.vcd_filter_scopes);
+                        self.vcd_earlier_selections
+                            .push((earlier, self.vcd_dump_depth));
+                    }
+                    // Dropping the writer flushes it and joins its thread
+                    // before the file is created again.
+                    self.vcd_writer = None;
+                } else if self.vcd_writer.is_none() {
+                    self.vcd_earlier_selections.clear();
+                }
+                self.vcd_dump_none = dump_none;
                 self.vcd_filter_scopes = filter_scopes;
                 self.vcd_dump_depth = depth;
                 self.vcd_start_dump();
@@ -967,9 +1045,9 @@ impl Simulator {
                 self.vcd_dump_all();
             }
             "$dumpflush" => {
-                // §21.7.1.9: force everything buffered so far out to the file.
+                // §21.7.1.6: wait until preceding output is readable.
                 if let Some(w) = self.vcd_writer.as_mut() {
-                    let _ = w.flush();
+                    let _ = w.flush_sync();
                 }
             }
             "$dumplimit" => {
@@ -1038,9 +1116,24 @@ impl Simulator {
             | "$assertvacuousoff" => {
                 self.exec_assert_control(name, args);
             }
+            // Checkpoints, taken or restored at the end of the time slot.
+            // `$incsave` writes a full checkpoint.
             "$save" | "$restart" | "$incsave" => {
-                let msg = format!("Warning: {} ignored — checkpointing is not supported", name);
-                self.warn_system_task_once(name, &msg);
+                let path = args
+                    .first()
+                    .map(|a| self.system_string_arg(a))
+                    .unwrap_or_default();
+                if path.is_empty() {
+                    let msg = format!("Warning: {} ignored — it needs a file name", name);
+                    self.warn_system_task_once(name, &msg);
+                } else if name == "$restart" {
+                    self.checkpoint_ops
+                        .push(super::checkpoint::CheckpointOp::Restart(path));
+                } else {
+                    self.checkpoint_requested = true;
+                    self.checkpoint_ops
+                        .push(super::checkpoint::CheckpointOp::Save(path));
+                }
             }
             "$sreadmemb" | "$sreadmemh" => {
                 let msg = format!("Warning: {} ignored — memory left unchanged", name);
@@ -1149,7 +1242,8 @@ impl Simulator {
 
     /// `emit_severity_text` naming `scope` in the context line.
     pub(super) fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
-        let time_s = self.format_time_parts(self.time_in_current_unit()).0;
+        // §20.10, §20.4.3: the current time, scaled from the tick counter.
+        let time_s = self.format_current_time_parts().0;
         let line = if body.is_empty() {
             format!("** {}", severity)
         } else {
@@ -1493,10 +1587,12 @@ impl Simulator {
             if self.expr_is_string_valued(a) {
                 result.push_str(&v.to_sv_string());
             } else {
+                // A real argument prints as a real under every default
+                // radix (`$displayh(r)`), as the reference simulator does.
                 result.push_str(&match r {
-                    'b' => v.to_bin_string(),
-                    'h' => v.to_hex_string(),
-                    'o' => Self::bin_to_oct_string(&v.to_bin_string()),
+                    'b' if !v.is_real => v.to_bin_string(),
+                    'h' if !v.is_real => v.to_hex_string(),
+                    'o' if !v.is_real => Self::bin_to_oct_string(&v.to_bin_string()),
                     // §21.2.1.2: an unconsumed argument prints in the task's
                     // default DECIMAL format — which has the type's default
                     // field width, space-padded (`$display("x=", v)` of a
@@ -2029,7 +2125,10 @@ impl Simulator {
             // here rather than at one call site.
             ExprKind::Ident(hier) if hier.path.len() == 1 => {
                 let name = &hier.path[0].name.name;
-                if self.local_stack.iter().rev().any(|m| m.contains_key(name)) {
+                // Only the active routine's own frames shadow `this.<name>`
+                // (§23.9, §6.21); a caller's frame below `method_local_base`
+                // must not hide a class property of the same name.
+                if self.method_local_shadows(name) {
                     return false;
                 }
                 (self.this_stack.last().copied().flatten(), name.clone())
@@ -2055,17 +2154,22 @@ impl Simulator {
             }
             _ => return false,
         };
-        let handle = match handle_opt {
-            Some(h) => h,
-            None => return false,
-        };
-        let inst = match self.heap.get(handle).and_then(|c| c.as_ref()) {
-            Some(i) => i,
+        let class_name: &str = match handle_opt {
+            Some(h) => match self.heap.get(h).and_then(|c| c.as_ref()) {
+                Some(i) => &i.class_name,
+                None => return false,
+            },
+            None if matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1) => {
+                match self.class_context_stack.last().and_then(|c| c.as_deref()) {
+                    Some(cls) => cls,
+                    None => return false,
+                }
+            }
             None => return false,
         };
         // Does a class on the inheritance chain declare `prop` as a string
         // property?
-        self.class_string_props_of(&inst.class_name)
+        self.class_string_props_of(class_name)
             .iter()
             .any(|p| *p == prop)
     }
@@ -2166,8 +2270,8 @@ impl Simulator {
                 }
                 let name = seg.name.name.as_str();
                 // §8.7: a bare property name inside a method is `this.<name>`
-                // unless a local or formal shadows it (§6.21).
-                if !self.local_stack.iter().any(|m| m.contains_key(name)) {
+                // unless a local or formal of the active routine shadows it (§6.21).
+                if !self.method_local_shadows(name) {
                     let cls: Option<String> = match self.this_stack.last().copied().flatten() {
                         Some(hd) => self
                             .heap
@@ -2371,10 +2475,25 @@ impl Simulator {
     /// state.  Used by `class_member_is_string` (a `&self` method) to resolve
     /// `obj.<prop>` where `obj` is a local whose stored `Value` is the handle.
     pub(super) fn peek_local_handle(&self, name: &str) -> Option<usize> {
-        // Innermost-out search of the call frames.
-        for m in self.local_stack.iter().rev() {
+        // Innermost-out search of the active routine's frames.
+        let base = self.method_local_base.last().copied().unwrap_or(0);
+        for m in self.local_stack.get(base..).unwrap_or(&[]).iter().rev() {
             if let Some(v) = m.get(name) {
                 return v.to_u64().map(|h| h as usize);
+            }
+        }
+        // Class property of `this` shadows an outer/module variable (§23.9, §8.11).
+        if let Some(Some(handle)) = self.this_stack.last() {
+            if let Some(inst) = self.heap.get(*handle).and_then(|o| o.as_ref()) {
+                let key = self
+                    .shadowed_prop_key(name, false)
+                    .unwrap_or_else(|| name.to_string());
+                if let Some(v) = inst.properties.get(&key) {
+                    return v.to_u64().map(|h| h as usize);
+                }
+                if self.class_declares_property(&inst.class_name, name) {
+                    return None;
+                }
             }
         }
         // A module-scope class-handle declaration (`holder h;` in a `module`,
@@ -2468,7 +2587,7 @@ impl Simulator {
                     .runtime_recv_class(&Expression {
                         kind: ExprKind::Ident(h.clone()),
                         span: h.span,
-                        cached_width: std::cell::Cell::new(None),
+                        cached_width: crate::ast::cache::WidthCache::new(None),
                     })
                     .or_else(|| self.var_class_types.get(first).cloned())
                     .or_else(|| Some(first.clone()));
@@ -2629,35 +2748,42 @@ impl Simulator {
                         }
                         't' | 'T' => {
                             if ai < args.len() {
-                                // The argument carries a time in the scope's
-                                // unit. §20.3: `$realtime` keeps sub-unit
-                                // precision, but `$time`/`$stime` are the time
-                                // ROUNDED to the module unit (an integer) — `%t`
-                                // must format that rounded value, not the raw
-                                // simulation time. Any other expression is read
-                                // as a scope-unit value directly.
-                                let value = match &args[ai].kind {
-                                    ExprKind::SystemCall { name, .. }
-                                        if name.as_str() == "$realtime" =>
-                                    {
-                                        self.time_in_current_unit()
-                                    }
-                                    ExprKind::SystemCall { name, .. }
-                                        if matches!(name.as_str(), "$time" | "$stime") =>
-                                    {
-                                        let r = self.time_in_current_unit().round();
-                                        if name.as_str() == "$stime" {
-                                            ((r as u64) & 0xFFFF_FFFF) as f64
-                                        } else {
-                                            r
-                                        }
-                                    }
-                                    _ => self.eval_expr(&args[ai]).to_f64(),
-                                };
+                                // Evaluate the time in scope units (§20.3),
+                                // then apply the display units and precision.
                                 // $timeformat's min field width (default 20,
-                                // §21.3.5) governs a bare %t; an explicit
+                                // §20.4.3) governs a bare %t; an explicit
                                 // `%NNt` width overrides it, `%0t` is minimal.
-                                let (body, tf_width) = self.format_time_parts(value);
+                                let (body, tf_width) = match &args[ai].kind {
+                                    // §20.3.3: `$realtime` is the current
+                                    // time in any scope's unit; format it
+                                    // from the tick counter.
+                                    ExprKind::SystemCall { name, .. }
+                                        if matches!(
+                                            name.as_str(),
+                                            "$realtime" | "$__xz_realtime_at"
+                                        ) =>
+                                    {
+                                        self.format_current_time_parts()
+                                    }
+                                    // §3.14.2.3: a read in a package, class
+                                    // or compilation-unit subroutine is in
+                                    // the declaring scope's unit, which the
+                                    // display then scales from.
+                                    ExprKind::SystemCall { name, args: unit }
+                                        if matches!(
+                                            name.as_str(),
+                                            "$__xz_time_at" | "$__xz_stime_at"
+                                        ) && unit.len() == 1 =>
+                                    {
+                                        let unit_exp = self.eval_expr(&unit[0]).to_f64() as i32;
+                                        let value = self.eval_expr(&args[ai]);
+                                        self.format_time_parts_in(&value, unit_exp)
+                                    }
+                                    _ => {
+                                        let value = self.eval_expr(&args[ai]);
+                                        self.format_time_parts(&value)
+                                    }
+                                };
                                 result.push_str(&field(body, tf_width));
                                 ai += 1;
                             }
@@ -2669,7 +2795,40 @@ impl Simulator {
                             if ai < args.len() {
                                 let arg = &args[ai];
                                 ai += 1;
+                                // §10.9: an unpacked typed pattern renders as a
+                                // variable of its type.
+                                if let Some(Some(s)) =
+                                    self.with_typed_pattern_storage(arg, |sim, held| {
+                                        let ExprKind::Ident(h) = &held.kind else {
+                                            return None;
+                                        };
+                                        sim.p_top_level = true;
+                                        sim.render_p_var(&h.path[0].name.name)
+                                    })
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 self.p_top_level = true;
+                                // §21.2.1.7: a packed typed pattern renders as a
+                                // value of its own type.
+                                if let ExprKind::TypedPattern { ty, .. } = &arg.kind
+                                    && is_packed(ty, self)
+                                {
+                                    let v = self.eval_expr(arg);
+                                    result.push_str(&self.render_p_value_typed(&v, ty));
+                                    continue;
+                                }
+                                // §21.2.1.7: a parameter of a structure type.
+                                if let ExprKind::Ident(h) = &arg.kind
+                                    && h.path.len() == 1
+                                    && h.path[0].selects.is_empty()
+                                    && let Some(s) =
+                                        self.render_p_struct_param(&h.path[0].name.name)
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 // §8.9: a static fixed array spelled `Cls::S`
                                 // or `C#(T)::S`, or one element of it,
                                 // `Cls::S[i]`.
@@ -2728,6 +2887,17 @@ impl Simulator {
                                         }
                                     }
                                 }
+                                // §21.2.1.7, §13.4.1: a call returning an
+                                // unpacked array prints the elements it
+                                // returns, as the same value in a variable.
+                                if let Some(src) = self.ret_collection_operand(arg) {
+                                    self.p_top_level = true;
+                                    let core = src
+                                        .and_then(|s| self.render_p_var(&s))
+                                        .unwrap_or_else(|| "'{}".to_string());
+                                    result.push_str(&core);
+                                    continue;
+                                }
                                 // §21.2.1.7: a call returning an unpacked struct.
                                 if let Some(core) = self.render_p_struct_call(arg) {
                                     result.push_str(&core);
@@ -2764,16 +2934,43 @@ impl Simulator {
                                     );
                                     const TMP: &str = "__xz_locator_fmt";
                                     self.materialize_locator(TMP, &arr_name, &mname, &idxs);
-                                    // An `_index` form yields indices, never the
-                                    // element type, so it is not string-rendered.
-                                    let is_str = !mname.ends_with("_index")
-                                        && self.string_signals.contains(&arr_name);
+                                    // An `_index` form yields indices: strings
+                                    // only for a string-keyed array.
+                                    let is_str = if mname.ends_with("_index") {
+                                        self.is_string_keyed_array(&arr_name)
+                                    } else {
+                                        self.string_signals.contains(&arr_name)
+                                            || self.class_coll_holds_strings(&arr_name)
+                                    };
+                                    // §21.2.1.6: an enum result (key or element
+                                    // type) prints its labels.
+                                    let enum_ty = if !mname.ends_with("_index") {
+                                        self.class_member_coll_type(&arr_name)
+                                            .cloned()
+                                            .or_else(|| self.p_elem_type(&arr_name))
+                                            .and_then(|dt| match dt {
+                                                DataType::TypeReference { name, .. } => {
+                                                    Some(name.qualified())
+                                                }
+                                                _ => None,
+                                            })
+                                    } else if self.is_associative_array(&arr_name) {
+                                        self.assoc_key_type_name(&arr_name)
+                                    } else {
+                                        None
+                                    };
+                                    let members =
+                                        enum_ty.as_deref().and_then(|t| self.enum_members_named(t));
                                     let mut parts: Vec<String> = Vec::with_capacity(idxs.len());
                                     for i in 0..idxs.len() {
                                         if let Some(v) = self
                                             .get_signal_value_by_name(&format!("{}[{}]", TMP, i))
                                         {
-                                            parts.push(Self::render_p_value(&v, is_str));
+                                            let label =
+                                                members.and_then(|m| Self::enum_label(m, &v));
+                                            parts.push(label.unwrap_or_else(|| {
+                                                Self::render_p_value(&v, is_str)
+                                            }));
                                         }
                                     }
                                     result.push_str(&format!("'{{{}}}", parts.join(", ")));
@@ -2997,6 +3194,16 @@ impl Simulator {
                                         continue;
                                     }
                                 }
+                                // An indexed lane of a signed named integral type keeps
+                                // its signing even if its flattened storage is unsigned.
+                                if matches!(arg.kind, ExprKind::Index { .. })
+                                    && self.packed_named_select_signed(arg)
+                                {
+                                    let mut v = self.eval_expr(arg);
+                                    v.is_signed = true;
+                                    result.push_str(&v.to_dec_string());
+                                    continue;
+                                }
                                 // §21.2.1.7: type-directed recursive render —
                                 // nested structs, unpacked arrays, enum labels,
                                 // strings and reals, in declaration order.
@@ -3049,8 +3256,9 @@ impl Simulator {
                                                 selects: Vec::new(),
                                             }],
                                             span: arg.span,
-                                            cached_signal_id: std::cell::Cell::new(None),
-                                            cached_resolved_name: std::cell::OnceCell::new(),
+                                            cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                                            cached_resolved_name: crate::ast::cache::NameCache::new(),
+                                            bound: crate::ast::binding::Bound::UNSET,
                                         };
                                         let resolved = self.resolve_hier_name(&ident);
                                         if resolved != flat {
@@ -3276,6 +3484,27 @@ impl Simulator {
                             } else if ai < args.len() {
                                 let v = self.eval_expr(&args[ai]);
                                 ai += 1;
+                                // §6.12.2: an integral letter prints a real as
+                                // an integer (see `real_fmt_int`).
+                                let v = if v.is_real
+                                    && matches!(
+                                        spec,
+                                        'd' | 'D'
+                                            | 'b'
+                                            | 'B'
+                                            | 'o'
+                                            | 'O'
+                                            | 'h'
+                                            | 'H'
+                                            | 'x'
+                                            | 'X'
+                                            | 'c'
+                                            | 'C'
+                                    ) {
+                                    Self::real_fmt_int(&v)
+                                } else {
+                                    v
+                                };
                                 match spec {
                                     'd' | 'D' => {
                                         // §21.2.1.2: default field width is
@@ -3487,21 +3716,9 @@ impl Simulator {
                 } else {
                     push_raw_spec(&mut result, None);
                 }
-            } else if c == '\\' {
-                if let Some(&e) = chars.peek() {
-                    chars.next();
-                    match e {
-                        'n' => result.push('\n'),
-                        't' => result.push('\t'),
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        _ => {
-                            result.push('\\');
-                            result.push(e);
-                        }
-                    }
-                }
             } else {
+                // Backslashes in string literals were already decoded by the lexer
+                // (§5.9.1 / §21.2.1.1), so treat `\` as an ordinary literal character.
                 result.push(c);
             }
         }
@@ -3578,6 +3795,7 @@ impl Simulator {
         // module-top and program-top behavior identical. Allocate a fresh pid
         // so process-scoped bookkeeping (disable labels, scope hints) has
         // somewhere to attach.
+        let mut ended = Vec::new();
         for (stmts, scope) in blocks {
             if self.finished {
                 break;
@@ -3590,11 +3808,32 @@ impl Simulator {
             }
             // `%m` and bare names resolve in the program instance.
             self.current_scope.clone_from(&scope);
+            self.program_pids.insert(pid);
+            self.program_pid_scope.insert(pid, scope.clone());
+            self.program_initial_pids.insert(pid);
+            *self.program_initials_live.entry(scope.clone()).or_default() += 1;
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
-            self.program_pids.insert(pid);
-            self.run_process_stmts(pid, &ProcCont::from_vec(stmts));
+            let saved = std::mem::replace(&mut self.in_reactive_drain, true);
+            // §9.3.2: route program-initial processes through the scheduled-
+            // process wrapper so a process that suspends inside a class task
+            // (`c.run()` with a `#delay`/`fork..join` in its body) parks its
+            // `this`/local context for the resume. A bare `run_process_stmts`
+            // call left that context on the simulator, the next process cleared
+            // it, and the resumed method body read every member through a null
+            // `this`.
+            self.run_scheduled_process(pid, &ProcCont::from_vec(stmts));
+            self.in_reactive_drain = saved;
+            if !self.is_pid_suspended(pid) {
+                ended.push(pid);
+            }
+        }
+        // An initial procedure that ended without waiting ends after every
+        // program has started, so the implicit `$finish` (§24.3) cannot come
+        // before a later program's first statement.
+        for pid in ended {
+            self.child_finished(pid);
         }
     }
 
@@ -3604,6 +3843,7 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn drain_reactive_conts(&mut self) {
         let mut guard = 0u32;
+        let mut guard_state = 0;
         while !self.reactive_conts.is_empty() && !self.finished {
             let conts = std::mem::take(&mut self.reactive_conts);
             self.late_resume_epoch += conts.len() as u64;
@@ -3622,7 +3862,7 @@ impl Simulator {
             }
             self.in_reactive_drain = saved;
             guard += 1;
-            if guard > 10_000 {
+            if guard > 10_000 && !self.fixpoint_window_progressed(&mut guard, &mut guard_state) {
                 break;
             }
         }

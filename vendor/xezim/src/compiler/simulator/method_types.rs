@@ -3,6 +3,18 @@
 use super::*;
 
 impl Simulator {
+    pub(super) fn method_typedef_widths(&self) -> &super::elaborate::TypedefTable {
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedefs, |t| &t.0)
+    }
+
+    pub(super) fn method_typedef_types(&self) -> &super::elaborate::SharedMap<DataType> {
+        self.declaration_typedefs
+            .as_ref()
+            .map_or(&self.module.typedef_types, |t| &t.1)
+    }
+
     /// Declared return width of the function `func` names, without calling it.
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
@@ -25,8 +37,8 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
                 let mut r = h.clone();
                 r.path.pop();
-                r.cached_signal_id = std::cell::Cell::new(None);
-                r.cached_resolved_name = std::cell::OnceCell::new();
+                r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
+                r.cached_resolved_name = crate::ast::cache::NameCache::new();
                 Expression::new(ExprKind::Ident(r), func.span)
             }
             _ => return false,
@@ -94,7 +106,7 @@ impl Simulator {
         if matches!(fd.return_type, DataType::Void { .. }) {
             return None;
         }
-        if matches!(fd.return_type, DataType::Real { .. }) {
+        if self.dt_is_real(&fd.return_type) {
             return Some(64);
         }
         let w = super::elaborate::resolve_type_width(
@@ -190,7 +202,10 @@ impl Simulator {
         while let Some(cd) = self.module.classes.get(&cur) {
             if let Some(m) = cd.methods.get(mname) {
                 if let ClassMethodKind::Function(f) = &m.kind {
-                    if matches!(f.return_type, DataType::Real { .. }) {
+                    if super::elaborate::is_type_real_resolved(
+                        &f.return_type,
+                        &self.module.typedef_types,
+                    ) {
                         return Some(64);
                     }
                     if matches!(f.return_type, DataType::Void { .. }) {
@@ -199,7 +214,7 @@ impl Simulator {
                     let w = super::elaborate::resolve_type_width(
                         &f.return_type,
                         Some(&self.module.parameters),
-                        Some(&self.module.typedefs),
+                        Some(self.method_typedef_widths()),
                     );
                     return (w > 0).then_some(w);
                 }
@@ -288,6 +303,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         self.resolve_typeref_class_name(&tnname)
     }
@@ -368,6 +384,44 @@ impl Simulator {
                         }
                     }
                 }
+                // §10.4.2/§6.12.2: a MULTI-SEGMENT path rooted at a class
+                // object — a handle variable (`h.prop`) or a class name
+                // (`C::prop`, flattened by elaboration into a 2-segment
+                // path) — names a class property, so the signal lookup
+                // below must not capture it: `resolve_hier_name` falls
+                // back to the LEAF for names it cannot bind, and an
+                // unrelated module-scope signal of that leaf name then
+                // supplied the width AND poisoned the identifier's cached
+                // signal id, which rerouted the NBA itself to that signal
+                // — the property never saw the write (`hdl2.vec <= v`
+                // landed in a module `vec`, sized 60 against the 64-bit
+                // property). `class_prop_lvalue_width` walks the DECLARED
+                // types only — no object is read, no method runs — and
+                // answers None for every shape it cannot size, so
+                // non-class paths keep the flat-table lookups below. Only
+                // the leaf-capture shape is checked here: a name the
+                // resolver kept whole reaches its own signal or none.
+                //
+                // §6.12, §8.25: a `real` property of the handle's object —
+                // also one typed by a type parameter the object binds to
+                // `real` — keeps a real RHS whole (64), which the declared
+                // width walk cannot see through the parameter.
+                if h.path.len() == 2
+                    && h.path[1].selects.is_empty()
+                    && self.may_name_real_class_prop(&h.path[1].name.name)
+                    && let Some(handle) = self.eval_ident_handle(&h.path[0].name.name)
+                    && self.class_prop_is_real(handle, &h.path[1].name.name)
+                {
+                    return 64;
+                }
+                if h.path.len() > 1
+                    && name.as_ref() == h.path[h.path.len() - 1].name.name
+                    && !self.no_class_objects()
+                    && self.head_denotes_class_object(h)
+                    && let Some(w) = self.class_prop_lvalue_width(h).filter(|w| *w > 0)
+                {
+                    return w;
+                }
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
                     if let Some(k) = leaf_key {
@@ -428,6 +482,32 @@ impl Simulator {
                     if let Some(w) = self.heap_prop_width(handle, leaf) {
                         return w;
                     }
+                    // §6.12.2: a `real` property has no integral width for
+                    // `heap_prop_width`, but its NBA RHS must survive the
+                    // schedule-time resize untouched — 64 keeps a real Value
+                    // real (`resize` clones a real at width 64) and the
+                    // commit-side `fit_class_prop` does the real↔integral
+                    // conversion when the property is integral.
+                    if self.class_prop_is_real(handle, leaf) {
+                        return 64;
+                    }
+                }
+                // §10.4.2/§6.12.2: a class-property lvalue the flat tables
+                // above cannot see — HANDLE-qualified (`h.prop`) or
+                // owner-qualified STATIC (`C::prop`, flattened by
+                // elaboration into a 2-segment path) — is sized by its
+                // DECLARED width, and a `real` property is 64 bits. The NBA
+                // scheduler freezes the RHS at this width, so the 32-bit
+                // default below truncated every wider property (a 64-bit
+                // `h.vec`, a 33-bit `h.w33`, a whole 60-bit struct `h.p`)
+                // and turned a real RHS into an int32. `lrm_self_width`
+                // walks the DECLARED types — no object is read, no method
+                // runs — and answers None for every shape it cannot size,
+                // so non-class paths keep the leaf fallbacks below.
+                if !self.no_class_objects()
+                    && let Some(w) = self.lrm_self_width(expr).filter(|w| *w > 0)
+                {
+                    return w;
                 }
                 self.widths
                     .get(leaf)
@@ -486,6 +566,14 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.3: after an index the labels count ELEMENTS of the
+                // next dimension — `a[1][4:2]` on `logic [3:0][5:0][7:0] a`
+                // is 24 bits, the context its RHS is evaluated in (§11.6.1).
+                if matches!(rs_base.kind, ExprKind::Index { .. })
+                    && let Some(ew) = self.select_base_elem_stride(rs_base)
+                {
+                    return count.saturating_mul(ew);
+                }
                 count
             }
             ExprKind::Index { expr: e, index: _ } => {
@@ -518,6 +606,15 @@ impl Simulator {
                         if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
                         }
+                        // §7.8: an associative element has the declared
+                        // element width (`ma[k] = (1 << 69) - 1`).
+                        let scoped = self.dyn_name_lookup(&n).map(|s| s.to_string());
+                        let an = scoped.as_deref().unwrap_or(&n);
+                        if self.is_associative_array(an)
+                            && let Some(w) = self.assoc_store_ctx_width(an)
+                        {
+                            return w;
+                        }
                     }
                     if depth == 2 {
                         if let Some((_, _, w)) = self.module.arrays_2d.get(&*n) {
@@ -540,18 +637,42 @@ impl Simulator {
                     // dim list and the lvalue fell through to width 1 — a
                     // continuous assign then resized its RHS to one bit and
                     // wrote the LSB (0x12 -> 0).
-                    let num_unpacked = if let Some((d, _)) = self.module.arrays_nd.get(&*n) {
-                        d.len()
-                    } else if self.module.arrays_2d.contains_key(&*n) {
-                        2
-                    } else if self.module.arrays.contains_key(&*n)
-                        || self.module.dynamic_arrays.contains(&*n)
-                        || self.is_associative_array(&n)
+                    // The unpacked element's width comes from the same
+                    // lookup, for the packed-select width below.
+                    let (num_unpacked, unpacked_elem_w) =
+                        if let Some((d, w)) = self.module.arrays_nd.get(&*n) {
+                            (d.len(), Some(*w))
+                        } else if let Some(&(_, _, w)) = self.module.arrays_2d.get(&*n) {
+                            (2, Some(w))
+                        } else if let Some(&(_, _, w)) = self.module.arrays.get(&*n) {
+                            (1, Some(w))
+                        } else if self.module.dynamic_arrays.contains(&*n)
+                            || self.is_associative_array(&n)
+                        {
+                            (1, None)
+                        } else {
+                            (0, None)
+                        };
+                    // §7.4.1, §7.4.5: past the unpacked dimensions the
+                    // indices select packed elements of the unpacked
+                    // element. `packed_full_dims` lists only the packed
+                    // array dimensions, so for an array of packed structs
+                    // (`le_t [1:0] b [2]`) the product of the remaining
+                    // dimensions leaves out the struct's own width and
+                    // `b[0][1]` came out one bit wide: a nonblocking store
+                    // or continuous assignment kept bit 0. The unpacked
+                    // element's width over the packed elements selected so
+                    // far is right for any element type.
+                    if depth > num_unpacked
+                        && let Some(elem_w) = unpacked_elem_w
+                        && let Some(w) = self.packed_select_width_in_unpacked_elem(
+                            &n,
+                            elem_w,
+                            depth - num_unpacked,
+                        )
                     {
-                        1
-                    } else {
-                        0
-                    };
+                        return w;
+                    }
                     if let Some(dims) = self.module.packed_full_dims.get(&*n) {
                         let pdepth = depth.saturating_sub(num_unpacked);
                         if pdepth < dims.len() {
@@ -570,6 +691,17 @@ impl Simulator {
                             }
                         }
                     }
+                }
+                // §7.4.1: an element of a multi-dimensional packed member
+                // (`sa[i].f0[j][k]`, `s.f0[j][k]` on an array of packed
+                // structs): the width of the slice the store resolves to.
+                // Effect-free indices only, as they are evaluated here.
+                if let ExprKind::Index { expr: b, index: ix } = &expr.kind
+                    && matches!(cur.kind, ExprKind::MemberAccess { .. })
+                    && Self::cond_expr_is_effect_free(expr, false)
+                    && let Some((_, _, w)) = self.packed_struct_elem_slice(b, ix)
+                {
+                    return w;
                 }
                 // §18.4/§7.2: an element of a class aggregate member —
                 // width from the resolved storage (a packed-dimension slot
@@ -591,5 +723,38 @@ impl Simulator {
             }
             _ => self.infer_width(expr),
         }
+    }
+
+    /// Width of `pdepth` packed selects into an `elem_w`-bit element of the
+    /// fixed-size unpacked array `name`: the element's declared width over
+    /// the number of packed elements those selects pick from. `None` when
+    /// its packed shape is not known, or the selects reach a single bit, so
+    /// the caller keeps its other answers.
+    fn packed_select_width_in_unpacked_elem(
+        &self,
+        name: &str,
+        elem_w: u32,
+        pdepth: usize,
+    ) -> Option<u32> {
+        let elem_w = u64::from(elem_w);
+        let selected: u64 = match self.module.packed_full_dims.get(name) {
+            Some(dims) if pdepth <= dims.len() => dims[..pdepth]
+                .iter()
+                .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                .product(),
+            Some(_) => return None,
+            // A single `[N-1:0]` dimension is not recorded; its element
+            // width is.
+            None if pdepth == 1 => {
+                let ew = *self.module.packed_signal_elem_widths.get(name)? as u64;
+                if ew <= 1 {
+                    return None;
+                }
+                elem_w / ew
+            }
+            None => return None,
+        };
+        (selected > 0 && elem_w.is_multiple_of(selected) && elem_w > selected)
+            .then(|| (elem_w / selected) as u32)
     }
 }

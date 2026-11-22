@@ -1,6 +1,9 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+#[macro_use]
+mod stdio;
+
 // Opt-in end-of-run statistics footer (`--report-stats` / XEZIM_REPORT_STATS).
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
@@ -120,31 +123,36 @@ fn spawn_memory_watchdog() {
         _ => return, // /proc unavailable (non-Linux); skip silently
     };
     let limit_kb = total_kb / 4 * 3;
-    std::thread::spawn(move || {
-        let pid = std::process::id();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
-                if rss_kb > limit_kb {
-                    eprintln!(
-                        "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
-                        rss_kb / 1024,
-                        limit_kb / 1024,
-                        total_kb / 1024,
-                        pid,
-                    );
-                    // SIGKILL self — bypasses panic handlers, no Drop runs,
-                    // but ensures the process actually exits even if a thread
-                    // is stuck inside a long allocation.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGKILL);
+    let watchdog = std::thread::Builder::new()
+        .name("xezim-memwatch".to_string())
+        .spawn(move || {
+            let pid = std::process::id();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                if let Some(rss_kb) = proc_kb("/proc/self/status", "VmRSS") {
+                    if rss_kb > limit_kb {
+                        eprintln!(
+                            "[xezim][mem-watchdog] RSS {} MiB exceeds 3/4 of system memory ({} MiB of {} MiB) — killing pid {} to prevent OOM. Set XEZIM_NO_MEM_WATCHDOG=1 to disable.",
+                            rss_kb / 1024,
+                            limit_kb / 1024,
+                            total_kb / 1024,
+                            pid,
+                        );
+                        // SIGKILL self — bypasses panic handlers, no Drop runs,
+                        // but ensures the process actually exits even if a thread
+                        // is stuck inside a long allocation.
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        // Fallback if libc isn't available somehow.
+                        std::process::exit(137);
                     }
-                    // Fallback if libc isn't available somehow.
-                    std::process::exit(137);
                 }
             }
-        }
-    });
+        });
+    if let Err(e) = watchdog {
+        eprintln!("Warning: cannot spawn memory watchdog ({e}); running without it");
+    }
 }
 
 /// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
@@ -199,14 +207,21 @@ fn print_usage() {
     eprintln!("  -D <name>[=val]  Define a macro");
     eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
     eprintln!("                   dir and uvm_pkg.sv); XEZIM_UVM_VERSION picks a release");
-    eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
+    eprintln!("  -s, -top <top>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!(
-        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
+        "  --max-time <n>[fs|ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
+    eprintln!("  --save-at <time>[,<file>]  Save a checkpoint at the end of the last time slot at");
+    eprintln!(
+        "                   or before <time> (<n>[fs|ps|ns|us|ms|s], bare <n> is ns; file default"
+    );
+    eprintln!("                   xezim.ckpt); repeatable. The run continues after saving");
+    eprintln!("  --restore <file> Start from a checkpoint ($save, --save-at) of the same design,");
+    eprintln!("                   built by the same xezim");
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
     eprintln!("                   implies the --verbose engine lines");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
@@ -271,6 +286,13 @@ fn print_usage() {
     eprintln!("  --dump-timescales  Print each module's timescale before the run (no source");
     eprintln!("                     $printtimescale needed); flags modules with no `timescale.");
     eprintln!("  --dpi-lib <so>   Load a DPI shared library (.so/.dylib/.dll)");
+    eprintln!("  <file>.c/.cc/.cpp/.cxx/.C  A DPI C/C++ source, on the command line or in a -f");
+    eprintln!("                   list: compiled with $CC/$CXX (else clang/clang++, else cc/c++)");
+    eprintln!("                   with xezim's svdpi.h and vpi_user.h on the include path,");
+    eprintln!("                   linked with any listed .o/.a into one library cached under");
+    eprintln!("                   $XEZIM_CACHE_DIR, $XDG_CACHE_HOME or ~/.cache (xezim/dpi),");
+    eprintln!("                   and loaded like --dpi-lib. A listed .so/.dylib/.dll is loaded");
+    eprintln!("                   as --dpi-lib");
     eprintln!("  --show-env-avail Print every XEZIM_* environment variable with a description");
     eprintln!("  --vpi-lib <so>   Load a VPI module and run its vlog_startup_routines (-m)");
     eprintln!("  --x-warn         Warn when a signal holding a valid 0/1 value takes an x bit");
@@ -367,6 +389,19 @@ fn print_usage() {
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
     eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
     eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  --wave-suppress <entry>  EXCLUDE signals from the VCD, FST and XTrace dumps.");
+    eprintln!("                   Repeatable, and the two entry forms may be mixed: a bare name");
+    eprintln!("                   is a MODULE definition, so every instance of it at any depth");
+    eprintln!("                   goes; a dotted name is one hierarchical path, with or without");
+    eprintln!("                   the top-module prefix: an instance, an instance array, a");
+    eprintln!("                   generate block or one variable. A bare name that is no module");
+    eprintln!("                   is a path below the top module.");
+    eprintln!("  --wave-suppress-module <name>  --wave-suppress, reading <name> as a module");
+    eprintln!("                   definition even if an instance carries the same name.");
+    eprintln!("  -wave_suppress_file <file>  (--wave-suppress-file) Exclusions from a file: one");
+    eprintln!(
+        "                   or more per line, '#' or '//' comments. Adds to --wave-suppress."
+    );
     eprintln!("  --fst-repack[=N] gzip-wrap the finished FST on a clean close (GTKWave's");
     eprintln!("                   repack-on-close; deflate level N, 1..9, default 6). About");
     eprintln!("                   1.5x smaller; readers inflate it on open.");
@@ -406,8 +441,11 @@ fn print_usage() {
     );
     eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
     eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
-    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>; also -svseed, -seed and the");
+    eprintln!("                   =<n> forms (-sv_seed=5), on the command line or in -f files");
     eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
+    eprintln!("  -CFLAGS \"<args>\", -LDFLAGS \"<args>\"  Extra compiler / linker arguments");
+    eprintln!("                   for the DPI C/C++ sources (-ccflags, -ldflags are the same)");
     eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
     eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
     eprintln!(
@@ -501,14 +539,19 @@ fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
 /// Build the `--module-timescale` configuration from raw option strings,
 /// validating units and detecting conflicting named assignments.
 /// Parse a `--max-time` value: a bare number is NANOSECONDS (historical
-/// default), an attached suffix selects the unit: `30000000ps`, `30us`,
+/// default), an attached suffix selects the unit: `925000000000fs`, `30us`,
 /// `1ms`, `2s` (case-insensitive; `us` or `µs`). Returns nanoseconds.
 /// A customer run set `--max-time 30000000` intending picoseconds under a
 /// 1ps timescale and got 30 ms — the unit was invisible and unspellable.
 fn parse_max_time(raw: &str) -> Result<u64, String> {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
-    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower.strip_suffix("ps") {
+    let (num_str, factor_ns): (&str, f64) = if let Some(n) = lower
+        .strip_suffix("fs")
+        .filter(|n| n.trim().parse::<f64>().is_ok())
+    {
+        (n, 1e-6)
+    } else if let Some(n) = lower.strip_suffix("ps") {
         (n, 1e-3)
     } else if let Some(n) = lower.strip_suffix("ns") {
         (n, 1.0)
@@ -525,15 +568,32 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     };
     let num: f64 = num_str.trim().parse().map_err(|_| {
         format!(
-            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            "invalid --max-time value '{}' (expected <n>[fs|ps|ns|us|ms|s])",
             raw
         )
     })?;
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
-    let ns = num * factor_ns;
-    let rounded = ns.round();
+    // Keep integer femtoseconds exact above f64's 53-bit mantissa. Rounding
+    // to whole ns happens once, after the unit conversion (#1113).
+    if let Some(fs) = lower
+        .strip_suffix("fs")
+        .and_then(|value| value.trim().parse::<u128>().ok())
+    {
+        let ns = fs / 1_000_000 + u128::from(fs % 1_000_000 >= 500_000);
+        if ns >= u64::MAX as u128 {
+            return Ok(u64::MAX);
+        }
+        if ns == 0 {
+            return Err(format!(
+                "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
+                raw
+            ));
+        }
+        return Ok(ns as u64);
+    }
+    let rounded = (num * factor_ns).round();
     if rounded < 1.0 {
         return Err(format!(
             "--max-time '{}' is below 1 ns; the cap is tracked in whole nanoseconds",
@@ -541,6 +601,33 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
         ));
     }
     Ok(rounded as u64)
+}
+
+/// Parse a `--save-at` time: like `--max-time`, a bare number is
+/// nanoseconds, but zero and anything below 1 ns are also accepted.
+/// Returns seconds.
+fn parse_save_time(raw: &str) -> Result<f64, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let units = [
+        ("fs", 1e-15),
+        ("ps", 1e-12),
+        ("ns", 1e-9),
+        ("µs", 1e-6),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
+    ];
+    let (num, scale) = units
+        .iter()
+        .find_map(|(u, f)| lower.strip_suffix(u).map(|n| (n, *f)))
+        .unwrap_or((lower.as_str(), 1e-9));
+    match num.trim().parse::<f64>() {
+        Ok(n) if n >= 0.0 => Ok(n * scale),
+        _ => Err(format!(
+            "invalid --save-at time '{}' (expected <n>[fs|ps|ns|us|ms|s])",
+            raw
+        )),
+    }
 }
 
 /// Marks an `-override_timescale` value inside the `--module-timescale`
@@ -926,13 +1013,13 @@ fn process_command_file(
                 continue;
             }
             match t {
-                "-s" => {
+                "-s" | "-top" => {
                     i += 1;
                     let top = toks
                         .get(i)
                         .filter(|top| !top.is_empty() && !top.starts_with('-'))
                         .ok_or_else(|| {
-                            format!("-s requires a top module (in args file '{}')", path)
+                            format!("{} requires a top module (in args file '{}')", t, path)
                         })?;
                     top_modules.push(top.clone());
                 }
@@ -991,6 +1078,20 @@ fn process_command_file(
                     };
                     if let Some(v) = v {
                         compat.fst_scope_files.push(resolve_rel(base, &v));
+                    }
+                }
+                // `-wave_suppress_file <file>` (path relative to this args
+                // file); one `--wave-suppress` entry per line.
+                _ if cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                    let v = match cli_files::option_value(t, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                        Some(Some(v)) => Some(v.to_string()),
+                        _ => {
+                            i += 1;
+                            toks.get(i).map(|s| s.to_string())
+                        }
+                    };
+                    if let Some(v) = v {
+                        compat.wave_suppress_files.push(resolve_rel(base, &v));
                     }
                 }
                 // `-xezim_env` must be on the command line: the environment
@@ -1136,21 +1237,6 @@ fn process_command_file(
                         }
                     }
                 },
-                // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
-                // (and `-seed` likewise) lower onto the `+seed=` plusarg the
-                // simulator already consumes.
-                "-svseed" | "-seed" => {
-                    if i + 1 < toks.len() {
-                        i += 1;
-                        plusargs.push(format!("+seed={}", toks[i]));
-                    }
-                }
-                _ if t.starts_with("-svseed=") => {
-                    plusargs.push(format!("+seed={}", &t["-svseed=".len()..]));
-                }
-                _ if t.starts_with("-seed=") => {
-                    plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
-                }
                 _ if t.starts_with("-s") && t.len() > 2 => {
                     top_modules.push(t[2..].to_string());
                 }
@@ -1558,14 +1644,15 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
     let mut top_level_bind = false;
     // Open unit keywords, innermost last.
     let mut stack: Vec<&str> = Vec::new();
-    let mut prev: &str = "";
+    let mut prev_was_typedef = false;
     let mut i = 0usize;
     while i < toks.len() {
-        let t = &toks[i];
-        let text_s = t.text.as_str();
+        let t = toks[i];
+        let text_cow = toks.text(t);
+        let text_s = text_cow.as_ref();
         if matches!(t.kind, TK::Identifier | TK::EscapedIdentifier) {
             refs.insert(text_s.to_string());
-            prev = text_s;
+            prev_was_typedef = false;
             i += 1;
             continue;
         }
@@ -1584,10 +1671,10 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
             // interface scope for it, or the missing `endinterface` unbalances
             // everything that follows.
             let iface_class =
-                kind == "interface" && toks.get(i + 1).is_some_and(|n| n.text == "class");
+                kind == "interface" && toks.get(i + 1).is_some_and(|n| toks.text(n) == "class");
             // `typedef class C;` is a §6.18 forward declaration, not a
             // definition; the real one may live in another file entirely.
-            let fwd = kind == "class" && prev == "typedef";
+            let fwd = kind == "class" && prev_was_typedef;
             if !iface_class && !fwd {
                 let top_level = stack.iter().all(|s| *s == "package");
                 if top_level {
@@ -1595,13 +1682,13 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
                     // the name (`module automatic m`, `class static C`).
                     let mut j = i + 1;
                     while toks.get(j).is_some_and(|n| {
-                        matches!(n.text.as_str(), "static" | "automatic" | "virtual")
+                        matches!(toks.text(n).as_ref(), "static" | "automatic" | "virtual")
                     }) {
                         j += 1;
                     }
                     if let Some(n) = toks.get(j) {
                         if matches!(n.kind, TK::Identifier | TK::EscapedIdentifier) {
-                            declared.push(n.text.clone());
+                            declared.push(toks.text(n).into_owned());
                         }
                     }
                 }
@@ -1623,7 +1710,7 @@ fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<St
         } else if text_s == "bind" && stack.is_empty() {
             top_level_bind = true;
         }
-        prev = text_s;
+        prev_was_typedef = t.kind == TK::KwTypedef;
         i += 1;
     }
     (declared, refs, top_level_bind)
@@ -1684,6 +1771,60 @@ fn merged_sv_files_for_top(top: &str, texts: &[String]) -> Option<Vec<usize>> {
             .map(|(i, _)| i)
             .collect(),
     )
+}
+
+/// Record — and, for a repeat, STRIP — compilation-unit-scope (`$unit`)
+/// non-forward `typedef` definitions in `text`.
+///
+/// Mirrors [`strip_duplicate_unit_subroutines`] so adopted `-v`/`-y` library
+/// files that each carry a `$unit` typedef of the same name leave a merged
+/// dump that still compiles standalone (§3.13, §6.18).
+fn strip_duplicate_unit_typedefs(
+    text: &str,
+    seen: &mut std::collections::HashSet<String>,
+) -> (String, usize) {
+    let tokens = xezim::lexer::Lexer::new(text).tokenize();
+    let mut parser = sv_parser::parse::Parser::new(tokens);
+    let ast = parser.parse_source_text();
+    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    for desc in &ast.descriptions {
+        let td = match desc {
+            xezim::ast::Description::TypedefDecl(td) => td,
+            xezim::ast::Description::PackageItem(xezim::ast::decl::PackageItem::Typedef(td)) => td,
+            _ => continue,
+        };
+        if td.forward || matches!(td.data_type, xezim::ast::types::DataType::Void(_)) {
+            continue;
+        }
+        if !seen.insert(td.name.name.clone())
+            && td.span.start < td.span.end
+            && td.span.end <= text.len()
+            && text.is_char_boundary(td.span.start)
+            && text.is_char_boundary(td.span.end)
+        {
+            spans.push((td.span.start, td.span.end, td.name.name.clone()));
+        }
+    }
+    if spans.is_empty() {
+        return (text.to_string(), 0);
+    }
+    spans.sort_by_key(|(s, _, _)| *s);
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut stripped = 0usize;
+    for (start, end, name) in spans {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&format!(
+            "/* [xezim] duplicate $unit typedef '{name}' suppressed; first definition kept */"
+        ));
+        cursor = end;
+        stripped += 1;
+    }
+    out.push_str(&text[cursor..]);
+    (out, stripped)
 }
 
 /// Record — and, for a repeat, STRIP — compilation-unit-scope (`$unit`)
@@ -1830,17 +1971,19 @@ fn append_adopted_libs_to_merged(
     // Seed from the primary sources already in the file, so a library copy of
     // a task the design itself defines is suppressed too.
     let mut seen_subs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_typedefs: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Ok(primary) = std::fs::read_to_string(merged_out) {
         let _ = strip_duplicate_unit_subroutines(&primary, &mut seen_subs);
+        let _ = strip_duplicate_unit_typedefs(&primary, &mut seen_typedefs);
     }
     for (path, mods) in &adopted {
-        // Preprocess with the SAME context the -v/-y indexing pass used
-        // (fresh preprocessor, run include dirs, post-primary macro
-        // snapshot) so the appended text has its includes inlined and
-        // macros expanded. Raw bytes broke the standalone re-compile the
-        // moment merged.sv left the original directory: the library's
-        // relative include paths no longer resolved and its macros came
-        // out undefined.
+        // The text the -v/-y indexing pass preprocessed the file to (run
+        // include dirs, and the macros the design and the library files
+        // read before it left, §22.5.1), so the appended text has its
+        // includes inlined and macros expanded. Raw bytes broke the
+        // standalone re-compile the moment merged.sv left the original
+        // directory: the library's relative include paths no longer
+        // resolved and its macros came out undefined.
         let (text, how) = match xezim::preprocess_adopted_lib(path) {
             Some(t) => (t, "preprocessed"),
             None => match std::fs::read(path) {
@@ -1867,14 +2010,17 @@ fn append_adopted_libs_to_merged(
             let (_decl, refs, _bind) = scan_units_and_refs(&text);
             lib_refs.extend(refs);
         }
-        let (text, nstrip) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
-        nstripped += nstrip;
+        let (text, nt) = strip_duplicate_unit_typedefs(&text, &mut seen_typedefs);
+        let (text, ns) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
+        nstripped += nt + ns;
         extra.push_str(&format!(
             "\n// ===== adopted library file: {} ({}; needed for: {}) =====\n",
             path.display(),
             how,
             mods.join(", ")
         ));
+        // Each adopted library starts its own directive context (§22.2).
+        extra.push_str("`default_nettype wire\n");
         extra.push_str(&text);
         if !extra.ends_with('\n') {
             extra.push('\n');
@@ -1917,9 +2063,9 @@ fn append_adopted_libs_to_merged(
         }
         added.sort_unstable();
         for fi in &added {
-            let (text, nstrip) =
-                strip_duplicate_unit_subroutines(&primary_texts[*fi], &mut seen_subs);
-            nstripped += nstrip;
+            let (text, nt) = strip_duplicate_unit_typedefs(&primary_texts[*fi], &mut seen_typedefs);
+            let (text, ns) = strip_duplicate_unit_subroutines(&text, &mut seen_subs);
+            nstripped += nt + ns;
             extra.push_str(&format!(
                 "
 // ===== primary file re-added: {} (referenced only from an adopted library) =====
@@ -1955,11 +2101,36 @@ fn append_adopted_libs_to_merged(
         nmods,
         merged_out,
         if nstripped > 0 {
-            format!(" (suppressed {nstripped} duplicate $unit task/function definition(s))")
+            format!(" (suppressed {nstripped} duplicate $unit definition(s))")
         } else {
             String::new()
         }
     );
+}
+
+fn smaller_worker_stacks(requested_mb: usize) -> impl Iterator<Item = usize> {
+    [1024, 512, 256, 128, 64]
+        .into_iter()
+        .filter(move |&size_mb| size_mb < requested_mb)
+}
+
+#[test]
+fn smaller_worker_stack_ladder() {
+    for (requested, expected) in [
+        (1536, vec![1024, 512, 256, 128, 64]),
+        (1024, vec![512, 256, 128, 64]),
+        (512, vec![256, 128, 64]),
+        (256, vec![128, 64]),
+        (128, vec![64]),
+        (64, vec![]),
+        (32, vec![]),
+    ] {
+        // Exhausting this iterator selects the current-thread fallback.
+        assert_eq!(
+            smaller_worker_stacks(requested).collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 fn main() {
@@ -1967,6 +2138,16 @@ fn main() {
     // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
     // still single-threaded here, so setting the environment is sound.
     apply_xezim_env_files();
+    // Standalone informational commands need neither compilation nor a worker
+    // stack. Keep their output available even under a tight address-space limit.
+    if env::args().len() == 1
+        || matches!(
+            env::args().nth(1).as_deref(),
+            Some("-V" | "-h" | "--help" | "--show-env-avail")
+        )
+    {
+        std::process::exit(run_main());
+    }
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -1989,7 +2170,6 @@ fn main() {
             libc::prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
         }
     }
-    spawn_memory_watchdog();
     // Install the SIGUSR1 hang-report handler before compile: a user poking a
     // seemingly-hung run during a long elaboration must not kill it (the
     // default SIGUSR1 action is termination).
@@ -2001,26 +2181,62 @@ fn main() {
     // aborts with "thread 'main' has overflowed its stack"). Do what rustc
     // does: run the whole compile+simulate on a worker thread with a large
     // stack. The memory is virtual — pages commit only if actually used —
-    // so the big default costs nothing. XEZIM_STACK_MB overrides.
+    // but the reservation still counts against address-space limits.
+    // XEZIM_STACK_MB overrides; retry smaller workers before the main stack.
     let stack_mb: usize = std::env::var("XEZIM_STACK_MB")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1024);
     if stack_mb > 0 {
-        let code = std::thread::Builder::new()
-            .name("xezim-main".to_string())
-            .stack_size(stack_mb * 1024 * 1024)
-            .spawn(run_main)
-            .expect("spawn simulation thread")
-            .join()
-            .unwrap_or_else(|_| 101);
-        std::process::exit(code);
+        let mut first_error = None;
+        for size_mb in std::iter::once(stack_mb).chain(smaller_worker_stacks(stack_mb)) {
+            let Some(stack_bytes) = size_mb
+                .checked_mul(1024 * 1024)
+                .filter(|&bytes| bytes <= isize::MAX as usize)
+            else {
+                first_error.get_or_insert_with(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "requested stack size is too large",
+                    )
+                });
+                continue;
+            };
+            let warning = first_error.as_ref().map(|e| {
+                format!(
+                    "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({e}); running with a {size_mb} MiB stack (set XEZIM_STACK_MB to a size that fits)"
+                )
+            });
+            match std::thread::Builder::new()
+                .name(xezim::CLI_WORKER_THREAD.to_string())
+                .stack_size(stack_bytes)
+                .spawn(move || {
+                    if let Some(warning) = warning {
+                        eprintln!("{warning}");
+                    }
+                    spawn_memory_watchdog();
+                    run_main()
+                }) {
+                Ok(worker) => std::process::exit(worker.join().unwrap_or(101)),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        eprintln!(
+            "Warning: cannot spawn the simulation thread with a {stack_mb} MiB stack ({}); running on the current thread (set XEZIM_STACK_MB to a size that fits, or raise `ulimit -s`)",
+            first_error.unwrap()
+        );
+        // Keep simulate_multi here too, without changing what children inherit.
+        xezim::CLI_CURRENT_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    spawn_memory_watchdog();
     let code = run_main();
     std::process::exit(code);
 }
 
 fn run_main() -> i32 {
+    let _oom_trace = xezim_core::oom_trace::session();
     let compile_wall_start = std::time::Instant::now();
 
     // Default to IEEE 1800-2023 mode. SV-2023 is additive over -2017, so
@@ -2113,6 +2329,9 @@ fn run_main() -> i32 {
     let mut fst_file: Option<String> = None;
     let mut fst_repack: Option<u8> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
+    // `--wave-suppress` / `--wave-suppress-module` / `--wave-suppress-file`:
+    // the waveform EXCLUDE list, shared by VCD, FST and XTrace.
+    let mut wave_suppress: Vec<String> = Vec::new();
     let mut sim_debug = false;
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
@@ -2121,6 +2340,7 @@ fn run_main() -> i32 {
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
     let mut plusargs: Vec<String> = Vec::new();
+    let mut direct_plusarg_positions: Vec<usize> = Vec::new();
     let mut emit_hypergraph: Option<String> = None;
     let mut load_partition: Option<String> = None;
     let mut write_profile: Option<String> = None;
@@ -2135,6 +2355,7 @@ fn run_main() -> i32 {
 
     let mut compat = cli_compat::CompatArgs::default();
     let mut max_time_explicit = false;
+    let mut save_at: Vec<(f64, String)> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -2233,7 +2454,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-l") && arg.len() > 2 => {
                 log_file = Some(arg[2..].to_string());
             }
-            "-s" => {
+            "-s" | "-top" => {
                 i += 1;
                 if i < args.len() {
                     top_modules.push(args[i].clone());
@@ -2270,6 +2491,32 @@ fn run_main() -> i32 {
                     Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
                     Err(e) => {
                         eprintln!("Error: cannot read -fst_scope_file '{}': {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // `--wave-suppress-file <file>`: one `--wave-suppress` entry per
+            // line — module names and hierarchical paths may be mixed freely.
+            // Ahead of the `-f<file>` args-file prefix form, which would
+            // otherwise take `-wave_suppress_file`.
+            _ if cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES).is_some() => {
+                let path = match cli_files::option_value(arg, cli_files::WAVE_SUPPRESS_FILE_NAMES) {
+                    Some(Some(v)) => v.to_string(),
+                    _ => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("Error: -wave_suppress_file requires a file");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+                    Err(e) => {
+                        eprintln!("Error: cannot read -wave_suppress_file '{}': {}", path, e);
                         std::process::exit(1);
                     }
                 }
@@ -2418,6 +2665,7 @@ fn run_main() -> i32 {
                     xezim::compiler::simulator::set_warn_x(true);
                     xezim::compiler::simulator::set_warn_x_limit(n);
                 }
+                direct_plusarg_positions.push(i);
                 plusargs.push(arg.clone());
             }
             // `-v <file>` — a library FILE (traditional library semantics): its
@@ -2601,6 +2849,31 @@ fn run_main() -> i32 {
                     }
                 }
             }
+            "--save-at" => {
+                i += 1;
+                if i < args.len() {
+                    let (t, file) = match args[i].split_once(',') {
+                        Some((t, f)) => (t, f.to_string()),
+                        None => (args[i].as_str(), "xezim.ckpt".to_string()),
+                    };
+                    match parse_save_time(t) {
+                        Ok(secs) => {
+                            save_at.push((secs, file));
+                            xezim::compiler::simulator::set_checkpoint_save_at(save_at.clone());
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            "--restore" => {
+                i += 1;
+                if i < args.len() {
+                    xezim::compiler::simulator::set_checkpoint_restore(Some(args[i].clone()));
+                }
+            }
             "--settle-limit" => {
                 i += 1;
                 if i < args.len() {
@@ -2781,6 +3054,33 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
+            }
+            // ── `--wave-suppress`: the waveform EXCLUDE list ──────────────
+            // A bare identifier names a MODULE — every instance of it, at every
+            // depth — and a dotted name names one hierarchical subtree, with or
+            // without the top-module prefix. `--wave-suppress-module` forces the
+            // module reading, so the two rules are never ambiguous. The list is
+            // one matcher shared by the VCD, FST and XTrace dumps.
+            "--wave-suppress" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--wave-suppress=") && !arg.starts_with("--wave-suppress-m") => {
+                wave_suppress.push(arg["--wave-suppress=".len()..].to_string());
+            }
+            "--wave-suppress-module" => {
+                i += 1;
+                if i < args.len() {
+                    wave_suppress.push(format!("module:{}", args[i]));
+                }
+            }
+            _ if arg.starts_with("--wave-suppress-module=") => {
+                wave_suppress.push(format!(
+                    "module:{}",
+                    &arg["--wave-suppress-module=".len()..]
+                ));
             }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
@@ -3002,19 +3302,6 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--timescale=") => {
                 module_timescale_args.push(arg["--timescale=".len()..].to_string());
             }
-            // commercial-simulator-compatible seed aliases (undocumented): lower onto `+seed=`.
-            "-svseed" | "-seed" => {
-                i += 1;
-                if i < args.len() {
-                    plusargs.push(format!("+seed={}", args[i]));
-                }
-            }
-            _ if arg.starts_with("-svseed=") => {
-                plusargs.push(format!("+seed={}", &arg["-svseed=".len()..]));
-            }
-            _ if arg.starts_with("-seed=") => {
-                plusargs.push(format!("+seed={}", &arg["-seed=".len()..]));
-            }
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
@@ -3180,6 +3467,18 @@ fn run_main() -> i32 {
         }
     }
 
+    // `--wave-suppress-file` given inside an args file: the same list, the same
+    // rules, just read relative to the args file that named it.
+    for f in std::mem::take(&mut compat.wave_suppress_files) {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => wave_suppress.extend(cli_files::parse_scope_file(&text)),
+            Err(e) => {
+                eprintln!("Error: cannot read -wave_suppress_file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // `-uvm`: add the UVM library that `XEZIM_UVM_DIR` names (its `src`
     // include directory and `uvm_pkg.sv`; src/uvm_dir.rs). Before
     // `--dump-files-list`, so the list shows what was added.
@@ -3203,6 +3502,21 @@ fn run_main() -> i32 {
         _ => {}
     }
 
+    // C/C++ DPI sources, object files, archives and shared libraries named
+    // among the design files, on the command line or in a `-f` list, are not
+    // HDL: they are built into (or are) DPI libraries and loaded as
+    // `--dpi-lib` is (src/dpi_sources.rs).
+    let foreign = xezim::dpi_sources::ForeignInputs::take_from(&mut source_files);
+    // A compiled artifact holds the elaborated design only, as it holds no
+    // `--dpi-lib` library: the run that loads it must name the files again.
+    if mode == Mode::Compile && _output_file.is_some() && !foreign.is_empty() {
+        eprintln!(
+            "[xezim][warning] the compiled artifact does not include the DPI C/C++ file(s) {}; \
+             name them again when running it",
+            foreign.files().collect::<Vec<_>>().join(", ")
+        );
+    }
+
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so
     // the list still appears when a file is missing or fails to parse — that
@@ -3217,6 +3531,12 @@ fn run_main() -> i32 {
                 sf,
                 if exists { "" } else { "   [NOT FOUND]" }
             );
+        }
+        if !foreign.is_empty() {
+            println!("--- DPI C/C++ file(s): {} ---", foreign.files().count());
+            for f in foreign.files() {
+                println!("  {}", f);
+            }
         }
         if !lib_files.is_empty() {
             println!("--- -v library file(s): {} ---", lib_files.len());
@@ -3333,6 +3653,37 @@ suppressed but the explicit SDF annotation still applies."
         print_simulation_banner();
     }
 
+    // The DPI C/C++ sources: compiled and linked into one cached library,
+    // loaded after the `--dpi-lib` libraries, with the shared libraries
+    // named among the files. Only a simulation loads DPI code.
+    if mode == Mode::Simulate && !foreign.is_empty() {
+        let built = if foreign.needs_build() {
+            xezim::dpi_sources::default_cache_dir().and_then(|cache| {
+                xezim::dpi_sources::build_library(
+                    &foreign,
+                    &compat.dpi_cflags,
+                    &compat.dpi_ldflags,
+                    &cache,
+                )
+            })
+        } else {
+            Ok(None)
+        };
+        match built {
+            Ok(lib) => dpi_libs.extend(lib.map(|p| p.to_string_lossy().into_owned())),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        dpi_libs.extend(
+            foreign
+                .shared_libraries
+                .iter()
+                .map(|p| xezim::dpi_sources::loadable_path(p)),
+        );
+    }
+
     if design_cache_enabled && mode == Mode::Simulate {
         let directory = design_cache_dir
             .clone()
@@ -3410,6 +3761,9 @@ suppressed but the explicit SDF annotation still applies."
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
                         xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
+                        // The exclusion list applies to a compiled artifact's
+                        // dumps as well.
+                        xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
                         let mut sim = xezim::compiler::Simulator::new(elab, max_time);
                         if let Some(limit) = settle_limit {
                             sim.settle_limit = limit;
@@ -3425,7 +3779,11 @@ suppressed but the explicit SDF annotation still applies."
                         // Pass the full CLI invocation (binary name +
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
-                        sim.set_args(&args);
+                        sim.set_args(&cli_files::runtime_argv(
+                            &args,
+                            &plusargs,
+                            &direct_plusarg_positions,
+                        ));
                         let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {
@@ -3696,6 +4054,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
@@ -3750,6 +4109,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
+            drop(parser);
             report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
@@ -3788,6 +4148,10 @@ suppressed but the explicit SDF annotation still applies."
                 *t = rewritten;
             }
         }
+        // A saved image can be loaded later with a VPI or DPI library (§38.34).
+        xezim_core::elaborate::set_vpi_net_drivers(
+            _output_file.is_some() || !vpi_libs.is_empty() || !dpi_libs.is_empty(),
+        );
         match xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module.as_deref(),
@@ -3906,6 +4270,12 @@ suppressed but the explicit SDF annotation still applies."
             && std::env::var("XEZIM_KEEP_PORTS").ok().as_deref() != Some("1"),
     );
 
+    // `--wave-suppress[-file|-module]`: the waveform EXCLUDE list. It reaches
+    // the dump setup the same way the include lists do, and the same list is
+    // consulted by the VCD, FST and XTrace writers, so one design cannot get
+    // three different answers.
+    xezim::compiler::simulator::set_wave_suppress(&wave_suppress);
+
     match xezim::simulate_multi(
         &sources,
         max_time,
@@ -3980,11 +4350,17 @@ suppressed but the explicit SDF annotation still applies."
 }
 
 /// §20.10: translate end-of-run severity state into a process exit status.
-/// `$fatal` must never exit 0 — its finish_number is a diagnostics level, not
+/// A run that a signal stopped exits 128 + the signal number. `$fatal` must
+/// never exit 0 — its finish_number is a diagnostics level, not
 /// a success code, so any `$fatal` fails the run. `$error` only fails when the
 /// user opts in with `--error-exit` (matching the "promote errors" switch other
 /// simulators provide), so existing flows that tolerate errors keep working.
 fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool) -> i32 {
+    // A run that SIGINT or SIGTERM stopped exits 128 + the signal (130,
+    // 143), after the dumps are finalized: it did not run to its end.
+    if let Some(code) = xezim::compiler::interrupted_exit_status() {
+        return code;
+    }
     if sim.saw_fatal {
         return 1;
     }
@@ -4034,5 +4410,18 @@ fn report_fatal_error(e: &str) {
         eprintln!("{}", e);
     } else {
         eprintln!("Simulation error: {}", e);
+    }
+}
+
+#[test]
+fn integer_femtosecond_limits_round_exactly() {
+    for (input, expected) in [
+        ("9007199255499999fs", 9_007_199_255),
+        ("9007199255500000fs", 9_007_199_256),
+        ("9007199256500001FS", 9_007_199_257),
+        ("18446744073709551614000000fs", u64::MAX - 1),
+        ("18446744073709551615000000fs", u64::MAX),
+    ] {
+        assert_eq!(parse_max_time(input).unwrap(), expected, "{input}");
     }
 }

@@ -42,7 +42,7 @@ impl Simulator {
     /// §8.25: retain a value-parameter pattern in an object's specialization
     /// signature, including literal sizes, signs, keys and replication.
     pub(super) fn class_array_arg_fragment(&self, expr: &Expression) -> Option<String> {
-        match &expr.kind {
+        match &expr.peel_typed_pattern().kind {
             ExprKind::AssignmentPattern(items) => {
                 let parts: Option<Vec<String>> = items
                     .iter()
@@ -364,12 +364,12 @@ impl Simulator {
                     .find(|(n, ..)| n == leaf)
                     .map(|&(_, l, h, w)| (l, h, w))
             })?;
-        let mut params = self.module.parameters.clone();
+        let mut param_overrides: HashMap<String, Value> = HashMap::default();
         for (name, _) in &cd.param_defaults {
             if !cd.array_properties.contains_key(name)
                 && let Some(v) = self.resolve_value_param_in_current(name)
             {
-                params.insert(name.clone(), v);
+                param_overrides.insert(name.clone(), v);
             }
         }
         let mut descending = cd
@@ -403,10 +403,17 @@ impl Simulator {
                     if let DataType::TypeReference { name, .. } = dt.as_ref() {
                         let scoped = name.qualified();
                         let value = if name.has_scope() {
-                            params.get(&scoped).cloned()
+                            param_overrides
+                                .get(&scoped)
+                                .or_else(|| self.module.parameters.get(&scoped))
+                                .cloned()
                         } else {
-                            self.resolve_value_param_in_current(&name.name.name)
-                                .or_else(|| params.get(&name.name.name).cloned())
+                            self.resolve_value_param_in_current(&name.name.name).or_else(|| {
+                                param_overrides
+                                    .get(&name.name.name)
+                                    .or_else(|| self.module.parameters.get(&name.name.name))
+                                    .cloned()
+                            })
                         };
                         value
                             .filter(|v| !v.has_xz())
@@ -430,9 +437,13 @@ impl Simulator {
             .bind_type_params_in(&dt, &|n| self.resolve_type_param_binding(n))
             .unwrap_or(dt);
         let resolved = self.resolve_dt(&dt);
-        let width = super::elaborate::resolve_type_width(
+        let env = super::elaborate::ParamEnv::Overlay {
+            base: &self.module.parameters,
+            top: &param_overrides,
+        };
+        let width = super::elaborate::resolve_type_width_env(
             &resolved,
-            Some(&params),
+            Some(&env),
             Some(&self.module.typedefs),
         );
         Some(ClassArrayLayout {
@@ -536,7 +547,7 @@ impl Simulator {
         key: &str,
     ) -> Option<()> {
         let layout = self.class_array_layout(class, leaf)?;
-        let ExprKind::AssignmentPattern(items) = &init.kind else {
+        let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
             return None;
         };
         let count = usize::try_from(layout.hi.checked_sub(layout.lo)?.checked_add(1)?).ok()?;
@@ -626,7 +637,7 @@ impl Simulator {
         leaf: &str,
         init: &Expression,
     ) {
-        let ExprKind::AssignmentPattern(items) = &init.kind else {
+        let ExprKind::AssignmentPattern(items) = &init.peel_typed_pattern().kind else {
             return;
         };
         let signature = self.canonicalize_spec_sig(class, "");
@@ -650,29 +661,7 @@ impl Simulator {
         layout: &ClassArrayLayout,
     ) -> Vec<(i64, Value)> {
         let indices = layout.indices();
-        // §10.9.1: an explicit index wins over a type key, which wins over
-        // default. Reuse the common positional/key/default/replication binder.
-        let typed = items.iter().find_map(|item| match item {
-            AssignmentPatternItem::Typed(dt, value)
-                if self.pattern_type_matches(&layout.data_type, dt) =>
-            {
-                Some(value)
-            }
-            _ => None,
-        });
-        let mut adjusted;
-        let items = if let Some(value) = typed {
-            adjusted = items
-                .iter()
-                .filter(|item| !matches!(item, AssignmentPatternItem::Default(_)))
-                .cloned()
-                .collect::<Vec<_>>();
-            adjusted.push(AssignmentPatternItem::Default(value.clone()));
-            adjusted.as_slice()
-        } else {
-            items
-        };
-        let elements = self.pattern_elems(items, &indices);
+        let elements = self.pattern_elems_for_type(items, &indices, &layout.data_type);
         indices
             .into_iter()
             .zip(elements)

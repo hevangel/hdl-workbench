@@ -312,11 +312,13 @@ impl Simulator {
                             },
                         },
                         cold: Box::new(CombEntryCold {
+                            rhs_time_scope: None,
                             scope_hint: None,
                             read_signal_ids: read_ids,
                             write_signal_ids: write_ids,
                             span: inst.span,
                             cov: None,
+                            time0_effects: false,
                         }),
                         has_unresolved_reads: false,
                         defer_at_time0: false,
@@ -368,11 +370,13 @@ impl Simulator {
             entries.push(CombEntry {
                 item: CombItem::Udp { idx },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: read_ids,
                     write_signal_ids: write_ids,
                     span: inst.span,
                     cov: None,
+                    time0_effects: false,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
@@ -392,11 +396,13 @@ impl Simulator {
                     indices: indices.into_boxed_slice(),
                 },
                 cold: Box::new(CombEntryCold {
+                    rhs_time_scope: None,
                     scope_hint: None,
                     read_signal_ids: vec![event_ref.sig_id as usize],
                     write_signal_ids,
                     span: crate::ast::Span::dummy(),
                     cov: None,
+                    time0_effects: false,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
@@ -793,8 +799,8 @@ impl Simulator {
             let base_code = self
                 .delayed_updates
                 .iter()
-                .find(|(_, sid, _)| *sid == id)
-                .map(|(_, _, v)| v.get_bit_code(bit))
+                .find(|(_, sid, _, _)| *sid == id)
+                .map(|(_, _, v, _)| v.get_bit_code(bit))
                 .unwrap_or_else(|| self.signal_table[id].get_bit_code(bit));
             if base_code != new_code {
                 let mut sel = Value::new(1);

@@ -39,7 +39,27 @@ impl Simulator {
         if let Some(rc) = self.fn_decl_cache.get(name) {
             return Some(rc.clone());
         }
-        let fd = self.module.functions.get(name)?.clone();
+        let mut fd = self.module.functions.get(name)?.clone();
+        // §13.4/§23.6: only called declarations materialize a private body.
+        // This cache has one lexical name, so memoized widths and resolved
+        // signals can be enabled without contaminating shared elaboration ASTs.
+        fd.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_function_body(name, &fd) {
+                Some(mat) => mat.into_vec(),
+                None => fd.items.to_vec(),
+            };
+            if self.module.deferred_function_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
@@ -74,10 +94,61 @@ impl Simulator {
         if let Some(rc) = self.task_decl_cache.get(name) {
             return Some(rc.clone());
         }
-        let td = self.module.tasks.get(name)?.clone();
+        let mut td = self.module.tasks.get(name)?.clone();
+        td.items = crate::ast::cache::with_fresh_scope_caches(|| {
+            let mut items = match self.module.materialize_task_body(name, &td) {
+                Some(mat) => mat.into_vec(),
+                None => td.items.to_vec(),
+            };
+            if self.module.deferred_task_bodies.contains_key(name)
+                && !self.module.packages.is_empty()
+            {
+                let pkgs: std::collections::HashSet<String> =
+                    self.module.packages.iter().cloned().collect();
+                items = items
+                    .iter()
+                    .map(|s| super::elaborate::flatten_pkg_member_refs(s, &pkgs))
+                    .collect();
+            }
+            items.into()
+        });
         let rc = std::rc::Rc::new(td);
         self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
+    }
+
+    fn fast_uvm_oneway_hash(&mut self, args: &[Expression]) -> Option<Value> {
+        let str_val = self.eval_expr(args.first()?);
+        let s = str_val.to_string();
+        let mut seed = if let Some(arg) = args.get(1) {
+            self.eval_expr(arg).to_u64().unwrap_or(0) as u32
+        } else {
+            0
+        };
+        if seed == 0 {
+            seed = self
+                .get_signal_value_by_name("uvm_pkg::uvm_global_random_seed")
+                .or_else(|| self.get_signal_value_by_name("uvm_global_random_seed"))
+                .and_then(|v| v.to_u64())
+                .unwrap_or(0) as u32;
+        }
+        let mut crc1 = 0xffff_ffffu32;
+        for &b in s.as_bytes() {
+            if b == 0 {
+                break;
+            }
+            for bit in 0..8 {
+                let msb = (crc1 >> 31) != 0;
+                crc1 <<= 1;
+                if msb ^ (((b >> bit) & 1) != 0) {
+                    crc1 ^= 0x04c1_1db6;
+                    crc1 |= 1;
+                }
+            }
+        }
+        let swapped = crc1.swap_bytes();
+        let hash = seed.wrapping_add(!swapped);
+        Some(Value::from_u64(hash as u64, 32))
     }
 
     pub(super) fn exec_function_call(
@@ -85,6 +156,11 @@ impl Simulator {
         fd: &FunctionDeclaration,
         args: &[Expression],
     ) -> Value {
+        if fd.name.name.name == "uvm_oneway_hash" {
+            if let Some(val) = self.fast_uvm_oneway_hash(args) {
+                return val;
+            }
+        }
         // §6.21 / §13.4.2: a function's locals take ITS lifetime, not the
         // calling task's. A static function called from an automatic task
         // shares its locals across calls, so the caller's per-invocation
@@ -115,7 +191,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&fd.name.name.name, fd.span, false));
         let normalized = Self::normalize_call_args(&fd.ports, args);
         let supplied = normalized
             .as_ref()
@@ -216,10 +292,10 @@ impl Simulator {
         // a stale same-named formal from an earlier call can't leak).
         // Only a formal whose declared type can name an interface (`virtual
         // x_if v`, or a typedef that may resolve to one) can carry a vif;
-        // an `int`/`bit`/`string` formal never had a key to set or clear, so
-        // the per-port format + resolve + hash was pure overhead on every
-        // call of every function.
-        let vif_formals: Vec<(&str, Option<&Expression>)> = fd
+        // an `int`/`bit`/`string` formal has no actual to resolve, so the
+        // per-port format + resolve + hash was pure overhead on every call
+        // of every function.
+        let mut vif_formals: Vec<(&str, Option<&Expression>)> = fd
             .ports
             .iter()
             .enumerate()
@@ -231,6 +307,14 @@ impl Simulator {
                 )
             })
             .collect();
+        // §13.5, §25.9: the keys are flat by name, so a caller's formal or
+        // local of the same name may have left one. A plain formal, or a
+        // variable the body declares, is this call's own and names no
+        // interface: it enters with no actual, which clears the key for the
+        // call and puts it back on return.
+        if !self.vif_local_names.is_empty() {
+            self.vif_own_names(&fd.ports, &fd.items, &mut vif_formals);
+        }
         let vif_saved = if vif_formals.is_empty() {
             Vec::new()
         } else {
@@ -324,6 +408,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -336,32 +421,29 @@ impl Simulator {
             }
             // Unpacked ARRAY formal: functions never bound one, so the body read
             // X and a `ref` write never reached the caller (§13.5.2).
-            if let Some(actual) = actual {
-                let prior = self.module.arrays.contains_key(&port.name.name)
-                    || self.module.arrays_2d.contains_key(&port.name.name)
-                    || self.module.arrays_nd.contains_key(&port.name.name);
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
-                    // retains its element type, including packed geometry.
-                    self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
-                    if is_out {
-                        if !info.1.is_empty() {
-                            array_writebacks.push(info);
-                        }
-                    } else if !prior {
-                        // An INPUT array formal is dropped on return too: left
-                        // registered, a later call whose same-named formal
-                        // took the scalar path found it and behaved
-                        // differently (#327's "warming").
-                        array_inputs.push(info);
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                // §7.4.1 / §13.5 / §21.2.1.7: every unpacked formal
+                // retains its element type, including packed geometry.
+                self.register_formal_type_metadata(&port.name.name, &port.data_type, false);
+                if is_out {
+                    if !info.1.is_empty() {
+                        array_writebacks.push(info);
                     }
-                    continue;
+                } else {
+                    // An INPUT array formal is dropped on return too: left
+                    // registered, a later call whose same-named formal
+                    // took the scalar path found it and behaved
+                    // differently (#327's "warming").
+                    array_inputs.push(info);
                 }
+                continue;
             }
             // §13.5.3 (1800-2023): an omitted `output`/`inout` argument with a
             // default binds the default as its actual, so `output o = a`
@@ -383,9 +465,12 @@ impl Simulator {
                 // formal_seed` below only resizes the value that is handed it,
                 // which cannot restore a carry the self-determined width
                 // already dropped.
-                let value = match self.actual_context_width(port) {
-                    Some(w) => self.eval_expr_ctx(&args[i], w),
-                    None => self.eval_expr(&args[i]),
+                let value = match self.formal_pattern_value(port, &args[i]) {
+                    Some(v) => v,
+                    None => match self.free_actual_context_width(port) {
+                        Some(w) => self.eval_expr_ctx(&args[i], w),
+                        None => self.eval_expr(&args[i]),
+                    },
                 };
                 self.vif_argument_value(port, &args[i], value)
             } else if let Some(def) = &port.default {
@@ -394,8 +479,10 @@ impl Simulator {
                 // evaluated bare, `a` was unknown and the default was x.
                 self.in_subroutine_default_scope(None, None, |sim| {
                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                    sim.push_pending_formal_dyn(&formal_dyn);
                     let value = sim.eval_formal_default(port, def);
                     let value = sim.vif_argument_value(port, def, value);
+                    sim.pop_pending_formal_dyn();
                     sim.pop_local_frame();
                     value
                 })
@@ -500,9 +587,14 @@ impl Simulator {
         // `signed_signals`, so an unregistered signed return type (`function
         // integer f`) silently went unsigned and `f >>>= 3` shifted
         // logically (ivtest cfunc_assign_op_vec asr3).
+        // A typedef'd return type (`function lane_t f`) is signed through
+        // its definition (§6.18).
         let ret_signed = match &ret_tp {
             Some((_, c)) => self.concrete_type_signed(c).unwrap_or(false),
-            None => super::elaborate::is_type_signed(&fd.return_type),
+            None => super::elaborate::is_type_signed_resolved(
+                &fd.return_type,
+                &self.module.typedef_types,
+            ),
         };
         if ret_signed {
             self.signed_signals.insert(ret_name.clone());
@@ -513,7 +605,7 @@ impl Simulator {
         // initial value is the type default: x for a 4-state type, 0 for a
         // 2-state one. An empty `function integer y(); endfunction` returns
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
-        let mut ret_init = if super::elaborate::is_type_real(&fd.return_type) {
+        let mut ret_init = if self.dt_is_real(&fd.return_type) {
             Value::from_f64(0.0)
         } else if match &ret_tp {
             Some((_, c)) => self.concrete_type_two_state(c),
@@ -668,6 +760,8 @@ impl Simulator {
         // above, in the caller's context.
         self.this_stack.push(None);
         self.class_context_stack.push(None);
+        self.method_local_base
+            .push(self.local_stack.len().saturating_sub(1));
         // Track the running subroutine name so `%m` inside a package function
         // resolves to `<pkg>.<name>` (see the `%m` formatter). Popped after the
         // body; recursion keeps the stack ordered.
@@ -679,6 +773,12 @@ impl Simulator {
         // ordered.
         self.fn_ret_collection_stack
             .push(self.fn_returns_collection(&fd.return_type));
+        let ret_ctx = self
+            .scalar_formal_integral(&fd.return_type)
+            .map_or(0, |(w, _)| w);
+        self.fn_ret_ctx_stack.push(ret_ctx);
+        let frame = self.return_pattern_type(fd);
+        self.fn_ret_frames.push(frame);
         // §13.4.1: a function returning a queue, dynamic or associative
         // array (through a typedef) has a return VARIABLE of that type: the
         // body may fill it in place (`f.push_back(v)`, `f[k] = v`, `f = new[n]`,
@@ -702,6 +802,7 @@ impl Simulator {
                     data_type: fd.return_type.clone(),
                     lifetime: None,
                     declarators: vec![crate::ast::stmt::VarDeclarator {
+                        decl: crate::ast::binding::Bound::UNSET,
                         name: fd.name.name.clone(),
                         dimensions: Vec::new(),
                         init: None,
@@ -770,12 +871,14 @@ impl Simulator {
             if self.module.dynamic_arrays.contains(&n) || self.is_associative_array(&n) {
                 if ret_is_assoc {
                     self.snapshot_ret_assoc(&n);
-                } else if self.queue_elem_struct(&n).is_none() {
+                } else if let Some(su) = self.queue_elem_struct(&n) {
+                    let len = self.get_queue_size(&n) as i64;
+                    let idx: Vec<i64> = (0..len).collect();
+                    self.snapshot_ret_structs(&n, &idx, &su);
+                } else {
                     const RET_SNAP: &str = "__xz_ret_coll__";
                     self.copy_whole_queue(RET_SNAP, &n);
                     self.pending_ret_collection = Some(RET_SNAP.to_string());
-                } else {
-                    self.pending_ret_collection = Some(n);
                 }
                 self.return_value = Some(Value::zero(32));
             } else if self.snapshot_ret_fixed(&n) {
@@ -804,10 +907,13 @@ impl Simulator {
         self.func_call_stack.pop();
         self.fn_ret_collection_stack.pop();
         self.fn_ret_assoc_stack.pop();
+        self.fn_ret_ctx_stack.pop();
+        self.fn_ret_frames.pop();
         self.pkg_scope_stack.pop();
         self.m_scope_stack = saved_m_scope_fn;
         self.this_stack.pop();
         self.class_context_stack.pop();
+        self.method_local_base.pop();
         let mut result = if let Some(rv) = self.return_value.take() {
             rv
         } else if let Some(su) = self.unpacked_struct_of(&fd.return_type) {
@@ -859,10 +965,12 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            if w > 0 && w != result.width {
-                result = result.resize(w);
+            if w > 0 && (w != result.width || result.is_fill) {
+                result = result.resize_for_assign(w);
             }
-            result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+            // §13.4.1, §6.18: the result has the return type's sign, through
+            // a typedef too.
+            result.is_signed = ret_signed;
             result = Self::ret_two_state(result, ret_conv);
         }
         // Assoc / fixed-array formals copy element-wise, but the copy is
@@ -871,6 +979,7 @@ impl Simulator {
         // actual would otherwise let the restore wipe the output writeback.
         let assoc_params = std::mem::take(&mut assoc_params);
         let array_writebacks = std::mem::take(&mut array_writebacks);
+        let staged_arrays = self.stage_array_writebacks(&array_writebacks);
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
         // applied — see `stage_queue_param`.
@@ -967,7 +1076,8 @@ impl Simulator {
             }
             self.purge_assoc_param(&param, prior);
         }
-        self.writeback_array_args(&array_writebacks);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         self.purge_array_formals(&array_writebacks);
         self.purge_array_formals(&array_inputs);
         for (tmp, caller) in staged_wb {
@@ -980,6 +1090,29 @@ impl Simulator {
         result
     }
 
+    /// §26.3: the scope a bare-named subroutine body runs in: the package a
+    /// design unit imports it from, else the package whose qualified entry is
+    /// this very body, so one reached only from another package's code still
+    /// runs in its own package.
+    pub(super) fn subroutine_decl_scope(
+        &self,
+        name: &str,
+        span: crate::ast::Span,
+        task: bool,
+    ) -> Option<String> {
+        if let Some(scope) = self.module.func_decl_scope.get(name) {
+            return Some(scope.clone());
+        }
+        let pkg = self.module.pkg_subr_owner.get(name)?;
+        let key = format!("{pkg}::{name}");
+        let declared = if task {
+            self.module.tasks.get(&key).map(|t| t.span)
+        } else {
+            self.module.functions.get(&key).map(|f| f.span)
+        };
+        (declared == Some(span)).then(|| pkg.clone())
+    }
+
     /// Execute a module-level task call with arguments.
     pub(super) fn exec_task_call(&mut self, td: &TaskDeclaration, args: &[Expression]) {
         // §26.3: the package this body belongs to — see `exec_function_call`.
@@ -988,7 +1121,7 @@ impl Simulator {
         let pkg_scope = self
             .pending_pkg_scope
             .take()
-            .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
+            .or_else(|| self.subroutine_decl_scope(&td.name.name.name, td.span, true));
         let mut cleanup = self.bind_task_frame(td, args, None);
         self.enter_free_task_scope(td, &mut cleanup);
         self.open_decl_shadow_frame();
@@ -1051,6 +1184,8 @@ impl Simulator {
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
     pub(super) fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
+        // §13.5.2: the aliased leaves of a `ref` struct formal.
+        self.ref_frame_flush();
         // §13.5.3: a default may name an earlier formal; update it before
         // capturing supplied outputs or popping the declaration's scope.
         self.apply_default_formal_outputs(&c.default_output_bindings);
@@ -1102,7 +1237,9 @@ impl Simulator {
             })
             .collect();
         self.ref_binding_stack.pop();
-        self.ref_alias_stack.pop();
+        if let Some(frame) = self.ref_alias_stack.pop() {
+            self.ref_pins_release(&frame);
+        }
         self.ref_identity_stack.pop();
         self.refresh_ref_redirect_hot();
         self.local_iface_aliases.pop();
@@ -1151,22 +1288,17 @@ impl Simulator {
         // caller's actual, the restore (`pop_and_restore_queue_frame`) wipes
         // the caller's bare-name elements — destroying an output/inout/ref
         // writeback done now. Mirror the function path (and the queue staging
-        // above). An assoc formal's per-call key is torn down by the restore,
-        // so its element data is staged onto a temp key; fixed-array formals
-        // keep bare keys that survive.
+        // above). An assoc or fixed-array formal's per-call key is torn down
+        // by the restore, so its element data is staged onto a temp key.
         let assoc_params = std::mem::take(&mut c.assoc_params);
         let wb = c.array_writebacks.clone();
+        let staged_arrays = self.stage_array_writebacks(&wb);
         let array_params = std::mem::take(&mut c.array_params);
         let assoc_wb = self.stage_assoc_writebacks(
             assoc_params
                 .iter()
                 .map(|(p, c, out)| (p.as_str(), c.as_str(), *out)),
         );
-        let identity_params: std::collections::HashSet<&String> = wb
-            .iter()
-            .filter(|(p, c2, ..)| p == c2)
-            .map(|(p, ..)| p)
-            .collect();
         self.break_flag = c.saved_break || self.dpi_unwinding;
         self.return_flag = c.saved_return || self.dpi_unwinding;
         self.pop_and_restore_queue_frame();
@@ -1192,13 +1324,9 @@ impl Simulator {
                 self.module.assoc_defaults.remove(&param_name);
             }
         }
-        self.writeback_array_args(&wb);
+        self.writeback_array_args(&staged_arrays);
+        self.purge_array_formals(&staged_arrays);
         for param_name in &array_params {
-            // Identity-bound formals share the caller's storage — see the
-            // function-path twin above (audit46 a10).
-            if identity_params.contains(param_name) {
-                continue;
-            }
             let prefix = format!("{}[", param_name);
             let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
             for k in keys {
@@ -1213,6 +1341,9 @@ impl Simulator {
         for saved in c.formal_metadata.into_iter().rev() {
             self.restore_formal_metadata(saved);
         }
+        // The caller's own aliased copies: another process may have written
+        // their actuals while the callee was parked.
+        self.ref_frame_refresh();
     }
 
     /// Register the structural metadata a task/function FORMAL needs so that
@@ -1288,23 +1419,41 @@ impl Simulator {
     /// Is `func` a call of a module/package function whose return type is
     /// a queue, dynamic or associative array typedef?
     pub(super) fn call_returns_collection(&self, func: &Expression) -> bool {
+        self.call_ret_coll_dims(func).is_some()
+    }
+
+    /// The unpacked dimensions of the collection `func` returns
+    /// ([`Self::fn_ret_coll_dims`]), `None` when it returns none.
+    pub(super) fn call_ret_coll_dims(
+        &self,
+        func: &Expression,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
         // §13.4: a METHOD returning a collection (`o.build().size()`,
         // `B::make().size()`): the receiver's class, or the scope class of a
         // static call, declares it. Only module functions were recognized,
         // so the collection method ran on nothing and answered 0.
-        let (recv, mname): (Option<Expression>, &str) = match &func.kind {
+        let (recv, mname): (Option<std::borrow::Cow<'_, Expression>>, &str) = match &func.kind {
             ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mname = h.path[h.path.len() - 1].name.name.as_str();
+                // §26.3: `pkg::f()` names the package's function.
+                if h.path.len() == 2 && self.module.packages.contains(&h.path[0].name.name) {
+                    return self.pkg_function_ret_coll_dims(&h.path[0].name.name, mname);
+                }
                 let mut r = h.clone();
                 r.path.pop();
-                r.cached_signal_id = std::cell::Cell::new(None);
+                r.cached_signal_id = crate::ast::cache::SignalCache::new(None);
                 (
-                    Some(Expression::new(ExprKind::Ident(r), func.span)),
-                    h.path[h.path.len() - 1].name.name.as_str(),
+                    Some(std::borrow::Cow::Owned(Expression::new(
+                        ExprKind::Ident(r),
+                        func.span,
+                    ))),
+                    mname,
                 )
             }
-            ExprKind::MemberAccess { expr, member } => {
-                (Some((**expr).clone()), member.name.as_str())
-            }
+            ExprKind::MemberAccess { expr, member } => (
+                Some(std::borrow::Cow::Borrowed(&**expr)),
+                member.name.as_str(),
+            ),
             _ => (None, ""),
         };
         if let Some(recv) = recv {
@@ -1315,31 +1464,78 @@ impl Simulator {
                 {
                     Some(rh.path[0].name.name.clone())
                 }
+                ExprKind::Ident(rh)
+                    if rh.path.len() == 1
+                        && self.module.packages.contains(&rh.path[0].name.name) =>
+                {
+                    return self.pkg_function_ret_coll_dims(&rh.path[0].name.name, mname);
+                }
+                // §8.11: `this.f()` is a method of the executing class.
+                ExprKind::This => self.class_context_stack.last().cloned().flatten(),
                 _ => self.get_expr_type_name(&recv),
             };
-            let mut cur = class;
-            while let Some(cn) = cur {
-                let Some(cd) = self.module.classes.get(&cn) else {
-                    break;
-                };
-                if let Some(m) = cd.methods.get(mname) {
-                    return matches!(&m.kind, crate::ast::decl::ClassMethodKind::Function(f)
-                        if self.fn_ret_coll_dims(&f.return_type).is_some());
-                }
-                cur = cd.extends.clone();
-            }
-            return false;
+            return class.and_then(|cn| self.class_method_ret_coll_dims(&cn, mname)?);
         }
         let ExprKind::Ident(h) = &func.kind else {
-            return false;
+            return None;
         };
-        let Some(seg) = h.path.last() else {
-            return false;
-        };
+        let seg = h.path.last()?;
+        // §8.20, §23.9: a bare call inside a class method binds to the class
+        // chain before a module function of the same name.
+        if let Some(cls) = self.class_context_stack.last().and_then(|c| c.as_deref())
+            && let Some(found) = self.class_method_ret_coll_dims(cls, &seg.name.name)
+        {
+            return found;
+        }
+        let fd = self.module.functions.get(&seg.name.name)?;
+        self.fn_ret_coll_dims(&fd.return_type)
+    }
+
+    /// The collection dimensions of what the method `name` that `cls`'s
+    /// chain declares first returns (its prototype's return type: an
+    /// `extern` or `pure virtual` declaration counts); `None` when no class
+    /// in the chain declares it.
+    #[allow(clippy::type_complexity)]
+    fn class_method_ret_coll_dims(
+        &self,
+        cls: &str,
+        name: &str,
+    ) -> Option<Option<Vec<crate::ast::types::UnpackedDimension>>> {
+        use crate::ast::decl::ClassMethodKind as Kind;
+        let mut cur = self.module.classes.get(cls);
+        // The extends chain is acyclic; the bound guards a malformed one.
+        for _ in 0..=self.module.classes.len() {
+            let cd = cur?;
+            if let Some(m) = cd.methods.get(name) {
+                return Some(match &m.kind {
+                    Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => {
+                        self.fn_ret_coll_dims(&f.return_type)
+                    }
+                    Kind::Task(_) => None,
+                });
+            }
+            cur = self.module.classes.get(cd.extends.as_deref()?);
+        }
+        None
+    }
+
+    /// The collection dimensions of what package `pkg`'s function `name`
+    /// returns.
+    fn pkg_function_ret_coll_dims(
+        &self,
+        pkg: &str,
+        name: &str,
+    ) -> Option<Vec<crate::ast::types::UnpackedDimension>> {
+        let key = format!("{pkg}::{name}");
         self.module
             .functions
-            .get(&seg.name.name)
-            .is_some_and(|fd| self.fn_ret_coll_dims(&fd.return_type).is_some())
+            .get(&key)
+            .or_else(|| {
+                self.module.functions.get(name).filter(|_| {
+                    self.module.pkg_subr_owner.get(name).map(|s| s.as_str()) == Some(pkg)
+                })
+            })
+            .and_then(|fd| self.fn_ret_coll_dims(&fd.return_type))
     }
 
     pub(super) fn fn_returns_collection(&self, dt: &DataType) -> bool {
@@ -1385,6 +1581,55 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// Whether the metadata registered under `name` makes member or element
+    /// selects of it resolve: a packed struct's field layout, or the
+    /// dimensions of a multidimensional packed array.
+    pub(super) fn formal_meta_has_selects(&self, name: &str) -> bool {
+        self.module.packed_struct_fields.contains_key(name)
+            || self.module.packed_signal_elem_widths.contains_key(name)
+            || self
+                .module
+                .packed_full_dims
+                .get(name)
+                .is_some_and(|d| d.len() > 1)
+    }
+
+    /// The running process is back in its task frames. The select metadata
+    /// of a formal is keyed by the formal's NAME in tables every process
+    /// shares, and a call restores the caller's entry when it returns: an
+    /// activation that parks finds, on resuming, whatever another process's
+    /// call (the same task's other activation, or a task with a formal of
+    /// that name) registered or restored meanwhile, so `s.a` of a packed
+    /// struct formal read nothing. Install this process's own again,
+    /// outermost frame first.
+    pub(super) fn reinstall_struct_formal_meta(&mut self) {
+        if self.ref_park_flags & super::ref_aliases::REF_PARK_META == 0
+            || !self
+                .task_cleanup
+                .iter()
+                .any(|c| !c.struct_formal_meta.is_empty())
+        {
+            return;
+        }
+        let frames = std::mem::take(&mut self.task_cleanup);
+        for c in &frames {
+            for (name, own) in &c.struct_formal_meta {
+                let same = self.module.packed_struct_fields.get(name) == own.packed_fields.as_ref()
+                    && self.module.packed_full_dims.get(name) == own.packed_dimensions.as_ref()
+                    && self.module.packed_signal_elem_widths.get(name).copied()
+                        == own
+                            .packed_element_widths
+                            .iter()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, w)| *w);
+                if !same {
+                    self.restore_formal_parts(name, own.clone());
+                }
+            }
+        }
+        self.task_cleanup = frames;
     }
 
     pub(super) fn snapshot_formal_metadata(&self, name: &str) -> FormalMetadataSnapshot {
@@ -1491,7 +1736,7 @@ impl Simulator {
                 .unwrap_or_default()
         };
         FormalMetaParts {
-            declared_type: self.module.var_decl_types.get(name).cloned(),
+            declared_type: self.module.var_decl_types.get_shared(name).cloned(),
             packed_fields: self.module.packed_struct_fields.get(name).cloned(),
             packed_element_widths,
             packed_dimensions: self.module.packed_full_dims.get(name).cloned(),
@@ -1540,6 +1785,7 @@ impl Simulator {
                 epoch: self.nested_run_epoch,
                 saves: Vec::new(),
                 fresh_strings: Vec::new(),
+                fresh_names: Vec::new(),
             });
         }
     }
@@ -1568,6 +1814,13 @@ impl Simulator {
                     && !top.fresh_strings.iter().any(|n| n == name)
                 {
                     top.fresh_strings.push(name.to_string());
+                }
+                // What the declaration registers under the bare name goes when
+                // the activation ends (`drop_fresh_local_geometry`).
+                if let Some(top) = self.decl_shadow_log.last_mut()
+                    && !top.fresh_names.iter().any(|n| n == name)
+                {
+                    top.fresh_names.push(name.to_string());
                 }
                 return;
             }
@@ -1709,7 +1962,56 @@ impl Simulator {
         for n in &frame.fresh_strings {
             self.string_signals.remove(n);
         }
+        for n in &frame.fresh_names {
+            self.drop_fresh_local_geometry(n);
+        }
         self.restore_decl_shadows(frame.saves);
+    }
+
+    /// §23.9/#916: a FRESH local (no earlier metadata under its name) of a
+    /// non-plain type — a packed-of-packed `u8_t [0:7] v`, a vector with an
+    /// offset range, a struct, a typedef — registered its geometry under the
+    /// bare name; nothing was saved for it, so nothing put it back when the
+    /// activation ended. Another subroutine's plain local `v` running
+    /// compiled (its declaration never reaches the interpreter) then read the
+    /// stale geometry on a fallback statement: `v[col*8 +: 8] = …` on a
+    /// `logic [63:0] v` landed as a one-byte element write. The name's
+    /// metadata goes back to absent, as before the call. A plain name whose
+    /// declaration registered nothing but its width keeps the cheap path.
+    fn drop_fresh_local_geometry(&mut self, name: &str) {
+        let m = &self.module;
+        let non_plain = m
+            .var_decl_types
+            .get(name)
+            .is_some_and(|dt| !Self::decl_type_is_plain(dt));
+        if !non_plain
+            && !m.packed_full_dims.contains_key(name)
+            && !m.packed_signal_elem_widths.contains_key(name)
+            && !m.packed_struct_fields.contains_key(name)
+        {
+            return;
+        }
+        drop(self.take_formal_metadata(name));
+        self.widths.remove(name);
+        self.signed_signals.remove(name);
+        self.real_signals.remove(name);
+        self.string_signals.remove(name);
+    }
+
+    /// A declared type whose registration is only its width and signedness:
+    /// an integer atom, a real, a string or class handle, or a vector with at
+    /// most one packed dimension (an offset range still registers
+    /// `packed_full_dims`, which the callers check separately). Anything else
+    /// (a typedef, a struct, an enum, a packed-of-packed vector) registers
+    /// geometry under the bare name.
+    pub(super) fn decl_type_is_plain(dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerAtom { .. } | DataType::Real { .. } | DataType::Simple { .. } => true,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.len() <= 1
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn restore_decl_shadows(&mut self, saves: Vec<DeclShadow>) {
@@ -1765,7 +2067,16 @@ impl Simulator {
                 }
             }
         }
-        put(&mut self.module.var_decl_types, name, saved.declared_type);
+        match saved.declared_type {
+            Some(ty) => {
+                self.module
+                    .var_decl_types
+                    .insert_shared(name.to_string(), ty);
+            }
+            None => {
+                self.module.var_decl_types.remove(name);
+            }
+        }
         put(
             &mut self.module.packed_struct_fields,
             name,
@@ -1799,6 +2110,34 @@ impl Simulator {
         );
         put(&mut self.var_class_types, name, saved.class_type);
         put(&mut self.var_typedef_types, name, saved.typedef_type);
+    }
+
+    /// §7.4.1/§13.5: a plain vector formal or return variable of a class
+    /// method binds without `register_formal_type_metadata`, so a range
+    /// other than `[w-1:0]` (`input logic [0:7] f`) was never recorded and
+    /// `f[0]` read and wrote bit 0, or another scope's range under the name
+    /// was used. Record the variable's own range, or drop that entry, behind
+    /// the method's metadata save (`meta_note`).
+    pub(super) fn note_plain_formal_range(&mut self, name: &str, dt: &DataType) {
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if dimensions.len() == 1 =>
+            {
+                super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            }
+            _ => None,
+        };
+        match dims {
+            Some(d) if self.module.packed_full_dims.get(name) != Some(&d) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.insert(name.to_string(), d);
+            }
+            None if self.module.packed_full_dims.contains_key(name) => {
+                self.meta_note(name);
+                self.module.packed_full_dims.remove(name);
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn register_formal_type_metadata(
@@ -1892,31 +2231,112 @@ impl Simulator {
         }
         if let DataType::Struct(su) = self.resolve_dt(dt) {
             for m in &su.members {
-                if let Some(ew) = super::elaborate::packed_inner_elem_width(
+                let (ew, fd) = super::elaborate::packed_member_meta(
                     &m.data_type,
                     &self.module.parameters,
                     &self.module.typedefs,
-                ) {
-                    for mdecl in &m.declarators {
-                        let key = format!("{}.{}", name, mdecl.name.name);
+                    &self.module.typedef_types,
+                );
+                for mdecl in &m.declarators {
+                    let key = format!("{}.{}", name, mdecl.name.name);
+                    if let Some(ew) = ew {
                         self.note_elem_width_key(&key);
-                        self.module.packed_signal_elem_widths.insert(key, ew);
+                        self.module
+                            .packed_signal_elem_widths
+                            .insert(key.clone(), ew);
+                    }
+                    // §7.4.1: every dimension, so `a.f0[i][j][k]` of a
+                    // typedef-element member selects an element at each index.
+                    if let Some(fd) = &fd {
+                        self.meta_note(&key);
+                        self.module.packed_full_dims.insert(key, fd.clone());
                     }
                 }
             }
         }
-        if let Some(fields) = super::elaborate::packed_struct_field_layout(
-            dt,
-            &self.module.parameters,
-            &self.module.typedefs,
-            &self.module.typedef_types,
-        ) {
+        if let Some(fields) = self.formal_struct_layout(dt) {
             if !fields.is_empty() {
                 self.module
                     .packed_struct_fields
                     .insert(name.to_string(), fields);
             }
         }
+    }
+
+    /// `packed_struct_field_layout` of a formal's type, memoized per named
+    /// type (see `formal_struct_layouts`).
+    fn formal_struct_layout(&mut self, dt: &DataType) -> Option<Vec<(String, u32, u32)>> {
+        let layout = |m: &ElaboratedModule| {
+            super::elaborate::packed_struct_field_layout(
+                dt,
+                &m.parameters,
+                &m.typedefs,
+                &m.typedef_types,
+            )
+            .or_else(|| Self::untagged_union_layout(m, dt))
+        };
+        let key = match dt {
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } if dimensions.is_empty()
+                && type_args.is_empty()
+                && name.scopes.iter().all(|s| s.type_args.is_empty()) =>
+            {
+                name.qualified()
+            }
+            _ => return layout(&self.module),
+        };
+        if let Some((built_gen, fields)) = self.formal_struct_layouts.get(&key) {
+            if *built_gen == self.type_tables_gen {
+                return fields.clone();
+            }
+        }
+        let fields = layout(&self.module);
+        self.formal_struct_layouts
+            .insert(key, (self.type_tables_gen, fields.clone()));
+        fields
+    }
+
+    /// §7.3: the member layout of an unpacked untagged union, which is one
+    /// piece of storage every member starts at bit 0 of (a variable of the
+    /// type is registered the same way at elaboration). None for any other
+    /// type.
+    fn untagged_union_layout(
+        m: &ElaboratedModule,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32)>> {
+        let DataType::Struct(su) = super::elaborate::resolve_typedef_chain(dt, &m.typedef_types)
+        else {
+            return None;
+        };
+        if su.packed || su.tagged || !matches!(su.kind, crate::ast::types::StructUnionKind::Union) {
+            return None;
+        }
+        let mut out = Vec::new();
+        for member in &su.members {
+            let w = super::elaborate::resolve_type_width(
+                &member.data_type,
+                Some(&m.parameters),
+                Some(&m.typedefs),
+            );
+            let subs = super::elaborate::packed_struct_field_layout(
+                &member.data_type,
+                &m.parameters,
+                &m.typedefs,
+                &m.typedef_types,
+            )
+            .unwrap_or_default();
+            for d in &member.declarators {
+                out.push((d.name.name.clone(), 0, w));
+                for (sn, so, sw) in &subs {
+                    out.push((format!("{}.{}", d.name.name, sn), *so, *sw));
+                }
+            }
+        }
+        Some(out)
     }
 
     fn apply_default_formal_outputs(&mut self, bindings: &[(String, Expression)]) {
@@ -1997,6 +2417,26 @@ impl Simulator {
                 && supplied
                     .as_ref()
                     .is_none_or(|mask| mask.get(i).copied().unwrap_or(false))
+        };
+        // §13.5.2: a `ref` actual that is a property of an object, or a
+        // hierarchical or member name, aliases storage only the CALLER's
+        // scope can resolve; freeze it before the callee's frame exists.
+        let scope_aliases: Vec<Option<String>> = if td
+            .ports
+            .iter()
+            .any(|p| matches!(p.direction, PortDirection::Ref))
+        {
+            td.ports
+                .iter()
+                .enumerate()
+                .map(|(i, port)| {
+                    (matches!(port.direction, PortDirection::Ref) && arg_supplied(i))
+                        .then(|| self.ref_scope_alias_target(port, &args[i]))
+                        .flatten()
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         // §8.25: a formal typed by one of the class's type parameters has
         // the type bound in the CALLEE's specialization. Resolve each under
@@ -2106,7 +2546,7 @@ impl Simulator {
                 }
             })
             .collect();
-        let saved_vif_formals: Vec<_> = td
+        let mut saved_vif_formals: Vec<_> = td
             .ports
             .iter()
             .enumerate()
@@ -2119,6 +2559,22 @@ impl Simulator {
                 (key, prior)
             })
             .collect();
+        // §13.5, §25.9: a plain formal, or a variable the body declares, is
+        // this call's own and names no interface; a caller's same-named
+        // formal or local may have left a key under its name (the keys are
+        // flat by name). Cleared for the call; the cleanup puts back what was
+        // saved above, and saves the body's variables here.
+        if !self.vif_local_names.is_empty() {
+            let mut own: Vec<(&str, Option<&Expression>)> = Vec::new();
+            self.vif_own_names(&td.ports, &td.items, &mut own);
+            for (name, _) in own {
+                let key = format!("__vif_local__{}", name);
+                let prior = self.signals.remove(&key);
+                if !td.ports.iter().any(|p| p.name.name == name) {
+                    saved_vif_formals.push((key, prior));
+                }
+            }
+        }
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
         // a stale same-named formal from an earlier call can't leak).
@@ -2140,8 +2596,8 @@ impl Simulator {
                     );
                 }
                 // No key was ever made under this name, so the removal
-                // would find nothing (the store generation still moves).
-                None if !self.vif_local_names.contains(&port.name.name) => bump_store_gen(),
+                // would find nothing and nothing is written.
+                None if !self.vif_local_names.contains(&port.name.name) => {}
                 None => {
                     self.signals
                         .remove(&format!("__vif_local__{}", port.name.name));
@@ -2155,6 +2611,7 @@ impl Simulator {
         let formal_dyn = self.begin_formal_dyn();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
+        let mut leaf_aliases: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
             // A type-parameter formal's bound type: a typedef (an unpacked
             // struct binds member-wise below) or a class.
@@ -2220,23 +2677,26 @@ impl Simulator {
             }
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
-            if let Some(actual) = actual {
-                if let Some(info) = self.bind_array_arg(port, actual) {
-                    // Keep fixed-array formals visible to class-scope lookup (§13.5).
-                    locals.insert(
-                        format!("\u{1}array_formal:{}", port.name.name),
-                        Value::zero(1),
-                    );
-                    if matches!(
-                        port.direction,
-                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                    ) && !info.1.is_empty()
-                    {
-                        array_writebacks.push(info.clone());
-                    }
-                    array_params.push(info.0);
-                    continue;
+            if let Some(actual) = actual
+                && let Some(info) = self.bind_array_arg(port, actual)
+            {
+                // Keep fixed-array formals visible to class-scope lookup (§13.5).
+                locals.insert(
+                    format!("\u{1}array_formal:{}", port.name.name),
+                    Value::zero(1),
+                );
+                if matches!(
+                    port.direction,
+                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                ) && !info.1.is_empty()
+                {
+                    array_writebacks.push(info.clone());
                 }
+                // A `ref` alias names the caller's own storage.
+                if !(matches!(port.direction, PortDirection::Ref) && info.1.is_empty()) {
+                    array_params.push(info.0);
+                }
+                continue;
             }
             // §7.10 / §13.5.2: a QUEUE or DYNAMIC-ARRAY formal. Only functions
             // bound one; a task bound nothing, so the body operated on storage
@@ -2270,6 +2730,7 @@ impl Simulator {
                 if let Some((store, caller)) = self.bind_queue_param(
                     &port.name.name,
                     &eff_dims,
+                    port.dimensions.is_empty(),
                     actual,
                     &port.data_type,
                     port.direction,
@@ -2297,6 +2758,16 @@ impl Simulator {
                     actual,
                     &mut locals,
                 ) {
+                    // §13.5.2: each leaf of a `ref` struct formal is aliased
+                    // to the member of the actual it copies, where that
+                    // member is storage the callee can name.
+                    if matches!(port.direction, PortDirection::Ref) && arg_supplied(i) {
+                        for (key, caller_leaf) in &backs {
+                            if let Some(storage) = self.ref_leaf_alias_target(caller_leaf) {
+                                leaf_aliases.push((key.clone(), storage));
+                            }
+                        }
+                    }
                     output_bindings.extend(backs);
                     queue_writebacks.append(&mut self.pending_struct_coll_wb);
                     continue;
@@ -2321,8 +2792,10 @@ impl Simulator {
                                 default_spec.clone(),
                                 |sim| {
                                     sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                    sim.push_pending_formal_dyn(&formal_dyn);
                                     let value = sim.eval_expr(default);
                                     let value = sim.vif_argument_value(port, default, value);
+                                    sim.pop_pending_formal_dyn();
                                     sim.pop_local_frame();
                                     value
                                 },
@@ -2377,7 +2850,9 @@ impl Simulator {
                         continue;
                     }
                     let val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        let value = scope_aliases.get(i).and_then(Option::as_deref)
+                            .and_then(|key| self.ref_alias_peek(key))
+                            .unwrap_or_else(|| self.eval_expr(&args[i]));
                         self.vif_argument_value(port, &args[i], value)
                     } else {
                         Value::zero(32)
@@ -2389,7 +2864,23 @@ impl Simulator {
                 }
                 _ => {
                     let mut val = if arg_supplied(i) {
-                        let value = self.eval_expr(&args[i]);
+                        // §13.5, §11.6.1: as a function's (`exec_function_call`),
+                        // a task's input actual is context-determined by its
+                        // formal; `t(x + y)` over 8-bit operands lost the carry.
+                        // A module- or package-scope task's formal sized by a
+                        // parameter (`input [W-1:0] v`) gives its width too.
+                        let width = if method_ctx.is_none() {
+                            self.free_actual_context_width(port)
+                        } else {
+                            self.actual_context_width(port)
+                        };
+                        let value = match self.formal_pattern_value(port, &args[i]) {
+                            Some(v) => v,
+                            None => match width {
+                                Some(w) => self.eval_expr_ctx(&args[i], w),
+                                None => self.eval_expr(&args[i]),
+                            },
+                        };
                         self.vif_argument_value(port, &args[i], value)
                     } else if let Some(def) = &port.default {
                         // Caller omitted this arg → apply the formal's default
@@ -2401,8 +2892,10 @@ impl Simulator {
                             default_spec.clone(),
                             |sim| {
                                 sim.push_local_frame_typed(locals.clone(), frame_types.clone());
+                                sim.push_pending_formal_dyn(&formal_dyn);
                                 let value = sim.eval_formal_default(port, def);
                                 let value = sim.vif_argument_value(port, def, value);
+                                sim.pop_pending_formal_dyn();
                                 sim.pop_local_frame();
                                 value
                             },
@@ -2453,6 +2946,22 @@ impl Simulator {
                 self.signals.remove(&key);
             }
         }
+        // The select metadata of this activation's formals (see
+        // `TaskCleanup::struct_formal_meta`).
+        let mut struct_formal_meta: Vec<(String, FormalMetaParts)> = Vec::new();
+        for port in td.ports.iter().filter(|p| p.dimensions.is_empty()) {
+            // A built-in scalar registers no layout.
+            if Self::type_is_plain_scalar(&port.data_type) {
+                continue;
+            }
+            let name = port.name.name.as_str();
+            if self.formal_meta_has_selects(name)
+                && !struct_formal_meta.iter().any(|(n, _)| n == name)
+            {
+                struct_formal_meta.push((name.to_string(), self.snapshot_formal_parts(name)));
+                self.ref_park_flags |= super::ref_aliases::REF_PARK_META;
+            }
+        }
         self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
@@ -2494,7 +3003,12 @@ impl Simulator {
         let mut alias_map: HashMap<String, String> = HashMap::default();
         for (i, port) in td.ports.iter().enumerate() {
             if matches!(port.direction, crate::ast::types::PortDirection::Ref) && arg_supplied(i) {
-                if let Some(frozen) = self.ref_alias_target(&args[i]) {
+                if let Some(frozen) = scope_aliases
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| self.ref_alias_target(&args[i]))
+                {
                     alias_map.insert(port.name.name.clone(), frozen);
                 }
                 // Chained identity binding: an actual that is itself the
@@ -2525,6 +3039,16 @@ impl Simulator {
                 ref_map.insert(port.name.name.clone(), actual);
             }
         }
+        if !leaf_aliases.is_empty()
+            && let Some(marker) = self.ref_leaf_frame_marker()
+        {
+            alias_map.extend(leaf_aliases);
+            alias_map.extend([marker]);
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_LEAVES;
+        }
+        if alias_map.values().any(|s| s.ends_with(']')) {
+            self.ref_park_flags |= super::ref_aliases::REF_PARK_ELEMS;
+        }
         // An aliased ref writes through during the call — a return copy-out
         // would CLOBBER writes other processes made to the actual while this
         // call was suspended (observed: an observer's write overwritten by
@@ -2543,6 +3067,7 @@ impl Simulator {
                 }
             }
         }
+        self.ref_pins_acquire(&alias_map);
         self.ref_alias_stack.push(alias_map);
         self.ref_identity_stack.push(identity_formals);
         self.refresh_ref_redirect_hot();
@@ -2615,6 +3140,7 @@ impl Simulator {
             pushed_method_this: false,
             saved_spec: None,
             formal_metadata,
+            struct_formal_meta,
             modclass: None,
         }
     }
@@ -2750,3 +3276,7 @@ impl Simulator {
         spec
     }
 }
+
+#[cfg(test)]
+#[path = "callable_runtime_body_tests.rs"]
+mod callable_runtime_body_tests;

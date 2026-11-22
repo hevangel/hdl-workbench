@@ -1,6 +1,24 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
+/// A.8.2: a parenthesized primary can be a method-call root, with optional
+/// call parentheses. The runtime regression `parenthesized_member_select_is_rejected`
+/// checks A.8.3's field-select restriction after receiver type resolution.
+#[test]
+fn parenthesized_method_roots_keep_optional_call_parentheses() {
+    let good =
+        parse("module top; initial $display((obj).get(), (obj).get, (text).len()); endmodule");
+    assert!(good.errors.is_empty(), "{:?}", good.errors);
+}
+
+/// §3.12.1: a class static call keeps its explicit compilation-unit root.
+#[test]
+fn unit_qualified_class_call_retains_its_scope() {
+    let result = parse("module top; initial $display($unit::C::get()); endmodule");
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(format!("{:?}", result.source).contains("$unit::C"));
+}
+
 /// §10.4.2 / §25.9: calls within an NBA target do not turn `<=` into a
 /// relational expression. A comparison inside an argument remains one.
 #[test]
@@ -193,6 +211,20 @@ fn test_scoped_typed_assignment_pattern() {
     );
 }
 
+/// §10.9: `T'{...}` and `pkg::T'{...}` keep their type as a `TypedPattern`
+/// wrapping the pattern.
+#[test]
+fn test_typed_assignment_pattern_keeps_type() {
+    let source =
+        "module m; initial begin p = s_t'{1, 0}; q = pkg::s_t'{a: 1, default: 0}; end endmodule";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let ast = format!("{:?}", result.source);
+    assert_eq!(ast.matches("TypedPattern").count(), 2, "{ast}");
+    assert!(ast.contains("name: \"s_t\""), "{ast}");
+    assert!(ast.contains("name: \"pkg\""), "{ast}");
+}
+
 #[test]
 fn test_associative_arrays() {
     let source = "module m; int aa [string]; int aa2 [*]; endmodule";
@@ -227,6 +259,43 @@ fn test_interfaces_modports() {
     ";
     let result = parse(source);
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+}
+
+// IEEE 1800-2023 §25.3 / §25.7: a method prototype ends before the signal item.
+#[test]
+fn test_modport_method_prototypes() {
+    let prefix = "interface bus_if; int value; task put(input int n); endtask function int get(input int a, input int b); return a+b; endfunction ";
+    for member in [
+        "import task put(input int n)",
+        "export task put(input int)",
+        "import function int get(input int a, input int b)",
+    ] {
+        let result = parse(&format!(
+            "{prefix} modport user({member}, input value); endinterface"
+        ));
+        assert!(result.errors.is_empty(), "{member}: {:?}", result.errors);
+    }
+    for member in [
+        "import task (input int n)",
+        "import task put(input int n int)",
+        "import task put(input int n) input value",
+        "import function :final int get()",
+    ] {
+        let result = parse(&format!("{prefix} modport user({member}); endinterface"));
+        assert!(!result.errors.is_empty(), "accepted {member}");
+    }
+    // An unclosed argument list must diagnose the semicolon, before trailing modules.
+    let source = format!(
+        "{prefix} modport user(import task put(input int n; endinterface {}",
+        "module m; endmodule ".repeat(1000)
+    );
+    let result = parse(&source);
+    assert!(!result.errors.is_empty());
+    assert!(
+        result.errors[0].span.start <= source.find("n; endinterface").unwrap() + 1,
+        "{:?}",
+        result.errors[0]
+    );
 }
 
 #[test]
@@ -333,7 +402,10 @@ fn bare_event_control_on_a_member() {
 fn module_class_var_keeps_virtual_interface_type_arg() {
     for (decl, arg) in [
         ("holder #(virtual bus_if) h;", "virtual bus_if"),
-        ("holder #(virtual interface bus_if) h;", "virtual interface bus_if"),
+        (
+            "holder #(virtual interface bus_if) h;",
+            "virtual interface bus_if",
+        ),
         ("holder #(virtual bus_if.mon) h;", "virtual bus_if . mon"),
         ("holder #(virtual bus_if #(4)) h;", "virtual bus_if#(4)"),
     ] {
@@ -645,6 +717,51 @@ fn bind_root_hierarchy_paths() {
         for path in &bind.extra_paths {
             assert_eq!(path[0].name.name, "$root");
         }
+    }
+}
+
+/// §23.11: a bind instantiation is a module, interface, program or checker
+/// instantiation, so it can list several instances; each is bound.
+#[test]
+fn bind_instance_list() {
+    for (directive, names) in [
+        ("bind t c #(3) a(), b();", &["a", "b"][..]),
+        ("bind t c a(), b[1:0](), d();", &["a", "b", "d"][..]),
+        ("bind m : t.u1, t.u2 c #(.A(1)) x(), y();", &["x", "y"][..]),
+    ] {
+        let result = parse(directive);
+        assert!(result.errors.is_empty(), "{directive}: {:?}", result.errors);
+        let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+            panic!("missing bind in {directive}");
+        };
+        let got: Vec<&str> = bind
+            .instantiation
+            .instances
+            .iter()
+            .map(|h| h.name.name.as_str())
+            .collect();
+        assert_eq!(got, names, "{directive}");
+    }
+    let result = parse("bind t c a(), b[1:0]();");
+    let Some(Description::Bind(bind)) = result.source.descriptions.first() else {
+        panic!("missing bind");
+    };
+    assert_eq!(bind.instantiation.instances[1].dimensions.len(), 1);
+}
+
+/// §23.11: a bind directive that cannot be read is reported, not dropped.
+#[test]
+fn unreadable_bind_directive_is_reported() {
+    for directive in [
+        "bind t c #(3) a() b();",
+        "module m; bind t c a(),; endmodule",
+    ] {
+        let result = parse(directive);
+        assert!(
+            result.errors.iter().any(|e| e.message.contains("bind")),
+            "{directive}: {:?}",
+            result.errors
+        );
     }
 }
 
@@ -1050,4 +1167,93 @@ fn net_declaration_strength_pairs_survive_parsing() {
         };
         assert_eq!(net.strength.as_deref(), Some(pair));
     }
+}
+
+/// aionhw/xezim-core#191: the reference census lives as long as the
+/// compilation sessions that fed it. An inner session ending leaves the names
+/// of the one still running; the last one releases them.
+#[test]
+fn reference_census_ends_with_its_last_session() {
+    let has = || {
+        crate::reference_census()
+            .dotted
+            .contains("zq_census_probe_191")
+    };
+    let outer = crate::census_session();
+    {
+        let _inner = crate::census_session();
+        let result = parse("module m; initial top.zq_census_probe_191 = 1; endmodule");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+    assert!(has(), "the outer session still needs the census");
+    drop(outer);
+    assert!(!has(), "the last session releases the census");
+}
+
+/// §23.2.2.3: a later ANSI port that omits its direction, port kind and data
+/// type takes all three from the previous port, as that port ended up. One
+/// that gives any of them takes only an omitted direction; an omitted kind
+/// follows the first-port rules and an omitted data type is `logic`
+/// (aionhw/xezim#1078). The LRM's examples `mh16`-`mh21` are among the cases.
+#[test]
+fn ansi_port_inherits_only_when_it_omits_direction_kind_and_type() {
+    use crate::ast::module::{AnsiPort, PortList};
+    use crate::ast::types::{DataType, NetType, PortDirection};
+    fn ports(header: &str) -> Vec<AnsiPort> {
+        let result = parse(&format!("module m{header}; endmodule"));
+        assert!(result.errors.is_empty(), "{header}: {:?}", result.errors);
+        let Some(Description::Module(m)) = result.source.descriptions.first() else {
+            panic!("{header}: no module");
+        };
+        let PortList::Ansi(ports) = &m.ports else {
+            panic!("{header}: not an ANSI list");
+        };
+        ports.clone()
+    }
+    let packed = |p: &AnsiPort| match &p.data_type {
+        Some(DataType::Implicit { dimensions, .. })
+        | Some(DataType::IntegerVector { dimensions, .. }) => dimensions.len(),
+        _ => 0,
+    };
+    // `clk` gives a direction, so it is a scalar `logic`; `rst_n` gives
+    // nothing and inherits that from `clk`, not the type of `d`.
+    let p = ports("(input logic [7:0] d, input clk, rst_n)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    assert_eq!(p[2].direction, Some(PortDirection::Input));
+    assert!(p[2].data_type.is_none(), "{:?}", p[2].data_type);
+    // mh0: a port kind alone opens an ANSI list; `y` takes `inout wire logic`.
+    let p = ports("(wire x, y)");
+    assert_eq!(p[1].net_type, Some(NetType::Wire));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh16: an implicit type opens one too, and `wire y` gives a kind, so it
+    // is `inout wire logic y`.
+    let p = ports("([5:0] x, wire y)");
+    assert_eq!(packed(&p[0]), 1);
+    assert_eq!(p[1].net_type, Some(NetType::Wire));
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh17: `input var integer x, wire y` -> `input wire logic y`.
+    let p = ports("(input var integer x, wire y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(!p[1].var_kw);
+    assert!(p[1].data_type.is_none(), "{:?}", p[1].data_type);
+    // mh19: `integer y` keeps the direction only.
+    let p = ports("(output signed [5:0] x, integer y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Output));
+    assert!(matches!(p[1].data_type, Some(DataType::IntegerAtom { .. })));
+    assert!(p[1].net_type.is_none());
+    // mh20: `y` gives nothing and takes `ref var logic [5:0]`.
+    let p = ports("(ref [5:0] x, y)");
+    assert_eq!(p[1].direction, Some(PortDirection::Ref));
+    assert_eq!(packed(&p[1]), 1);
+    // `var` and the net kind carry over with everything else.
+    let p = ports("(output var logic [3:0] a, b, input wand [1:0] c, e)");
+    assert!(p[1].var_kw);
+    assert_eq!(packed(&p[1]), 1);
+    assert_eq!(p[3].net_type, Some(NetType::Wand));
+    assert_eq!(packed(&p[3]), 1);
+    // A port that gives only a data type does not take the earlier kind.
+    let p = ports("(input wand [1:0] c, logic [2:0] f)");
+    assert_eq!(p[1].direction, Some(PortDirection::Input));
+    assert!(p[1].net_type.is_none());
 }

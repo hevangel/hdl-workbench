@@ -9,6 +9,12 @@ use super::*;
 /// Fewest allocations between two collections.
 const CLASS_GC_MIN_ALLOCS: usize = 20_000;
 
+/// Fewest name-keyed values (`signals`) added between two collections. The
+/// elements of an object's fixed array are stored there, one entry each, so a
+/// few objects can own most of the store: 16,384 objects with a 256-element
+/// array stay under `CLASS_GC_MIN_ALLOCS` while holding four million entries.
+const CLASS_GC_MIN_SIGNALS: usize = 100_000;
+
 /// `XEZIM_CLASS_GC=0` disables reclamation; `XEZIM_CLASS_GC=stress` collects
 /// at every time advance that allocated an object (for validating roots).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,35 +42,58 @@ impl Simulator {
             return;
         }
         let grown = self.heap.len().saturating_sub(self.class_gc_heap_len);
-        // A collection costs time and memory in proportion to every slot
-        // ever allocated, not to the live objects, so the next one waits for
-        // half again as many allocations: the slots grow geometrically
-        // between collections and the total cost stays linear. A fixed
-        // threshold made a long run with few live objects quadratic.
-        let threshold = match mode {
-            ClassGcMode::Stress => 1,
-            _ => CLASS_GC_MIN_ALLOCS
-                .max(self.class_gc_live)
-                .max(self.heap.len() / 2),
+        let grown_signals = self
+            .signals
+            .len()
+            .saturating_sub(self.class_gc_live_signals);
+        // A collection traces the previous survivors and the slots allocated
+        // since, not every slot ever allocated, so its cost follows the live
+        // objects plus the new ones and a fixed threshold stays linear over a
+        // long run.
+        let (threshold, signal_threshold) = match mode {
+            // Stress keeps to its definition: a time advance that allocated.
+            ClassGcMode::Stress => (1, usize::MAX),
+            _ => (
+                CLASS_GC_MIN_ALLOCS.max(self.class_gc_live),
+                CLASS_GC_MIN_SIGNALS.max(self.class_gc_live_signals),
+            ),
         };
         // A suspended DPI task keeps values on a foreign stack the trace
         // cannot see; wait until none is parked.
-        if grown < threshold || !self.dpi_tasks.is_empty() {
+        if (grown < threshold && grown_signals < signal_threshold) || !self.dpi_tasks.is_empty() {
             return;
         }
         self.class_gc_heap_len = self.heap.len();
-        let Ok(marked) = self.class_heap_reachability_probe() else {
+        // Both counts restart here, before the trace: one that fails (or a
+        // design whose store grows without any object) must wait for the next
+        // threshold like the allocation count does, not retry the root trace
+        // at every time advance.
+        self.class_gc_live_signals = self.signals.len();
+        let objects: Vec<usize> = self
+            .class_gc_survivors
+            .iter()
+            .copied()
+            .chain(self.class_gc_scan_from.max(1)..self.heap.len())
+            .filter(|&h| self.heap[h].is_some())
+            .collect();
+        // No object, nothing to release: skip the trace of every root.
+        if objects.is_empty() {
+            return;
+        }
+        let Ok(marked) = self.class_heap_mark(&objects) else {
             return;
         };
-        let dead: Vec<bool> = self
-            .heap
-            .iter()
-            .zip(&marked)
-            .enumerate()
-            .map(|(h, (object, &live))| h != 0 && object.is_some() && !live)
-            .collect();
-        let released = self.release_unreachable_class_storage(&dead);
-        self.class_gc_live = self.heap.iter().filter(|o| o.is_some()).count();
+        self.class_gc_scan_from = self.heap.len();
+        let (live, dead_list): (Vec<usize>, Vec<usize>) =
+            objects.into_iter().partition(|&h| marked.get(h));
+        let mut dead = super::heap_trace::SlotBits::new(self.heap.len());
+        for &h in &dead_list {
+            dead.set(h);
+        }
+        let released = self.release_class_storage(&dead, &dead_list);
+        self.class_gc_live = live.len();
+        self.class_gc_live_signals = self.signals.len();
+        self.class_gc_survivors = live;
         self.class_gc_released += released;
         self.class_gc_runs += 1;
     }
@@ -92,6 +121,7 @@ impl Simulator {
             clocking_snapshots,
             clocking_output_pending,
             clocking_cycle_pending,
+            clocking_edge_out_pending,
             clocking_preponed,
             clocking_hist,
             deferred_clocking_conts,
@@ -158,6 +188,7 @@ impl Simulator {
             forever_cont_cache,
             forever_sens_cache,
             blocking_cont_cache,
+            task_frame_eligibility,
             class_task_frame_cache,
             compiled_fast_calls,
             compiled_fast_static_calls,
@@ -187,10 +218,26 @@ impl Simulator {
             cg_instance_event_waiters,
             cg_type_options
         );
-        for (name, value) in self.signals.iter() {
+        // task_frame_eligibility retains every declaration used by this cache.
+        // Trace each immutable declaration once there, and only the frames
+        // here; visiting both maps whole repeats declaration bodies per site.
+        for (_, frame) in self.task_frame_cache.values() {
+            if let Some(frame) = frame {
+                trace.trace(frame)?;
+            }
+        }
+        for (name, value) in self.signals.map_entries() {
             // An object's own storage is an edge FROM that object, not a root.
             if Self::class_storage_owner(name).is_none() {
                 trace.trace(&(name, value))?;
+            }
+        }
+        for (name, first, values) in self.signals.elem_runs() {
+            if Self::class_storage_owner(name).is_none() {
+                trace.elem_keys(name, first, values.len());
+                for value in values {
+                    trace.trace(value)?;
+                }
             }
         }
         for entry in self.class_statics.iter() {
@@ -268,14 +315,28 @@ impl Simulator {
 }
 
 impl Simulator {
-    /// The objects reachable from the runtime roots, transitively: the
-    /// marking `maybe_collect_class_heap` sweeps by.
+    /// The objects reachable from the runtime roots, transitively, marked
+    /// over every allocated object rather than the previous survivors.
+    #[cfg(test)]
     pub(super) fn class_heap_reachability_probe(&self) -> Result<Vec<bool>, TraceError> {
+        let objects: Vec<usize> = (1..self.heap.len())
+            .filter(|&h| self.heap[h].is_some())
+            .collect();
+        let marked = self.class_heap_mark(&objects)?;
+        Ok((0..self.heap.len()).map(|h| marked.get(h)).collect())
+    }
+
+    /// Mark the live objects among `objects`, which must list every
+    /// allocated object (edges are traced from these only).
+    fn class_heap_mark(
+        &self,
+        objects: &[usize],
+    ) -> Result<super::heap_trace::SlotBits, TraceError> {
         let mut roots = self.trace_class_runtime_roots()?;
-        let mut edges = vec![Vec::new(); self.heap.len()];
+        let mut edges: HashMap<usize, Vec<usize>> = HashMap::default();
         let mut edge_trace = HandleTrace::new(self.heap.len());
-        for (handle, object) in self.heap.iter().enumerate() {
-            let Some(object) = object else {
+        for &handle in objects {
+            let Some(object) = self.heap.get(handle).and_then(Option::as_ref) else {
                 continue;
             };
             for (property, value) in object.properties.iter() {
@@ -291,28 +352,62 @@ impl Simulator {
                     }
                 }
             }
-            edges[handle].extend(edge_trace.drain_candidates());
+            let found = edge_trace.drain_candidates();
+            if !found.is_empty() {
+                edges.entry(handle).or_default().extend(found);
+            }
         }
-        for (name, value) in self.signals.iter().chain(self.class_assoc_defaults.iter()) {
-            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < edges.len()) {
+        for (name, value) in self
+            .signals
+            .map_entries()
+            .chain(self.class_assoc_defaults.iter())
+        {
+            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
                 edge_trace.trace(name)?;
                 let (_, property) = name.split_once('#').unwrap();
                 if !self.class_property_has_no_handles(owner, property) {
                     edge_trace.trace(value)?;
                 }
-                edges[owner].extend(edge_trace.drain_candidates());
+                let found = edge_trace.drain_candidates();
+                if !found.is_empty() {
+                    edges.entry(owner).or_default().extend(found);
+                }
             } else {
                 roots.trace(&(name, value))?;
             }
         }
-        let mut marked = vec![false; self.heap.len()];
+        // The elements `name[first]`, `name[first + 1]`, ... of a queue or
+        // dynamic array, traced as the keyed entries above are.
+        for (name, first, values) in self.signals.elem_runs() {
+            if let Some(owner) = Self::class_storage_owner(name).filter(|&h| h < self.heap.len()) {
+                edge_trace.elem_keys(name, first, values.len());
+                // `name[i]` names the same property as `name` does.
+                let (_, property) = name.split_once('#').unwrap();
+                if !self.class_property_has_no_handles(owner, property) {
+                    for value in values {
+                        edge_trace.trace(value)?;
+                    }
+                }
+                let found = edge_trace.drain_candidates();
+                if !found.is_empty() {
+                    edges.entry(owner).or_default().extend(found);
+                }
+            } else {
+                roots.elem_keys(name, first, values.len());
+                for value in values {
+                    roots.trace(value)?;
+                }
+            }
+        }
+        let mut marked = super::heap_trace::SlotBits::new(self.heap.len());
         let mut todo = roots.drain_candidates();
         while let Some(handle) = todo.pop() {
-            if marked[handle] || self.heap[handle].is_none() {
+            if self.heap.get(handle).is_none_or(Option::is_none) || !marked.set(handle) {
                 continue;
             }
-            marked[handle] = true;
-            todo.extend_from_slice(&edges[handle]);
+            if let Some(next) = edges.get(&handle) {
+                todo.extend_from_slice(next);
+            }
         }
         Ok(marked)
     }
@@ -354,18 +449,36 @@ impl Simulator {
     /// Sweep only slots whose unreachable status has already been established
     /// (`maybe_collect_class_heap`). Keep handle indices monotonic: stale
     /// numeric comparisons must never alias a subsequently allocated object.
+    #[cfg(test)]
     pub(super) fn release_unreachable_class_storage(&mut self, dead: &[bool]) -> usize {
         assert_eq!(dead.len(), self.heap.len());
         assert!(!dead.first().copied().unwrap_or(false));
-        let dead_handle = |h: usize| dead.get(h).copied().unwrap_or(false);
+        let list: Vec<usize> = (0..dead.len()).filter(|&h| dead[h]).collect();
+        let mut bits = super::heap_trace::SlotBits::new(dead.len());
+        for &h in &list {
+            bits.set(h);
+        }
+        self.release_class_storage(&bits, &list)
+    }
+
+    /// The sweep: `dead` marks exactly the handles in `dead_list`.
+    fn release_class_storage(
+        &mut self,
+        dead: &super::heap_trace::SlotBits,
+        dead_list: &[usize],
+    ) -> usize {
+        if dead_list.is_empty() {
+            return 0;
+        }
+        let dead_handle = |h: usize| dead.get(h);
         let dead_name = |name: &str| Self::class_storage_owner(name).is_some_and(&dead_handle);
         // Inherent remove maintains SignalMap's element index. HashMap::retain
         // through DerefMut would leave dangling names in that index.
-        let names: Vec<_> = self
+        let names: Vec<String> = self
             .signals
             .keys()
             .filter(|n| dead_name(n))
-            .cloned()
+            .map(|n| n.into_owned())
             .collect();
         for name in names {
             self.signals.remove(&name);
@@ -384,8 +497,6 @@ impl Simulator {
             assoc_elem_widths,
             assoc_index_widths,
             assoc_key_type_names,
-            assoc_inner_string_keys,
-            assoc_row_dims,
             assoc_defaults,
             queue_max_sizes,
             var_decl_types,
@@ -402,7 +513,6 @@ impl Simulator {
             dynamic_arrays,
             descending_arrays,
             queue_vars,
-            assoc_coll_elems,
             string_signals,
             two_state_signals
         );
@@ -412,8 +522,8 @@ impl Simulator {
         macro_rules! sets {
             ($($field:ident),* $(,)?) => { $(self.$field.retain(|name| !dead_name(name));)* };
         }
+        self.widths.remove_dead_owners(dead_name);
         maps!(
-            widths,
             var_class_types,
             var_typedef_types,
             var_container_types,
@@ -471,12 +581,54 @@ impl Simulator {
         self.randc_used.retain(|(h, _), _| !dead_handle(*h));
         self.randc_pending.retain(|(h, _), _| !dead_handle(*h));
         self.dist_decks.retain(|(h, _), _| !dead_handle(*h));
+        self.event_obj_ids.retain(|(h, _), _| !dead_handle(*h));
+        for slots in self.event_obj_slots.values_mut() {
+            slots.retain(|(h, _)| !dead_handle(*h));
+        }
+        self.event_obj_slots.retain(|_, slots| !slots.is_empty());
         let mut released = 0;
-        for (handle, object) in self.heap.iter_mut().enumerate() {
-            if dead_handle(handle) && object.take().is_some() {
+        for &handle in dead_list {
+            if self.heap.get_mut(handle).and_then(Option::take).is_some() {
                 released += 1;
             }
         }
         released
+    }
+}
+
+impl Simulator {
+    /// `XEZIM_GROWTH_TRACE=<ticks>`: every <ticks> of simulated time, print
+    /// the sizes of the tables whose growth slows a long run down.
+    pub(super) fn growth_trace(&mut self) {
+        static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let Some(every) = *EVERY.get_or_init(|| {
+            std::env::var("XEZIM_GROWTH_TRACE").ok()?.parse::<u64>().ok()
+        }) else {
+            return;
+        };
+        if self.time < self.growth_trace_next {
+            return;
+        }
+        self.growth_trace_next = self.time + every.max(1);
+        let frame_keys: usize = self
+            .process_contexts
+            .values()
+            .map(|c| c.local_stack.iter().map(|f| f.len()).sum::<usize>())
+            .sum();
+        eprintln!(
+            "[GROWTH] t={} heap_slots={} live={} gc_runs={} signals={} contexts={} frame_keys={} \
+             event_waiters={} instance_event_waiters={} condition_waiters={} join_waiters={}",
+            self.time,
+            self.heap.len(),
+            self.heap.iter().filter(|o| o.is_some()).count(),
+            self.class_gc_runs,
+            self.signals.len(),
+            self.process_contexts.len(),
+            frame_keys,
+            self.event_waiters.len(),
+            self.instance_event_waiters.len(),
+            self.condition_waiters.len(),
+            self.join_waiters.len(),
+        );
     }
 }

@@ -64,6 +64,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace block-local declaration binding",
     ),
     (
+        "XEZIM_BIND_AUDIT",
+        "Elab: print each name's binding (§23.9) beside what the generate rename made of it",
+    ),
+    (
         "XEZIM_BIT_SENS",
         "Scheduling: bit-granular comb sensitivity (a write re-runs only readers of the changed bits); 0 disables",
     ),
@@ -117,7 +121,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_CASCADE_LIMIT",
-        "Scheduling: max same-time edge cascade rounds before the runaway guard trips",
+        "Scheduling: opt-in hard cap on same-time edge/NBA cascade rounds (unset: a cascade runs on while state changes and trips only when state recurs)",
     ),
     (
         "XEZIM_CASEJUMP_LIMIT",
@@ -138,6 +142,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_CHAIN_CENSUS",
         "Phase 2: size the single-fanout chain clustering opportunity (count, lengths, dynamic coverage)",
+    ),
+    (
+        "XEZIM_CKPT_AUDIT",
+        "Checkpoints: append to this file the simulator fields a run changes after setup",
+    ),
+    (
+        "XEZIM_CKPT_DIGESTS",
+        "Checkpoints: write each field's digest beside a checkpoint when saved and restored",
     ),
     (
         "XEZIM_CLASS_GC",
@@ -403,7 +415,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_FORCE_PARALLEL",
-        "Parallel: force parallel dispatch even below thresholds",
+        "Parallel: force eligible edge dispatch without calibration",
     ),
     (
         "XEZIM_FOREACH_REPLAY_LIMIT",
@@ -468,6 +480,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_GIT_TAG",
         "Build metadata: nearest release tag baked into -V (build-time)",
+    ),
+    (
+        "XEZIM_GROWTH_TRACE",
+        "Every N ticks of simulated time, print heap, process-context and waiter-table sizes to stderr",
     ),
     (
         "XEZIM_HIER_REF_DEBUG",
@@ -583,6 +599,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_MAX_INST_DEPTH", "Elab: max instance recursion depth"),
     (
+        "XEZIM_MAX_PACKED_WIDTH",
+        "Maximum live packed declaration width in bits (default 16777216, maximum 134217728)",
+    ),
+    (
         "XEZIM_MBX_DBG",
         "Debug: trace mailbox get/put/peek operations",
     ),
@@ -597,6 +617,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_METHOD_PROFILE",
         "class-perf: sample class-method execution (in-process sampling profiler)",
+    ),
+    (
+        "XEZIM_METHOD_STMT_FALLBACK",
+        "class-perf: run a statement a compiled method body cannot lower in the interpreter instead of interpreting the whole method (0 disables, default on)",
     ),
     (
         "XEZIM_METHOD_TIER",
@@ -651,6 +675,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Semantics: `whole` makes a partially out-of-range part-select read x as a whole (some tools); default follows IEEE 1800 11.5.1, where only the out-of-range bits read x",
     ),
     (
+        "XEZIM_OOM_TRACE",
+        "Memory diagnostics: stream JSONL phase/source/instance and RSS samples to a file (1 = stderr; 0 = off)",
+    ),
+    (
         "XEZIM_OPCODE_CENSUS",
         "Print executed-insn opcode histogram at end of sim",
     ),
@@ -660,7 +688,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
-        "Parallel: run parallel plan serially (debug determinism check)",
+        "Parallel: run edge-dispatch plans serially (default 1; 0 enables worker threads)",
     ),
     (
         "XEZIM_PARTITION_BY_CLOCK",
@@ -817,6 +845,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Parse: read `static const` as `const static` (1 enables)",
     ),
     (
+        "XEZIM_RELAX_USE_BEFORE_DECL",
+        "Elab: accept module data references before their declarations with a warning (§6.5; 1 enables)",
+    ),
+    (
         "XEZIM_REPORT_STATS",
         "Print summary statistics at end of run",
     ),
@@ -840,7 +872,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_STACK_MB", "Main simulation thread stack size in MB"),
     (
         "XEZIM_STALL_LIMIT",
-        "Stall detector: process activations without progress before aborting",
+        "Scheduling: zero-delay activations per process before the stall guard trips; unset: progress-aware (trips only when a window changes no state), set: hard cap, 0 disables",
     ),
     ("XEZIM_STUCK_CLOCK", "Stuck-clock detector: enable (0/1)"),
     (
@@ -987,6 +1019,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Same as --verbose: version banner, [PHASE] timings, end-of-run engine counters (1)",
     ),
     (
+        "XEZIM_VERIFY_CLASS_ELEM_READS",
+        "Debug: check every fast class unpacked-array element read against the full name lookup (1)",
+    ),
+    (
         "XEZIM_VERIFY_INLINE_BITS",
         "JIT: shadow-verify the inline-bits mirror against Values",
     ),
@@ -997,6 +1033,14 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_WAITERS_FIRST",
         "Scheduling: run event waiters before edge blocks (0/1)",
+    ),
+    (
+        "XEZIM_WAITER_INDEX",
+        "Scheduling: 0 examines every parked @(...) waiter at each scheduling pass instead of only those whose signals were written (default 1; needs XEZIM_DIRTY_EDGE)",
+    ),
+    (
+        "XEZIM_WAITER_INDEX_SHADOW",
+        "Scheduling: 1 examines every parked @(...) waiter and stops on one the waiter index would have skipped although its signal changed",
     ),
     (
         "XEZIM_XZ_STATS",

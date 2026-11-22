@@ -113,20 +113,7 @@ impl Simulator {
         dt: &DataType,
         typedef_types: &HashMap<String, DataType>,
     ) -> DataType {
-        let mut cur = dt.clone();
-        for _ in 0..64 {
-            match &cur {
-                DataType::TypeReference { name, .. } => {
-                    if let Some(next) = typedef_types.get(&name.name.name) {
-                        cur = next.clone();
-                    } else {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        cur
+        Self::resolve_type_ref_borrowed(dt, typedef_types).clone()
     }
 
     /// Returns `Some((width, signed))` when `dt` — either directly or through a
@@ -137,10 +124,19 @@ impl Simulator {
     /// formals keep the caller value untouched (mirrors the direct integral
     /// formal handling that a raw `TypeReference` port bypassed).
     pub(super) fn scalar_formal_integral(&self, dt: &DataType) -> Option<(u32, bool)> {
+        self.scalar_integral_in(dt, &self.module.typedef_types, &self.module.typedefs)
+    }
+
+    pub(super) fn scalar_integral_in(
+        &self,
+        dt: &DataType,
+        types: &HashMap<String, DataType>,
+        widths: &super::elaborate::TypedefTable,
+    ) -> Option<(u32, bool)> {
         use crate::ast::types::DataType as DT;
         // Enum and real stay out: enum formals were never width-adapted and a
         // real typedef must round (not resize) — keep the prior behavior.
-        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let resolved = super::elaborate::resolve_typedef_chain(dt, types);
         let is_resolved_int =
             matches!(&resolved, DT::IntegerVector { .. } | DT::IntegerAtom { .. })
                 || matches!(
@@ -154,19 +150,18 @@ impl Simulator {
         // on every alias in the chain, not just its terminal element type.
         let named_width = matches!(dt, DT::TypeReference { name, dimensions, .. }
             if !dimensions.is_empty()
-                || super::elaborate::lookup_scoped_type(name, &self.module.typedefs)
+                || super::elaborate::lookup_scoped_type(name, widths)
                     .is_some_and(|width| *width > 0));
         let width_type = if named_width { dt } else { resolved };
         let pw = super::elaborate::resolve_type_width(
             width_type,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(widths),
         );
         if pw == 0 {
             return None;
         }
-        let signed =
-            super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+        let signed = super::elaborate::is_type_signed_resolved(&resolved, types);
         Some((pw, signed))
     }
 
@@ -217,7 +212,7 @@ impl Simulator {
             {
                 value = value.to_two_state();
             }
-        } else if super::elaborate::is_type_real(dt) && !value.is_real {
+        } else if self.dt_is_real(dt) && !value.is_real {
             value = Value::from_f64(value.to_f64());
         }
         value
@@ -240,7 +235,7 @@ impl Simulator {
             let mut by_w: HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>> = HashMap::default();
             for td in self.module.typedef_types.values() {
                 let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                if let Some(fields) = self.struct_field_layout(&resolved) {
                     let total: u32 = fields.iter().map(|f| f.2).sum();
                     by_w.entry(total).or_default().push(fields);
                 }
@@ -259,7 +254,10 @@ impl Simulator {
             })
     }
 
-    pub(super) fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
+    pub(super) fn struct_field_layout(
+        &self,
+        dt: &DataType,
+    ) -> Option<Vec<(String, u32, u32, bool)>> {
         let su = match dt {
             DataType::Struct(su) if !su.packed => su,
             _ => return None,
@@ -268,7 +266,7 @@ impl Simulator {
         let mut offset: u32 = 0;
         for m in su.members.iter().rev() {
             let fw = resolve_type_width(&m.data_type, None, None);
-            let fr = super::elaborate::is_type_real(&m.data_type);
+            let fr = self.dt_is_real(&m.data_type);
             for d in &m.declarators {
                 fields.push((d.name.name.clone(), offset, fw, fr));
                 offset += fw;
@@ -603,6 +601,15 @@ impl Simulator {
     /// packed array, which §35.5.5 does not allow as a result; it stays
     /// unresolved and the prototype is reported unsupported.
     pub(super) fn dpi_resolve_typedef(&self, dt: &DataType) -> DataType {
+        Self::dpi_resolve_typedef_in(dt, &self.module.typedef_types)
+    }
+
+    /// `dpi_resolve_typedef` over a given typedef table (the bytecode
+    /// compiler resolves an import's formals with the same rule).
+    pub(crate) fn dpi_resolve_typedef_in(
+        dt: &DataType,
+        typedef_types: &HashMap<String, DataType>,
+    ) -> DataType {
         let mut cur = dt.clone();
         for _ in 0..16 {
             let DataType::TypeReference {
@@ -616,7 +623,7 @@ impl Simulator {
             }
             // §26.3: a package-qualified result type (`pkg::color_e`) names
             // the package's typedef.
-            match super::elaborate::lookup_scoped_type(name, &self.module.typedef_types) {
+            match super::elaborate::lookup_scoped_type(name, typedef_types) {
                 Some(t) => cur = t.clone(),
                 None => break,
             }
@@ -741,20 +748,28 @@ impl Simulator {
             DpiRetKind::String => Type::pointer(),
         };
         let cif = Cif::new(arg_types, ret_type);
-        for lib in &self.dpi_libraries {
-            let sym = unsafe { lib.get::<*mut c_void>(&cname) };
-            if let Ok(s) = sym {
-                self.dpi_bindings.insert(
-                    sv_name.to_string(),
-                    DpiBinding {
-                        ret,
-                        arg_kinds: arg_kinds.clone(),
-                        cif: cif.clone(),
-                        fn_ptr: CodePtr::from_ptr(*s),
-                    },
-                );
-                return;
-            }
+        let fn_ptr = self
+            .dpi_libraries
+            .iter()
+            .find_map(|lib| unsafe { lib.get::<*mut c_void>(&cname) }.ok().map(|s| *s))
+            // §35.5.1: an import names a C function wherever it is defined.
+            // One that no --dpi-lib library defines is looked up among the
+            // libraries the process already has loaded (the C library, the
+            // xezim executable), so
+            // `import "DPI-C" function string getenv(input string name);`
+            // needs no library of its own. A name found nowhere stays
+            // unbound and keeps its "no implementation" diagnostic.
+            .or_else(|| loaded_c_symbol(&cname));
+        if let Some(p) = fn_ptr {
+            self.dpi_bindings.insert(
+                sv_name.to_string(),
+                DpiBinding {
+                    ret,
+                    arg_kinds,
+                    cif,
+                    fn_ptr: CodePtr::from_ptr(p),
+                },
+            );
         }
     }
 
@@ -824,6 +839,13 @@ impl Simulator {
     }
 
     pub(super) fn dpi_value_to_logic_words(v: &Value, width: u32) -> (Vec<u32>, Vec<u32>) {
+        let fitted;
+        let v = if v.width < width || v.is_fill {
+            fitted = v.resize_for_assign(width);
+            &fitted
+        } else {
+            v
+        };
         let nwords = width.div_ceil(32).max(1) as usize;
         let mut aval = vec![0u32; nwords];
         let mut bval = vec![0u32; nwords];
@@ -903,6 +925,60 @@ impl Simulator {
     /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
     /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
     /// other expression as a one-element array.
+    fn dpi_is_known_open_array(&self, name: &str) -> bool {
+        self.module.arrays.contains_key(name)
+            || self.dpi_multi_dim_shape(name).is_some()
+            || self.dpi_open_array_live_size(name).is_some()
+    }
+
+    /// Resolve an open-array DPI actual expression to its storage key (§35.5.6.1).
+    /// Handles bare class members in methods, `h.m` / `this.m`, collection/member
+    /// operands (`c.d`, `c.q`, packages), and plain/hierarchical identifiers.
+    fn dpi_open_array_actual_name(&mut self, expr: &Expression) -> Option<String> {
+        let plain = match &expr.kind {
+            ExprKind::Ident(hier) => Some(self.resolve_hier_name(hier)),
+            _ => None,
+        };
+        if let Some(ref p) = plain
+            && let ExprKind::Ident(hier) = &expr.kind
+            && hier.path.len() == 1
+            && hier.root.is_none()
+            && hier.path[0].selects.is_empty()
+            && let Some(cand) = self.instance_assoc_member(p)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        if let Some(cand) = self.handle_member_array_name(expr)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        if let Some(cand) = self.array_operand_name(expr)
+            && self.dpi_is_known_open_array(&cand)
+        {
+            return Some(cand);
+        }
+        plain
+            .map(std::borrow::Cow::into_owned)
+            .filter(|p| self.dpi_is_known_open_array(p))
+    }
+
+    fn dpi_open_array_fallback_is_scalar(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => self.cmp_name_scalar(h),
+            ExprKind::MemberAccess { .. }
+            | ExprKind::Range(..)
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::AssignmentPattern(_) => false,
+            ExprKind::Index { index, .. } => {
+                !matches!(index.kind, ExprKind::Range(..) | ExprKind::RangeSelect { .. })
+            }
+            ExprKind::Paren(inner) => self.dpi_open_array_fallback_is_scalar(inner),
+            _ => true,
+        }
+    }
+
     pub(super) fn dpi_collect_open_array(
         &mut self,
         expr: Option<&Expression>,
@@ -910,8 +986,7 @@ impl Simulator {
         let Some(e) = expr else {
             return (Vec::new(), vec![(0, -1)]);
         };
-        if let ExprKind::Ident(hier) = &e.kind {
-            let name = self.resolve_hier_name(hier);
+        if let Some(name) = self.dpi_open_array_actual_name(e) {
             // §35.5.6.1: a multi-dimensional actual (`int a[2][3]`) — every
             // element, row-major.
             if let Some(shape) = self.dpi_multi_dim_shape(&name) {
@@ -928,13 +1003,13 @@ impl Simulator {
             // A dynamic array or queue also has a `module.arrays` entry, but
             // its range is storage capacity: the live size bounds it.
             let live = self.dpi_open_array_live_size(&name);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
                 let mut out = Vec::with_capacity((hi - lo + 1).max(0) as usize);
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
                     for off in 0..(hi - lo + 1).max(0) as usize {
                         out.push(self.cell_read(first_id + off));
                     }
@@ -953,7 +1028,7 @@ impl Simulator {
                     }
                 }
                 let (left, right) =
-                    if live.is_none() && self.module.descending_arrays.contains(&*name) {
+                    if live.is_none() && self.module.descending_arrays.contains(&name) {
                         (hi, lo)
                     } else {
                         (lo, hi)
@@ -975,6 +1050,20 @@ impl Simulator {
         if let Some(r) = self.dpi_collect_pattern(e) {
             return r;
         }
+        if !self.dpi_open_array_fallback_is_scalar(e) {
+            let key = format!("dpi_open_array:{}:{}", e.span.start, e.span.end);
+            if !self.warned_system_tasks.contains(&key) {
+                let sf = self.stall_pid_src_file(self.current_pid);
+                let msg = match self.span_file_line_in(e.span, sf) {
+                    Some(loc) => format!(
+                        "[xezim][warning] DPI open-array actual at {} could not be resolved as an unpacked array; falling back to 1-element scalar (§35.5.6.1)",
+                        loc
+                    ),
+                    None => "[xezim][warning] DPI open-array actual could not be resolved as an unpacked array; falling back to 1-element scalar (§35.5.6.1)".to_string(),
+                };
+                self.warn_system_task_once(&key, &msg);
+            }
+        }
         (vec![self.eval_expr(e)], vec![(0, 0)])
     }
 
@@ -984,7 +1073,7 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<(Vec<Value>, Vec<(i64, i64)>)> {
-        let ExprKind::AssignmentPattern(items) = &e.kind else {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(e).kind else {
             return None;
         };
         if items.is_empty()
@@ -995,9 +1084,12 @@ impl Simulator {
             return None;
         }
         let n = items.len() as i64;
-        let nested = items
-            .iter()
-            .all(|it| matches!(it.expr().kind, ExprKind::AssignmentPattern(_)));
+        let nested = items.iter().all(|it| {
+            matches!(
+                self.unpacked_pattern(it.expr()).kind,
+                ExprKind::AssignmentPattern(_)
+            )
+        });
         if nested {
             let mut out = Vec::new();
             let mut inner: Option<Vec<(i64, i64)>> = None;
@@ -1055,18 +1147,21 @@ impl Simulator {
     /// The element count of a dynamic array or queue actual; None for a
     /// fixed-size array.
     pub(super) fn dpi_open_array_live_size(&self, name: &str) -> Option<u64> {
-        (self.module.dynamic_arrays.contains(name)
-            || self
-                .signals
-                .contains_key(&Self::name_with_suffix(name, ".size")))
+        let is_fixed = self.module.arrays.contains_key(name)
+            && !self.module.dynamic_arrays.contains(name)
+            && !self.module.queue_vars.contains(name);
+        (!is_fixed
+            && (self.module.dynamic_arrays.contains(name)
+                || self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(name, ".size"))))
         .then(|| self.get_queue_size(name))
     }
 
     /// Write an output open array back to its actual, element by element
     /// in the order `dpi_collect_open_array` read them.
     pub(super) fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
-        if let ExprKind::Ident(hier) = &expr.kind {
-            let name = self.resolve_hier_name(hier);
+        if let Some(name) = self.dpi_open_array_actual_name(expr) {
             if let Some(shape) = self.dpi_multi_dim_shape(&name) {
                 let elem_w = self.dpi_multi_dim_elem_width(&name);
                 for (en, d) in Self::dpi_multi_dim_names(&name, &shape).iter().zip(data) {
@@ -1080,7 +1175,7 @@ impl Simulator {
                 return;
             }
             let live = self.dpi_open_array_live_size(&name);
-            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
                 let elem_w = elem_w.max(1) as u32;
                 let fit = |v: &Value| {
@@ -1091,7 +1186,7 @@ impl Simulator {
                     }
                 };
                 // Compact-resolver fast path.
-                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
+                if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_str()) {
                     for (off, d) in data.iter().enumerate().take((hi - lo + 1).max(0) as usize) {
                         let id = first_id + off;
                         let mut val = fit(d);
@@ -1220,19 +1315,74 @@ impl Simulator {
     /// §35.5.6 / §13.5: an actual bound to an integral DPI formal converts as
     /// an assignment to the formal would, so a real rounds (§6.12.2) instead
     /// of passing its f64 bit pattern (`c_add(2.6, 3.4)` handed C 0s).
-    pub(super) fn dpi_int_actual(&mut self, e: &Expression) -> Value {
-        self.dpi_int_actual_w(e, 64)
+    pub(super) fn dpi_int_actual(
+        &mut self,
+        port: Option<&crate::ast::decl::FunctionPort>,
+        e: &Expression,
+    ) -> Value {
+        self.dpi_int_actual_w(port, e, 64)
     }
 
     /// `dpi_int_actual` for a packed-vector formal of `width` bits: a real
     /// fills all of them (`1.0e30` into a `bit [127:0]`).
-    pub(super) fn dpi_int_actual_w(&mut self, e: &Expression, width: u32) -> Value {
-        let v = self.eval_expr(e);
+    ///
+    /// §13.5, §35.5.6: an INPUT actual is assigned to its formal on entry,
+    /// so it is context-determined by the formal's width (§11.6.1, §11.8.1)
+    /// as an ordinary call's is (`actual_context_width`). Evaluated
+    /// self-determined and widened afterwards, `f(a | (b << 1))` over one-bit
+    /// `a`, `b` passed 0 and `f(x + y)` over 8-bit operands lost the carry.
+    pub(super) fn dpi_int_actual_w(
+        &mut self,
+        port: Option<&crate::ast::decl::FunctionPort>,
+        e: &Expression,
+        width: u32,
+    ) -> Value {
+        let v = match port.and_then(|p| self.dpi_formal_ctx_width(p)) {
+            Some(w) => self.eval_expr_ctx(e, w),
+            None => self.eval_expr(e),
+        };
         if v.is_real {
             Self::real_to_int(v.to_f64(), width.max(64))
         } else {
             v
         }
+    }
+
+    /// The width an import's input actual is evaluated at: the formal's,
+    /// spelled out (`actual_context_width`) or through a typedef of a
+    /// fixed-width integral type (`input my_int_t v`), resolved as the
+    /// import's C signature resolves it (`dpi_resolve_typedef`).
+    pub(super) fn dpi_formal_ctx_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        if let Some(w) = self.actual_context_width(port) {
+            return Some(w);
+        }
+        let dt = Self::dpi_typedef_ctx_type(port, &self.module.typedef_types)?;
+        let w = super::elaborate::resolve_type_width(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        (w > 0).then_some(w)
+    }
+
+    /// The fixed-width integral type an import's typedef'd input formal
+    /// (`input my_int_t v`) names, or None (see `dpi_formal_ctx_width`).
+    pub(crate) fn dpi_typedef_ctx_type(
+        port: &crate::ast::decl::FunctionPort,
+        typedef_types: &HashMap<String, DataType>,
+    ) -> Option<DataType> {
+        if !matches!(port.data_type, DataType::TypeReference { .. })
+            || !port.dimensions.is_empty()
+            || !matches!(port.direction, PortDirection::Input)
+        {
+            return None;
+        }
+        let dt = Self::dpi_resolve_typedef_in(&port.data_type, typedef_types);
+        (matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(&dt))
+            .then_some(dt)
     }
 
     /// §23.9 / §26.3: ordinary declarations in the calling scope hide a
@@ -1384,13 +1534,21 @@ impl Simulator {
             Vec::new();
         let mut struct_keep: Vec<CString> = Vec::new();
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
+        // The formal each input actual is assigned to (see `dpi_int_actual_w`).
+        let ports: &[crate::ast::decl::FunctionPort] = match &spec.proto {
+            crate::ast::decl::DPIProto::Function(fd) => &fd.ports,
+            crate::ast::decl::DPIProto::Task(td) => &td.ports,
+        };
+        let in_port = |i: usize| ports.get(i);
 
         for (i, kind) in arg_kinds.iter().enumerate() {
             match kind {
                 DpiArgKind::Int32In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0) as i32)
+                            .map(|e| {
+                                self.dpi_int_actual(in_port(i), e).to_i64().unwrap_or(0) as i32
+                            })
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
@@ -1399,7 +1557,7 @@ impl Simulator {
                 DpiArgKind::LogicIn => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| Self::dpi_svlogic_code(&self.dpi_int_actual(e)))
+                            .map(|e| Self::dpi_svlogic_code(&self.dpi_int_actual(in_port(i), e)))
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
@@ -1430,7 +1588,10 @@ impl Simulator {
                     // i32 pass-through would send (2 -> svBit 0, not 2).
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| (self.dpi_int_actual(e).get_bit(0) == LogicBit::One) as u8)
+                            .map(|e| {
+                                (self.dpi_int_actual(in_port(i), e).get_bit(0) == LogicBit::One)
+                                    as u8
+                            })
                             .unwrap_or(0),
                     );
                     u8_vals.push(v);
@@ -1442,7 +1603,7 @@ impl Simulator {
                     // wrongly writes an int stays inside it.
                     let bit = args
                         .get(i)
-                        .map(|e| (self.dpi_int_actual(e).get_bit(0) == LogicBit::One) as u8)
+                        .map(|e| (self.dpi_int_actual(None, e).get_bit(0) == LogicBit::One) as u8)
                         .unwrap_or(0);
                     let b = Box::new(i32::from_ne_bytes([bit, 0, 0, 0]));
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
@@ -1456,7 +1617,7 @@ impl Simulator {
                 DpiArgKind::Int64In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0))
+                            .map(|e| self.dpi_int_actual(in_port(i), e).to_i64().unwrap_or(0))
                             .unwrap_or(0),
                     );
                     i64_vals.push(v);
@@ -1570,7 +1731,7 @@ impl Simulator {
                     // of {aval, bval} u32 pairs (see dpi_value_to_logic_interleaved).
                     let vv = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(in_port(i), e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&vv, *width);
                     logic_aval.push(buf);
@@ -1581,7 +1742,7 @@ impl Simulator {
                 DpiArgKind::VecLogicOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(None, e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&init, *width);
                     logic_aval.push(buf);
@@ -1597,7 +1758,7 @@ impl Simulator {
                     // ABI differs from VecLogicIn: no bval field.
                     let vv = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(in_port(i), e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let aval = Self::dpi_value_to_bit_words(&vv, *width);
                     // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
@@ -1610,7 +1771,7 @@ impl Simulator {
                 DpiArgKind::VecBitOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual_w(e, *width))
+                        .map(|e| self.dpi_int_actual_w(None, e, *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let aval = Self::dpi_value_to_bit_words(&init, *width);
                     logic_aval.push(aval);
@@ -1668,7 +1829,7 @@ impl Simulator {
                 DpiArgKind::Int32Out => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0) as i32)
+                        .map(|e| self.dpi_int_actual(None, e).to_i64().unwrap_or(0) as i32)
                         .unwrap_or(0);
                     let b = Box::new(init);
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
@@ -1682,7 +1843,7 @@ impl Simulator {
                 DpiArgKind::Int64Out => {
                     let init = args
                         .get(i)
-                        .map(|e| self.dpi_int_actual(e).to_i64().unwrap_or(0))
+                        .map(|e| self.dpi_int_actual(None, e).to_i64().unwrap_or(0))
                         .unwrap_or(0);
                     let b = Box::new(init);
                     let p = Box::new((&*b as *const i64 as *mut i64).cast::<c_void>());
@@ -1996,7 +2157,7 @@ impl Simulator {
             let values = js_sys::Array::new();
             for expression in args {
                 let value = self
-                    .dpi_int_actual(expression)
+                    .dpi_int_actual(None, expression)
                     .to_i64()
                     .ok_or_else(|| "a DPI `int` argument contains X or Z".to_string())?
                     as i32;
@@ -2054,4 +2215,20 @@ impl Simulator {
         self.compile();
         self.simulate();
     }
+}
+
+/// The address of the C symbol `cname` (NUL-terminated) in the global symbol
+/// scope: the executable, the libraries it was linked with (the C library)
+/// and every library opened `RTLD_GLOBAL`. `None` when no loaded object
+/// defines it.
+#[cfg(unix)]
+fn loaded_c_symbol(cname: &[u8]) -> Option<*mut c_void> {
+    // SAFETY: `cname` is NUL-terminated, and `dlsym` only looks the name up.
+    let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, cname.as_ptr().cast()) };
+    (!p.is_null()).then_some(p)
+}
+
+#[cfg(not(unix))]
+fn loaded_c_symbol(_cname: &[u8]) -> Option<*mut c_void> {
+    None
 }

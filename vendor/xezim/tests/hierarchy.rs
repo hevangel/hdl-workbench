@@ -15,6 +15,8 @@
 mod absolute_path_writes_in_subroutines;
 #[path = "hierarchy/array_of_module_instances.rs"]
 mod array_of_module_instances;
+#[path = "hierarchy/bind_audit.rs"]
+mod bind_audit;
 #[path = "hierarchy/bind_directive_basic.rs"]
 mod bind_directive_basic;
 #[path = "hierarchy/bind_static_init_syscall_scope.rs"]
@@ -29,14 +31,20 @@ mod bind_path_through_library_module;
 mod bind_through_nested_part_select;
 #[path = "hierarchy/bind_upward_refs.rs"]
 mod bind_upward_refs;
+#[path = "hierarchy/block_subroutines_take_time_and_clocking_from_their_instance.rs"]
+mod block_subroutines_take_time_and_clocking_from_their_instance;
 #[path = "hierarchy/c910_scoped_cont_assign.rs"]
 mod c910_scoped_cont_assign;
 #[path = "hierarchy/class_method_hier_subroutine_calls.rs"]
 mod class_method_hier_subroutine_calls;
 #[path = "hierarchy/colliding_actual_child_body.rs"]
 mod colliding_actual_child_body;
+#[path = "hierarchy/default_nettype_inferred_ports.rs"]
+mod default_nettype_inferred_ports;
 #[path = "hierarchy/defparam_upward_paths.rs"]
 mod defparam_upward_paths;
+#[path = "hierarchy/disable_targets.rs"]
+mod disable_targets;
 #[path = "hierarchy/downward_hier_refs_in_siblings.rs"]
 mod downward_hier_refs_in_siblings;
 #[path = "hierarchy/downward_write_with_live_objects.rs"]
@@ -47,6 +55,10 @@ mod dump_merged_sv_adopted_primary;
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/dump_merged_sv_top_pruning.rs"]
 mod dump_merged_sv_top_pruning;
+#[path = "hierarchy/duplicate_package_definition.rs"]
+mod duplicate_package_definition;
+#[path = "hierarchy/duplicate_definition_warning.rs"]
+mod duplicate_definition_warning;
 #[path = "hierarchy/expression_port_actuals.rs"]
 mod expression_port_actuals;
 #[path = "hierarchy/final_blocks_hierarchy.rs"]
@@ -57,14 +69,36 @@ mod flat_actual_struct_port;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/foreach_over_submodule_array.rs"]
 mod foreach_over_submodule_array;
-#[path = "hierarchy/genblk_cont_assign.rs"]
-mod genblk_cont_assign;
+#[path = "hierarchy/gated_clk_cell_by_body.rs"]
+mod gated_clk_cell_by_body;
 #[path = "hierarchy/genblk_dotted_ref_nettype_none.rs"]
 mod genblk_dotted_ref_nettype_none;
+#[path = "hierarchy/genblk_cont_assign.rs"]
+mod genblk_cont_assign;
+#[path = "hierarchy/generate_block_data_hiding.rs"]
+mod generate_block_data_hiding;
+#[path = "hierarchy/generate_block_data_scopes.rs"]
+mod generate_block_data_scopes;
+#[path = "hierarchy/generate_block_hiding.rs"]
+mod generate_block_hiding;
+#[path = "hierarchy/generate_block_positions.rs"]
+mod generate_block_positions;
+#[path = "hierarchy/generate_block_subroutine_scopes.rs"]
+mod generate_block_subroutine_scopes;
+#[path = "hierarchy/generate_block_subroutines.rs"]
+mod generate_block_subroutines;
+#[path = "hierarchy/generate_block_type_scopes.rs"]
+mod generate_block_type_scopes;
+#[path = "hierarchy/generate_genvar_substitution.rs"]
+mod generate_genvar_substitution;
 #[path = "hierarchy/generate_label_hier_roots.rs"]
 mod generate_label_hier_roots;
+#[path = "hierarchy/generate_rename_by_binding.rs"]
+mod generate_rename_by_binding;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/generate_scope_tree.rs"]
+mod generate_scope_tree;
 #[path = "hierarchy/generate_scope_subroutine_calls.rs"]
 mod generate_scope_subroutine_calls;
 #[path = "hierarchy/generic_interface_ports.rs"]
@@ -85,6 +119,8 @@ mod inout_port_default;
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
 mod interface_array_element_ports;
+#[path = "hierarchy/interface_array_whole_ports.rs"]
+mod interface_array_whole_ports;
 #[path = "hierarchy/interface_default_clocking.rs"]
 mod interface_default_clocking;
 #[path = "hierarchy/ivtest_port_cluster.rs"]
@@ -121,6 +157,10 @@ mod nonansi_port_expressions;
 mod nonansi_port_redeclaration;
 #[path = "hierarchy/nonansi_ports_and_vif_accessors.rs"]
 mod nonansi_ports_and_vif_accessors;
+#[path = "hierarchy/nonansi_struct_port_member_select.rs"]
+mod nonansi_struct_port_member_select;
+#[path = "hierarchy/nonansi_wildcard_placeholders.rs"]
+mod nonansi_wildcard_placeholders;
 #[path = "hierarchy/nonzero_lsb_port_select.rs"]
 mod nonzero_lsb_port_select;
 #[path = "hierarchy/null_ports_lib_defines_nowarn.rs"]
@@ -129,6 +169,8 @@ mod null_ports_lib_defines_nowarn;
 mod package_scoped_vars_and_methods;
 #[path = "hierarchy/packed_port_formal_type.rs"]
 mod packed_port_formal_type;
+#[path = "hierarchy/packed_port_offset_select.rs"]
+mod packed_port_offset_select;
 #[path = "hierarchy/packed_record_output_chain.rs"]
 mod packed_record_output_chain;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
@@ -155,12 +197,34 @@ mod port_default_child_scope;
 mod port_net_driven_from_inside;
 #[path = "hierarchy/port_net_pull_resolution.rs"]
 mod port_net_pull_resolution;
+#[path = "hierarchy/prepared_body_key.rs"]
+mod prepared_body_key;
 #[path = "hierarchy/repro_import.rs"]
 mod repro_import;
 #[path = "hierarchy/resource_pool_scope_lookup.rs"]
 mod resource_pool_scope_lookup;
+#[path = "hierarchy/review_block_array_queries.rs"]
+mod review_block_array_queries;
+#[path = "hierarchy/review_block_implicit_nets.rs"]
+mod review_block_implicit_nets;
+#[path = "hierarchy/review_disable_block_paths.rs"]
+mod review_disable_block_paths;
+#[path = "hierarchy/review_disable_nested_block_paths.rs"]
+mod review_disable_nested_block_paths;
+#[path = "hierarchy/review_generate_struct_arrays.rs"]
+mod review_generate_struct_arrays;
+#[path = "hierarchy/review_generate_typedef_in_instance.rs"]
+mod review_generate_typedef_in_instance;
+#[path = "hierarchy/review_implicit_net_scope.rs"]
+mod review_implicit_net_scope;
+#[path = "hierarchy/review_unit_names_in_blocks.rs"]
+mod review_unit_names_in_blocks;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
+#[path = "hierarchy/signed_literal_port_actuals.rs"]
+mod signed_literal_port_actuals;
+#[path = "hierarchy/review_port_assignment_conversion.rs"]
+mod review_port_assignment_conversion;
 #[path = "hierarchy/submodule_array_element_assigns.rs"]
 mod submodule_array_element_assigns;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]
@@ -181,14 +245,20 @@ mod t_nested_value_param_in_type_arg;
 mod t_no_parens_static_method;
 #[path = "hierarchy/typedef_array_ports_in_children.rs"]
 mod typedef_array_ports_in_children;
+#[path = "hierarchy/undeclared_names_by_binding.rs"]
+mod undeclared_names_by_binding;
 #[path = "hierarchy/undefined_call_in_instance.rs"]
 mod undefined_call_in_instance;
 #[path = "hierarchy/undriven_implicit_output_is_z.rs"]
 mod undriven_implicit_output_is_z;
+#[path = "hierarchy/unpacked_port_param_slice.rs"]
+mod unpacked_port_param_slice;
 #[path = "hierarchy/unpacked_struct_port.rs"]
 mod unpacked_struct_port;
 #[path = "hierarchy/unresolved_hier_refs.rs"]
 mod unresolved_hier_refs;
+#[path = "hierarchy/upward_subroutine_calls.rs"]
+mod upward_subroutine_calls;
 #[path = "hierarchy/vif_arrays_and_null_default.rs"]
 mod vif_arrays_and_null_default;
 #[path = "hierarchy/vif_clocking_in_methods.rs"]
@@ -201,6 +271,8 @@ mod vif_in_subroutines;
 mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
+#[path = "hierarchy/wildcard_to_implicit_nets.rs"]
+mod wildcard_to_implicit_nets;
 
 #[path = "hierarchy/nested_modules_and_zpad.rs"]
 mod nested_modules_and_zpad;
@@ -227,22 +299,29 @@ mod instance_loop_local_shadows_module_var;
 mod instance_task_in_forever_loop;
 #[path = "hierarchy/interface_port_inside.rs"]
 mod interface_port_inside;
+#[path = "hierarchy/interface_same_name_drive_1123.rs"]
+mod interface_same_name_drive_1123;
+
+#[path = "hierarchy/explicit_dollar_root_read_1124.rs"]
+mod explicit_dollar_root_read_1124;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
-#[path = "hierarchy/lrm_audit_time0_port_event.rs"]
-mod lrm_audit_time0_port_event;
+#[path = "hierarchy/library_file_macros.rs"]
+mod library_file_macros;
+#[path = "hierarchy/library_file_latin1.rs"]
+mod library_file_latin1;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
 mod lrm_package_variable_scoping;
+#[path = "hierarchy/lrm_audit_time0_port_event.rs"]
+mod lrm_audit_time0_port_event;
 #[path = "hierarchy/modport_expression_ports.rs"]
 mod modport_expression_ports;
 #[path = "hierarchy/modport_shape_battery.rs"]
 mod modport_shape_battery;
 #[path = "hierarchy/multi_top_typedef_packed_dims.rs"]
 mod multi_top_typedef_packed_dims;
-#[path = "hierarchy/named_block_hier_names.rs"]
-mod named_block_hier_names;
 #[path = "hierarchy/nonansi_modport_port_decl.rs"]
 mod nonansi_modport_port_decl;
 #[path = "hierarchy/ref_formal_same_name.rs"]
@@ -255,6 +334,8 @@ mod unit_scope_library_subroutine;
 mod unobserved_port_elision;
 #[path = "hierarchy/vif_packed_array_elem_nba.rs"]
 mod vif_packed_array_elem_nba;
+#[path = "hierarchy/named_block_hier_names.rs"]
+mod named_block_hier_names;
 
 #[path = "hierarchy/instance_array_342.rs"]
 mod instance_array_342;
@@ -338,6 +419,9 @@ mod port_fill_literal_width;
 #[path = "hierarchy/upward_module_name_actual_561.rs"]
 mod upward_module_name_actual_561;
 
+#[path = "hierarchy/upward_name_resolution_890.rs"]
+mod upward_name_resolution_890;
+
 #[path = "hierarchy/nested_iface_write_after_sync_568.rs"]
 mod nested_iface_write_after_sync_568;
 
@@ -346,6 +430,9 @@ mod vif_nested_instance_570;
 
 #[path = "hierarchy/nonansi_child_port_width_572.rs"]
 mod nonansi_child_port_width_572;
+
+#[path = "hierarchy/clocking_unpacked_array_input.rs"]
+mod clocking_unpacked_array_input;
 #[path = "hierarchy/nested_iface_vif_612.rs"]
 mod nested_iface_vif_612;
 #[path = "hierarchy/own_definition_name_assign_target.rs"]
@@ -353,3 +440,126 @@ mod own_definition_name_assign_target;
 
 #[path = "hierarchy/generate_nested_instance_port.rs"]
 mod generate_nested_instance_port;
+
+#[path = "hierarchy/prepared_body_shared_across_ancestors.rs"]
+mod prepared_body_shared_across_ancestors;
+
+#[path = "hierarchy/param_port_actual_no_implicit_net.rs"]
+mod param_port_actual_no_implicit_net;
+#[path = "hierarchy/enum_label_port_actual_no_implicit_net.rs"]
+mod enum_label_port_actual_no_implicit_net;
+
+#[path = "hierarchy/generate_region_parameter_override.rs"]
+mod generate_region_parameter_override;
+
+#[path = "hierarchy/param_override_lists.rs"]
+mod param_override_lists;
+
+#[path = "hierarchy/static_memory_member_paths.rs"]
+mod static_memory_member_paths;
+
+#[path = "hierarchy/issue721_callable_body_sharing.rs"]
+mod issue721_callable_body_sharing;
+#[path = "hierarchy/issue721_prepared_process_ownership.rs"]
+mod issue721_prepared_process_ownership;
+
+#[path = "hierarchy/module_local_names.rs"]
+mod module_local_names;
+
+#[path = "hierarchy/indexed_scope_cont_assign.rs"]
+mod indexed_scope_cont_assign;
+
+#[path = "hierarchy/indexed_scope_edge_sensitivity.rs"]
+mod indexed_scope_edge_sensitivity;
+
+#[path = "hierarchy/review_indexed_scope_selects.rs"]
+mod review_indexed_scope_selects;
+
+#[path = "hierarchy/time0_port_edge.rs"]
+mod time0_port_edge;
+
+#[path = "hierarchy/child_constant_checks_893.rs"]
+mod child_constant_checks_893;
+#[path = "hierarchy/child_constant_package_scope_721.rs"]
+mod child_constant_package_scope_721;
+#[path = "hierarchy/const_function_instance_scope_721.rs"]
+mod const_function_instance_scope_721;
+#[path = "hierarchy/declared_type_sharing_721.rs"]
+mod declared_type_sharing_721;
+
+#[path = "hierarchy/generate_rename_scope.rs"]
+mod generate_rename_scope;
+
+#[path = "hierarchy/generate_array_localparam.rs"]
+mod generate_array_localparam;
+
+#[path = "hierarchy/instance_array_struct_ports.rs"]
+mod instance_array_struct_ports;
+
+#[path = "hierarchy/struct_member_actuals.rs"]
+mod struct_member_actuals;
+
+#[path = "hierarchy/package_header_shadow_995.rs"]
+mod package_header_shadow_995;
+
+#[path = "hierarchy/generate_child_label_refs.rs"]
+mod generate_child_label_refs;
+#[path = "hierarchy/review_tri_port_net_types.rs"]
+mod review_tri_port_net_types;
+#[path = "hierarchy/modport_qualified_access.rs"]
+mod modport_qualified_access;
+#[path = "hierarchy/defparam_targets_core_199.rs"]
+mod defparam_targets_core_199;
+#[path = "hierarchy/bind_instance_lists_core_200.rs"]
+mod bind_instance_lists_core_200;
+#[path = "hierarchy/bind_instance_names_core_201.rs"]
+mod bind_instance_names_core_201;
+#[path = "hierarchy/instance_struct_members_root_1046.rs"]
+mod instance_struct_members_root_1046;
+#[path = "hierarchy/shared_net_initializer_targets.rs"]
+mod shared_net_initializer_targets;
+#[path = "hierarchy/negative_genvar_cached.rs"]
+mod negative_genvar_cached;
+#[path = "hierarchy/unit_storage_one_object_721.rs"]
+mod unit_storage_one_object_721;
+#[path = "hierarchy/unit_storage_shared_bodies_721.rs"]
+mod unit_storage_shared_bodies_721;
+#[path = "hierarchy/net_alias_groups_1092.rs"]
+mod net_alias_groups_1092;
+#[path = "hierarchy/generate_net_port_actuals_1093.rs"]
+mod generate_net_port_actuals_1093;
+#[path = "hierarchy/generate_real_struct_members_1099.rs"]
+mod generate_real_struct_members_1099;
+#[path = "hierarchy/struct_array_localparam_generate.rs"]
+mod struct_array_localparam_generate;
+
+#[path = "hierarchy/rooted_packed_scope.rs"]
+mod rooted_packed_scope;
+#[path = "hierarchy/clog2_port_connection_select.rs"]
+mod clog2_port_connection_select;
+#[path = "hierarchy/nettype_input_port_actuals_1280.rs"]
+mod nettype_input_port_actuals_1280;
+#[path = "hierarchy/prepared_body_release_721.rs"]
+mod prepared_body_release_721;
+#[path = "hierarchy/parameter_type_sharing_721.rs"]
+mod parameter_type_sharing_721;
+#[path = "hierarchy/assignment_origin_sharing_721.rs"]
+mod assignment_origin_sharing_721;
+#[path = "hierarchy/upward_scope_sharing_721.rs"]
+mod upward_scope_sharing_721;
+#[path = "hierarchy/vif_whole_unpacked_1311.rs"]
+mod vif_whole_unpacked_1311;
+#[path = "hierarchy/clocking_blocks_per_scope.rs"]
+mod clocking_blocks_per_scope;
+#[path = "hierarchy/scope_named_like_a_package.rs"]
+mod scope_named_like_a_package;
+#[path = "hierarchy/generate_if_package_param_member.rs"]
+mod generate_if_package_param_member;
+#[path = "hierarchy/bind_target_order_194.rs"]
+mod bind_target_order_194;
+#[path = "hierarchy/deferred_callable_paths_193.rs"]
+mod deferred_callable_paths_193;
+#[path = "hierarchy/two_state_scalar_targets.rs"]
+mod two_state_scalar_targets;
+#[path = "hierarchy/top_ansi_packed_ports.rs"]
+mod top_ansi_packed_ports;

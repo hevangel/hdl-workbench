@@ -425,18 +425,19 @@ impl Value {
 }
 
 impl Value {
-    /// The value an UNSIZED DECIMAL literal actually takes once §5.7.1's
-    /// signed, exactly-32-bit sizing is applied: `Some(wrapped)` when that
-    /// changes it, `None` when the literal is unaffected.
+    /// The value an UNSIZED DECIMAL literal would read as if it were sized at
+    /// exactly 32 signed bits: `Some(wrapped)` when that changes it, `None`
+    /// when the literal is unaffected.
     ///
     /// `3000000000` comes back as `Some(-1294967296)`; `4294967297` as
     /// `Some(1)`. Anything below 2^31 fits and returns `None`, as does a sized
     /// literal (`64'd3000000000`) or a based one (`'hffffffff`), which §5.7.1
     /// makes unsigned.
     ///
-    /// This reports the wrap rather than avoiding it — see
-    /// `warn_unsized_decimal_wrap` in `elaborate.rs` for why the wrap itself
-    /// is deliberate.
+    /// Literals are not evaluated that way: §5.7.1 gives an unsized number
+    /// that needs more than 32 bits the width it needs, sign bit included
+    /// (`unsized_integer_width`). This only tells what a 32-bit reading
+    /// would have lost.
     pub fn unsized_decimal_wrap(size: Option<u32>, radix: u32, value: &str) -> Option<i32> {
         if size.is_some() || radix != 10 {
             return None;
@@ -462,6 +463,18 @@ impl Value {
     /// width is under 32), so this only ever widens a constant that would have lost
     /// data.
     pub fn unsized_literal_width(value: &str, radix: u32) -> u32 {
+        Self::unsized_integer_width(value, radix, false)
+    }
+
+    /// IEEE 1800-2023 §5.7.1: "An unsized number that requires more than 32
+    /// bits shall have at least the minimum width needed to properly
+    /// represent the value, including a sign bit if the number is signed."
+    /// A signed decimal (`2000000000000`, `'sd3000000000`) is its magnitude's
+    /// bits plus a sign bit, at least 32: `2147483647` is 32 bits,
+    /// `2147483648` 33 and `2000000000000` 42. An unsigned decimal (`'d…`)
+    /// and a based number keep the width of their digits, as
+    /// `unsized_literal_width` describes.
+    pub fn unsized_integer_width(value: &str, radix: u32, signed: bool) -> u32 {
         // ONE byte pass where `chars().filter(..).count()` decoded UTF-8. A
         // UTF-8 continuation byte (`0b10xxxxxx`) is never the start of a
         // character and `_` is ASCII, so counting non-continuation bytes that
@@ -476,6 +489,9 @@ impl Value {
             2 => digits,
             8 => digits.saturating_mul(3),
             16 => digits.saturating_mul(4),
+            // Nine decimal digits stay below 2^31: 32 bits, sign bit and all,
+            // without parsing (this runs per literal operand evaluation).
+            _ if digits <= 9 => 32,
             // Decimal: use the magnitude when it fits, else a safe upper bound
             // (log2(10) < 3.33, so 4 bits per digit never under-counts).
             _ => {
@@ -489,7 +505,7 @@ impl Value {
                     cleaned.parse::<u128>()
                 };
                 match parsed {
-                    Ok(v) => (128 - v.leading_zeros()).max(1),
+                    Ok(v) => (128 - v.leading_zeros()).max(1) + u32::from(signed),
                     Err(_) => digits.saturating_mul(4),
                 }
             }
@@ -532,14 +548,9 @@ impl Value {
         }
     }
 
-    /// Hard ceiling on a single Value's bit width (1 Mibit ≈ 128 KiB of `Wide`
-    /// storage). No legitimate scalar/packed value is this wide; a larger width
-    /// is always an artifact of a parameter underflow — e.g. `[N-1:0]` or a
-    /// part-select/`infer_lhs_width` where N resolved to 0, so `N-1` wrapped to
-    /// ~u32::MAX. Without this cap such a width allocates multiple GB and OOMs
-    /// the run (notably black-parrot config-table extraction the const-evaluator
-    /// can't resolve). Matches `elaborate::SANE_MAX_PACKED_WIDTH`.
-    pub const MAX_WIDTH: u32 = 1 << 20;
+    /// Absolute storage limit in bits. The default declaration limit is lower
+    /// and can be raised for large packed behavioural memories.
+    pub const MAX_WIDTH: u32 = 1 << 27;
 
     /// Clamp an absurd (underflowed) width to `MAX_WIDTH`, warning once.
     ///
@@ -622,7 +633,8 @@ impl Value {
     }
 
     /// Normalize a binary op's operands when either is a §5.7.1 fill value:
-    /// the fill side widens (by bit replication) to the other side's width.
+    /// the fill side widens (by bit replication) to the other side's integral
+    /// width, or keeps its self-determined 1-bit width for a real operand.
     /// Returns None on the hot path (no fill involved).
     ///
     /// Every binary operator starts with this, so the hot path must be nothing
@@ -633,7 +645,18 @@ impl Value {
     #[inline(always)]
     fn fill_pair(&self, other: &Value) -> Option<(Value, Value)> {
         if self.is_fill || other.is_fill {
-            Some(self.fill_pair_cold(other))
+            Some(self.fill_pair_cold(other, true))
+        } else {
+            None
+        }
+    }
+
+    /// Keep the existing case-matching path (§12.5) separate from numeric
+    /// comparison normalization.
+    #[inline(always)]
+    fn case_fill_pair(&self, other: &Value) -> Option<(Value, Value)> {
+        if self.is_fill || other.is_fill {
+            Some(self.fill_pair_cold(other, false))
         } else {
             None
         }
@@ -641,8 +664,14 @@ impl Value {
 
     #[cold]
     #[inline(never)]
-    fn fill_pair_cold(&self, other: &Value) -> (Value, Value) {
-        let w = self.width.max(other.width).max(1);
+    fn fill_pair_cold(&self, other: &Value, real_context: bool) -> (Value, Value) {
+        // §5.7.1, §11.8.2: a non-real operand is self-determined before
+        // conversion to real. A real's storage width is not a fill context.
+        let w = if real_context && (self.is_real || other.is_real) {
+            1
+        } else {
+            self.width.max(other.width).max(1)
+        };
         let a = if self.is_fill {
             self.fill_at(w)
         } else {
@@ -874,6 +903,8 @@ impl Value {
                 ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
                 _ => 0.0,
             }
+        } else if let ValueStorage::Wide(planes) = &self.storage {
+            Self::wide_to_f64(planes, self.width, self.is_signed)
         } else {
             if self.is_signed {
                 self.to_i64().unwrap_or(0) as f64
@@ -881,6 +912,59 @@ impl Value {
                 self.to_u64().unwrap_or(0) as f64
             }
         }
+    }
+
+    /// §6.12.2: an integral value wider than 64 bits converted to real,
+    /// rounded to nearest; x and z bits read as 0. The top 64 significant
+    /// bits with a sticky bit for the rest round exactly as the whole value.
+    fn wide_to_f64(planes: &WidePlanes, width: u32, signed: bool) -> f64 {
+        let width = width as usize;
+        let mut words: Vec<u64> = planes
+            .val
+            .iter()
+            .zip(&planes.xz)
+            .map(|(v, x)| v & !x)
+            .collect();
+        if width % 64 != 0
+            && let Some(top) = words.get_mut(width / 64)
+        {
+            *top &= (1u64 << (width % 64)) - 1;
+        }
+        let negative =
+            signed && width > 0 && (words[(width - 1) / 64] >> ((width - 1) % 64)) & 1 == 1;
+        if negative {
+            // Two's complement magnitude at the value's width.
+            let mut carry = 1u64;
+            for w in words.iter_mut() {
+                let (sum, c) = (!*w).overflowing_add(carry);
+                *w = sum;
+                carry = c as u64;
+            }
+            if width % 64 != 0
+                && let Some(top) = words.get_mut(width / 64)
+            {
+                *top &= (1u64 << (width % 64)) - 1;
+            }
+        }
+        let Some(hi) = words.iter().rposition(|&w| w != 0) else {
+            return 0.0;
+        };
+        let msb = hi * 64 + 63 - words[hi].leading_zeros() as usize;
+        let bit = |i: usize| (words[i / 64] >> (i % 64)) & 1;
+        let magnitude = if msb < 64 {
+            words[0] as f64
+        } else {
+            let low = msb - 63;
+            let mut top = 0u64;
+            for i in (low..=msb).rev() {
+                top = (top << 1) | bit(i);
+            }
+            if (0..low).any(|i| bit(i) == 1) {
+                top |= 1;
+            }
+            top as f64 * 2f64.powi(low as i32)
+        };
+        if negative { -magnitude } else { magnitude }
     }
 
     /// Extract inline bits for caching. Returns None for Wide values.
@@ -2959,6 +3043,12 @@ impl Value {
     /// and combined bitwise.
     #[inline]
     pub fn merge_unknown(&self, other: &Value) -> Value {
+        // §11.4.11, Table 7-1: unequal real arms yield the default real
+        // value. Equality is numeric after conversion to the result type.
+        if self.is_real || other.is_real {
+            let a = self.to_f64();
+            return Self::from_f64(if a == other.to_f64() { a } else { 0.0 });
+        }
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             let bits = Self::wide_bitwise_lanes(
                 a,
@@ -3368,7 +3458,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn case_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.case_eq(&b);
         }
         // === operator: compares including X/Z. §11.4.5/§11.6.1: operands of
@@ -3439,7 +3529,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casez_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.casez_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
@@ -3497,7 +3587,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casex_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.fill_pair(other) {
+        if let Some((a, b)) = self.case_fill_pair(other) {
             return a.casex_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
@@ -3605,6 +3695,9 @@ impl Value {
     /// says "either operand". A hard mismatch on a non-wildcard bit
     /// forces the result to 0; otherwise the result is 1.
     pub fn wildcard_eq(&self, other: &Value) -> Value {
+        if let Some((lhs, rhs)) = self.fill_pair(other) {
+            return lhs.wildcard_eq(&rhs);
+        }
         // SV §11.4.6: only x/z bits in the RIGHT operand (the pattern) are
         // wildcards (don't-cares). An x/z in the LEFT operand at a non-masked
         // position is NOT a wildcard — it makes the result x, unless some
@@ -3674,11 +3767,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_than(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64((self.wide_cmp(other) == std::cmp::Ordering::Less) as u64, 1);
@@ -3702,11 +3797,13 @@ impl Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.less_equal(&b);
         }
-        if self.has_xz() || other.has_xz() {
-            return Value::new(1);
-        }
+        // §11.4.4, §6.12.1: convert to real (X/Z bits become zero)
+        // before applying the integral-only unknown-operand rule.
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
+        }
+        if self.has_xz() || other.has_xz() {
+            return Value::new(1);
         }
         if self.width > 64 || other.width > 64 {
             return Value::from_u64(
@@ -4230,6 +4327,10 @@ impl fmt::Display for Value {
 }
 
 #[cfg(test)]
+#[path = "value_real_relational_tests.rs"]
+mod real_relational_tests;
+
+#[cfg(test)]
 mod tests {
     /// §11.4.9: every reduction against a bit-by-bit model, on widths that
     /// straddle the inline/wide boundary and 4-state contents.
@@ -4566,13 +4667,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsized_decimal_literal_wrap_is_reported_at_the_2_31_boundary() {
-        // §5.7.1 sizes an unsized decimal literal signed and exactly 32 bits,
-        // so from 2^31 up it reads back negative. That matches the reference
-        // simulator and stays; this helper is what lets elaboration SAY so
-        // instead of wrapping silently (issue #31: a fitted RNM pole above
-        // 2^31 rad/s written without a decimal point got its sign flipped,
-        // turning a stable state into positive feedback).
+    fn signed_decimal_width_preserves_magnitude() {
+        for (text, width) in [
+            ("0", 32),
+            ("2147483647", 32),
+            ("2147483648", 33),
+            ("2000000000000", 42),
+            ("2_000_000_000_000", 42),
+            ("18446744073709551616", 66),
+        ] {
+            assert_eq!(Value::unsized_integer_width(text, 10, true), width);
+        }
+        assert_eq!(Value::unsized_integer_width("ffffffff", 16, true), 32);
+        assert_eq!(Value::unsized_integer_width("4294967295", 10, false), 32);
+    }
+
+    #[test]
+    fn legacy_decimal_truncation_is_reported_at_the_2_31_boundary() {
+        // Read at exactly 32 signed bits, an unsized decimal from 2^31 up
+        // reads back negative (literals are not sized that way any more, see
+        // `signed_decimal_width_preserves_magnitude`).
         assert_eq!(
             Value::unsized_decimal_wrap(None, 10, "3000000000"),
             Some(-1294967296)
@@ -5779,6 +5893,27 @@ impl Value {
         let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
+        // String values carry no X/Z bits: read each byte straight from its
+        // value word. String building (`s = {s, x}`) converts the whole
+        // accumulated value on every append, so this runs per character.
+        if let ValueStorage::Wide(planes) = &self.storage
+            && planes.xz.iter().all(|&w| w == 0)
+        {
+            for bi in (0..num_bytes).rev() {
+                let mut byte = (planes.val[bi / 8] >> ((bi % 8) * 8)) as u8;
+                let w = self.width as usize - bi * 8;
+                if w < 8 {
+                    byte &= ((1u16 << w) - 1) as u8;
+                }
+                if byte != 0 {
+                    started = true;
+                }
+                if started {
+                    out.push(byte);
+                }
+            }
+            return out;
+        }
         // Whole bytes via the SWAR slice reader (word extraction) instead of
         // eight get_bit calls per byte — string values are wide (one byte per
         // char) and this ran per formatted UVM message.
@@ -5803,10 +5938,12 @@ impl Value {
     /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
     /// above 0x7F survive a round-trip instead of becoming U+FFFD.
     pub fn to_sv_string(&self) -> String {
-        self.sv_string_bytes()
-            .into_iter()
-            .map(|b| b as char)
-            .collect()
+        let bytes = self.sv_string_bytes();
+        if bytes.is_ascii() {
+            // ASCII is already valid UTF-8 with one byte per char.
+            return String::from_utf8(bytes).unwrap_or_default();
+        }
+        bytes.into_iter().map(|b| b as char).collect()
     }
 
     /// Hex string representation
@@ -5817,6 +5954,24 @@ impl Value {
     /// Binary string representation  
     pub fn to_bin_string(&self) -> String {
         self.to_bin()
+    }
+
+    /// The value of the digits of an integer literal (`NumberLiteral::Integer`
+    /// text) at `width`. §5.7.1: a source literal never carries a sign (`-1`
+    /// is unary minus applied to `1`), but the elaborator writes a negative
+    /// value it substitutes or folds, such as a genvar (§27.4), as one
+    /// decimal token `-2`, which constant evaluation reads as negative. The
+    /// literal's cached value is not serialized, so a design loaded from the
+    /// design cache or an artifact evaluates that text again: read it as the
+    /// two's complement of the magnitude (`from_str_radix` leaves a sign to
+    /// the caller and reads it as x).
+    pub fn from_literal_text(s: &str, radix: u32, width: u32) -> Self {
+        match s.strip_prefix('-') {
+            Some(magnitude) if magnitude.bytes().next().is_some_and(|b| b.is_ascii_digit()) => {
+                Self::from_str_radix(magnitude, radix, width).negate()
+            }
+            _ => Self::from_str_radix(s, radix, width),
+        }
     }
 
     /// Parse from a string with given radix (2, 8, 10, 16)
@@ -6466,6 +6621,47 @@ impl Value {
     }
 }
 
+/// A string key as stored inside a flat element name (`a[KEY]`): `[`, `]`
+/// and `\` become `\(`, `\)` and `\\`, so a name never holds a raw bracket
+/// inside a key (§7.8.1 allows any characters). Inverse: `decode_name_key`.
+pub fn encode_name_key(key: &str) -> std::borrow::Cow<'_, str> {
+    if !key.bytes().any(|b| matches!(b, b'[' | b']' | b'\\')) {
+        return std::borrow::Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 4);
+    for c in key.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '[' => out.push_str("\\("),
+            ']' => out.push_str("\\)"),
+            _ => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Inverse of `encode_name_key`.
+pub fn decode_name_key(seg: &str) -> std::borrow::Cow<'_, str> {
+    if !seg.contains('\\') {
+        return std::borrow::Cow::Borrowed(seg);
+    }
+    let mut out = String::with_capacity(seg.len());
+    let mut chars = seg.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('(') => out.push('['),
+            Some(')') => out.push(']'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl Value {
     /// Instance method concat: self ++ other (self is MSB side)
     pub fn concat_with(&self, other: &Value) -> Value {
@@ -6703,3 +6899,7 @@ mod wide_arith_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "value_real_fill_tests.rs"]
+mod real_fill_tests;

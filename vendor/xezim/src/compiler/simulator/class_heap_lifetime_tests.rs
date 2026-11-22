@@ -47,7 +47,7 @@ fn lifetime_fixture_exercises_hidden_roots_while_processes_are_parked() {
     trace.trace(&sim.process_contexts).unwrap();
     let shadowed = node(99);
     assert!(
-        trace.candidates[shadowed as usize],
+        trace.candidates.get(shadowed as usize),
         "serialized context omitted shadowed handle"
     );
     assert!(sim.process_contexts.values().any(|ctx| {
@@ -150,10 +150,11 @@ fn class_sweep_removes_owned_storage_and_preserves_other_instances() {
     assert_eq!(sim.heap.len(), slots);
     assert!(sim.signals.elem_keys(&dead_array).is_empty());
     assert!(!sim.module.arrays.contains_key(&dead_array));
-    assert!(!sim
-        .signals
-        .keys()
-        .any(|n| super::Simulator::class_storage_owner(n) == Some(dead)));
+    assert!(
+        !sim.signals
+            .keys()
+            .any(|n| super::Simulator::class_storage_owner(&n) == Some(dead))
+    );
     assert_eq!(sim.signals.get(&format!("{live_array}[0]")), Some(&saved));
     assert!(sim.module.arrays.contains_key(&live_array));
     assert_eq!(sim.release_unreachable_class_storage(&mask), 0);
@@ -226,6 +227,53 @@ fn default_reclamation_bounds_live_objects_under_churn() {
     assert!(sim.class_gc_runs > 0, "no collection ran");
     let live = sim.heap.iter().filter(|o| o.is_some()).count();
     assert!(live < 25_000, "{live} objects still live after 60000 allocations");
+}
+
+// §8.7 (#1054): the elements of a fixed array member are name-keyed values
+// of their own, so objects far fewer than the allocation threshold can hold
+// most of the store. Their growth triggers a collection too.
+#[test]
+fn array_payloads_trigger_reclamation_below_the_allocation_count() {
+    if super::heap_gc::class_gc_mode() != super::heap_gc::ClassGcMode::On {
+        return;
+    }
+    let sim = crate::simulate(
+        r#"
+        class Item;
+          byte data[256];
+        endclass
+        module top;
+          Item h, kept;
+          initial begin
+            for (int n = 0; n < 2048; n++) begin
+              h = new();
+              h.data[0] = 7;
+              h.data[255] = n[6:0];
+              if (n == 17) kept = h;
+              h = null;
+              if (n % 64 == 63) #1;
+            end
+            if (kept.data[0] != 7 || kept.data[255] != 17) $fatal(1, "retained data lost");
+            $display("PAYLOAD_PASS");
+            $finish;
+          end
+        endmodule
+    "#,
+        100_000,
+    )
+    .expect("payload fixture");
+    assert_eq!(sim.error_count, 0);
+    assert!(
+        sim.output
+            .iter()
+            .any(|o| o.message.contains("PAYLOAD_PASS"))
+    );
+    assert!(sim.class_gc_runs > 0, "no collection ran");
+    let live = sim.heap.iter().filter(|o| o.is_some()).count();
+    assert!(
+        live < 1024,
+        "{live} objects still live after 2048 allocations"
+    );
 }
 
 /// §8.7 / §15.4.3: a captured pattern, rather than its tagged token, owns
@@ -335,4 +383,33 @@ endmodule
         .unwrap()
         .join()
         .unwrap();
+}
+
+// §8.7: collections after the first trace only the previous survivors and
+// the objects allocated since. An object that survived (through an edge from
+// another survivor) must still be reclaimed once that edge goes away, and an
+// object allocated later and reachable only from a survivor must stay live.
+#[test]
+fn incremental_collection_tracks_survivors_across_runs() {
+    let sim = crate::simulate(
+        include_str!("../../../tests/fixtures/memory/heap_incremental.sv"),
+        100_000,
+    )
+    .expect("incremental heap fixture");
+    assert!(sim.finished);
+    assert_eq!(sim.error_count, 0);
+    assert!(sim.class_gc_runs >= 3, "only {} collections", sim.class_gc_runs);
+    assert!(sim
+        .output
+        .iter()
+        .any(|line| line.message.contains("GC_INCR sum=9 next_null=1")));
+    let ids: Vec<u64> = sim
+        .heap
+        .iter()
+        .flatten()
+        .filter(|object| object.class_name == "Node")
+        .filter_map(|object| object.properties.get("id").and_then(|v| v.to_u64()))
+        .filter(|&id| id < 1000)
+        .collect();
+    assert_eq!(ids, vec![1, 8], "node 7 must be reclaimed, 1 and 8 kept");
 }

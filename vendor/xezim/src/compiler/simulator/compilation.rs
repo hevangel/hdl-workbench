@@ -9,6 +9,8 @@ impl Simulator {
         if self.compiled {
             return;
         }
+        let _oom_scope = xezim_core::oom_trace::scope("compile bytecode", "", &self.module.name, "");
+        self.checkpoint_muted = super::checkpoint::restore_pending();
         self.instrument_code_coverage();
         let trace_compile_phases = std::env::var_os("XEZIM_COMPILE_PHASES").is_some();
         let mut compile_phase_start = crate::time::Instant::now();
@@ -64,6 +66,7 @@ impl Simulator {
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
         // signal + per-signal direction. `tick_clocking_blocks`
         // consumes this to maintain `clocking_snapshots`.
+        let mut bound_mirrors: Vec<(String, Expression)> = Vec::new();
         for (cb_name, cd) in self.module.clocking_blocks.iter() {
             let clk = cd.clock_signal.as_ref().map(|i| i.name.clone());
             let edge = match cd.clock_edge {
@@ -75,8 +78,9 @@ impl Simulator {
                 // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
                 // `alias_map` translates the clocking-visible name to it.
                 let mut alias_map: HashMap<String, String> = HashMap::default();
+                let mut bound_sels: HashMap<String, Expression> = HashMap::default();
                 let mut inouts: HashSet<String> = HashSet::default();
-                let sigs: Vec<(String, bool)> = cd
+                let mut sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
                     .map(|s| {
@@ -85,10 +89,26 @@ impl Simulator {
                             crate::ast::types::PortDirection::Input
                                 | crate::ast::types::PortDirection::Inout
                         );
-                        let net = match s.bound_to.as_ref().and_then(Self::flatten_member_path) {
+                        // §14.5: a clockvar may be bound to a select of a
+                        // signal (`input a = bus[3:0];`). The base net is
+                        // the sampled/driven net; the select is kept.
+                        let (flat, has_sel) = match s.bound_to.as_ref() {
+                            Some(e) => match Self::flatten_member_path(e) {
+                                Some(segs) => (Some(segs), false),
+                                None => (
+                                    Self::select_chain_base(e).and_then(Self::flatten_member_path),
+                                    true,
+                                ),
+                            },
+                            None => (None, false),
+                        };
+                        let net = match flat {
                             Some(segs) if !segs.is_empty() => {
                                 let n = segs.join(".");
                                 alias_map.insert(s.name.name.clone(), n.clone());
+                                if has_sel && let Some(e) = s.bound_to.as_ref() {
+                                    bound_sels.insert(s.name.name.clone(), e.clone());
+                                }
                                 n
                             }
                             _ => s.name.name.clone(),
@@ -99,7 +119,56 @@ impl Simulator {
                         (net, is_input)
                     })
                     .collect();
-                let vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                let mut vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                // §14.5: an input bound to an expression (`input sum = a + 1;`,
+                // `input i = {op, ra, rb[3:1]};`) samples the value the
+                // expression has from its operands' samples. Each operand net
+                // is sampled as a hidden clocking input; the clockvar itself
+                // samples nothing by name, so a same-named variable outside
+                // the block is not read instead.
+                let mut bound_exprs: HashMap<String, ClockingBoundExpr> = HashMap::default();
+                for (i, s) in cd.signals.iter().enumerate() {
+                    let Some(e) = s.bound_to.as_ref() else {
+                        continue;
+                    };
+                    if !sigs[i].1
+                        || Self::flatten_member_path(e).is_some()
+                        || Self::select_chain_base(e)
+                            .and_then(Self::flatten_member_path)
+                            .is_some()
+                    {
+                        continue;
+                    }
+                    let mut nets = Vec::new();
+                    Self::clocking_expr_operands(e, &self.signal_name_to_id, &mut nets);
+                    let ops: Vec<(String, String)> = nets
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, net)| {
+                            (net, format!("{}{}.{}", CB_OPERAND_PREFIX, s.name.name, k))
+                        })
+                        .collect();
+                    sigs[i].0 = format!("{}{}", CB_OPERAND_PREFIX, s.name.name);
+                    for (net, hidden) in &ops {
+                        sigs.push((net.clone(), true));
+                        vis.push(hidden.clone());
+                    }
+                    bound_exprs.insert(s.name.name.clone(), (e.clone(), ops));
+                }
+                for (name, (e, _)) in &bound_exprs {
+                    bound_mirrors.push((
+                        format!("{}{}.{}", CB_SAMPLE_PREFIX, cb_name, name),
+                        e.clone(),
+                    ));
+                }
+                if !bound_exprs.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_bound_expr
+                            .insert("__xz_default_clocking".to_string(), bound_exprs.clone());
+                    }
+                    self.clocking_sig_bound_expr
+                        .insert(cb_name.clone(), bound_exprs);
+                }
                 self.clocking_vis.insert(cb_name.clone(), vis);
                 if !inouts.is_empty() {
                     if cd.is_default {
@@ -114,6 +183,24 @@ impl Simulator {
                             .insert("__xz_default_clocking".to_string(), alias_map.clone());
                     }
                     self.clocking_sig_alias.insert(cb_name.clone(), alias_map);
+                }
+                if !bound_sels.is_empty() {
+                    if cd.is_default {
+                        self.clocking_sig_bound_sel
+                            .insert("__xz_default_clocking".to_string(), bound_sels.clone());
+                    }
+                    self.clocking_sig_bound_sel
+                        .insert(cb_name.clone(), bound_sels);
+                }
+                // §14.16: a clocking OUTPUT creates a driver on the net it
+                // is bound to. Where that net has another driver, the clockvar
+                // drives a stage of its own and the stage joins the net's
+                // other drivers in the resolution fold.
+                for ((cb, net), stage) in self.module.clocking_output_stages.iter() {
+                    if cb == cb_name {
+                        self.clocking_output_stages
+                            .insert((cb_name.clone(), net.clone()), stage.clone());
+                    }
                 }
                 // §14.11: alias the parser's reserved `##N` marker to the
                 // `default clocking` block, so the desugared
@@ -135,11 +222,55 @@ impl Simulator {
                         .insert("__xz_default_clocking0".to_string(), edge);
                     self.default_clocking_cb = Some(cb_name.clone());
                 }
+                // §14.3 `clocking_skew ::= edge_identifier [delay_control]`
+                // on outputs. A per-signal skew replaces the block default,
+                // edge included.
+                let skew_edge = |e: crate::ast::stmt::Edge| match e {
+                    crate::ast::stmt::Edge::Posedge => EdgeKind::Posedge,
+                    crate::ast::stmt::Edge::Negedge => EdgeKind::Negedge,
+                    crate::ast::stmt::Edge::Edge => EdgeKind::LsbEdge,
+                };
+                if let Some(e) = cd.default_output_edge {
+                    if cd.is_default {
+                        self.clocking_out_edge
+                            .insert("__xz_default_clocking".to_string(), skew_edge(e));
+                    }
+                    self.clocking_out_edge.insert(cb_name.clone(), skew_edge(e));
+                }
+                let sig_edges: HashMap<String, Option<EdgeKind>> = cd
+                    .signals
+                    .iter()
+                    .filter(|s| {
+                        !matches!(
+                            s.direction,
+                            crate::ast::types::PortDirection::Input
+                                | crate::ast::types::PortDirection::Inout
+                        )
+                    })
+                    .filter(|s| s.skew.is_some() || s.skew_edge.is_some())
+                    .map(|s| (s.name.name.clone(), s.skew_edge.map(skew_edge)))
+                    .collect();
+                if !sig_edges.is_empty() {
+                    self.clocking_sig_out_edge.insert(cb_name.clone(), sig_edges);
+                }
+                self.clocking_in_indexed_scope |= cb_name.contains('[');
                 self.clocking_meta.insert(cb_name.clone(), (clk, sigs));
                 self.clocking_edge.insert(cb_name.clone(), edge);
                 self.clocking_prev_clock.insert(cb_name.clone(), 2);
                 self.clocking_snapshots
                     .insert(cb_name.clone(), HashMap::default());
+            }
+        }
+        // §14.5: the `@(cb.sum)` mirror of an expression-bound input takes
+        // the expression's width.
+        for (hidden, e) in bound_mirrors {
+            let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) else {
+                continue;
+            };
+            let w = self.lrm_self_width(&e).unwrap_or(1).max(1);
+            if self.signal_widths[id] != w {
+                self.signal_widths[id] = w;
+                self.signal_table[id] = Value::new(w);
             }
         }
         // §14.4 output skews: evaluate the per-cb default and per-signal
@@ -184,9 +315,9 @@ impl Simulator {
                 (
                     n.clone(),
                     cd.is_default,
-                    cd.default_output_skew.clone(),
+                    cd.default_output_skew.as_deref().cloned(),
                     out_per_sig,
-                    cd.default_input_skew.clone(),
+                    cd.default_input_skew.as_deref().cloned(),
                     in_per_sig,
                 )
             })
@@ -201,8 +332,10 @@ impl Simulator {
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
+            // §3.14.1: by an exact power of ten (`secs / 1e-15` is not).
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
-                return (secs / slf.tick_s).round() as u64;
+                let ticks = super::elaborate::scale_pow10(*secs, -Self::secs_to_exp(slf.tick_s));
+                return super::elaborate::round_time_units(ticks) as u64;
             }
             // §14.4: a plain number is in the time unit of the module or
             // interface declaring the block (unlike statement delays, the
@@ -264,6 +397,16 @@ impl Simulator {
                 let t = skew_ticks(self, &cb, &e);
                 in_m.insert(net, t);
             }
+            // §14.5: the operands of an expression-bound input take its skew.
+            if let Some(exprs) = self.clocking_sig_bound_expr.get(&cb) {
+                for (name, (_, ops)) in exprs {
+                    if let Some(&t) = in_m.get(name) {
+                        for (_, hidden) in ops {
+                            in_m.insert(hidden.clone(), t);
+                        }
+                    }
+                }
+            }
             if !in_m.is_empty() {
                 self.clocking_sig_in_skew.insert(cb, in_m);
             }
@@ -290,7 +433,14 @@ impl Simulator {
                     .copied()
                     .unwrap_or(dskew);
                 if skew != 0 && skew != CB_SKEW_1STEP {
-                    hist.push((net.clone(), skew));
+                    if let Some(elems) = [net.as_str(), v.as_str()]
+                        .into_iter()
+                        .find_map(|a| self.clocking_array_elems(a))
+                    {
+                        hist.extend(elems.into_iter().map(|(_, e)| (e, skew)));
+                    } else {
+                        hist.push((net.clone(), skew));
+                    }
                 }
             }
         }
@@ -401,7 +551,7 @@ impl Simulator {
         }
         self.colliding_static_colls = colliding_names.iter().cloned().collect();
         self.colliding_static_colls_ready = true;
-        let mut static_cols: Vec<(String, bool, u32, bool)> = Vec::new();
+        let mut static_cols = Vec::new();
         for cd in self.module.classes.values() {
             for (name, is_assoc, width) in &cd.static_collections {
                 let is_str = cd
@@ -425,11 +575,15 @@ impl Simulator {
                     *is_assoc,
                     *width,
                     is_str,
+                    cd.queue_property_names.contains(name),
                 ));
             }
         }
         self.register_struct_member_collections();
-        for (name, is_assoc, width, is_str) in static_cols {
+        for (name, is_assoc, width, is_str, is_queue) in static_cols {
+            if is_queue {
+                self.module.queue_vars.insert(name.clone());
+            }
             if is_assoc {
                 self.module
                     .associative_arrays
@@ -622,7 +776,7 @@ impl Simulator {
                 .get(&cn)
                 .and_then(|cd| cd.properties.get(&prop))
                 .and_then(|s| s.type_name.as_deref())
-                .and_then(Self::container_base);
+                .and_then(|t| self.builtin_container_kind(t));
             let (is_new, ctor_args): (bool, Vec<Expression>) = match &init.kind {
                 ExprKind::Call { func, args }
                     if matches!(&func.kind, ExprKind::Ident(h)
@@ -963,6 +1117,10 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.collapse_identity_port_nets();
+        // §9.2.2.2 / §7.2: identity copies re-point member names at their
+        // sources. Build whole-struct sensitivity after the final collapse,
+        // or it waits on the old member ids, which no longer change.
+        self.unpacked_struct_sens = self.build_unpacked_struct_sens();
         mark_compile_phase("identity port-net collapse", &mut compile_phase_start);
         self.compile_edge_blocks();
         self.drop_compiled_edge_block_asts();
@@ -1395,9 +1553,11 @@ impl Simulator {
         // constant nets, and the reference fires them once at t0. Snapshotting
         // AFTER the settle erased that change and the blocks never ran.
         self.snapshot_edge_signals_full();
+        self.hold_time0_effect_entries();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.fire_time0_input_port_blocks();
+        self.record_time0_port_edges();
         self.in_pre_process_settle = false;
         self.time0_settled = true;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
@@ -1552,7 +1712,7 @@ impl Simulator {
             let span = ib.stmt.span;
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, span)],
+                other => vec![Statement::new(other, span)].into(),
             };
             let pid = self.next_pid;
             self.next_pid += 1;
@@ -1565,7 +1725,7 @@ impl Simulator {
             }
             self.process_origin
                 .insert(pid, (span, "static initializer"));
-            self.event_queue.schedule(0, pid, stmts.into());
+            self.event_queue.schedule(0, pid, stmts.into_vec().into());
         }
         // §16.5/§16.14: declarative concurrent assertions exist before
         // Active processes run, including an initial clock's time-zero edge.
@@ -1611,113 +1771,185 @@ impl Simulator {
         self.m_block_scope = saved_block_scope;
         self.m_block_scope_id = saved_block_scope_id;
         self.m_block_active = saved_block_active;
-        for ib in early
-            .into_iter()
-            .chain(pending_initial.into_iter().map(&mut rename_pending))
-            .chain(initial_blocks)
-        {
-            let ib = self.cov_initial(ib);
-            let scope = ib.scope;
-            let span = ib.stmt.span;
-            let block_label = match &ib.stmt.kind {
-                StatementKind::SeqBlock { name, .. } => name.as_ref().map(|n| n.name.clone()),
-                _ => None,
-            };
-            let stmts = match ib.stmt.kind {
-                StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
-            };
-            // Clock-generator fast path:
-            //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
-            // Otherwise each half-period would schedule a new process
-            // (~2.5ms per toggle on c910). Detect this pattern, apply
-            // the seed assignment immediately, and register a ClockGen
-            // so `fire_clock_generators` can toggle the signal O(1).
-            // The detection below EVALUATES the block's seed RHS, and that
-            // eval memoizes each bare name's resolution on its AST node. It
-            // must therefore run under THIS block's scope — the hint still
-            // holds whatever the previous block (or any earlier compile-time
-            // eval) left, and a bare wildcard-imported constant resolved once
-            // under a sibling's scope stays wrong for the whole run: `user`'s
-            // enum member `C` permanently read `shadower`'s local `int C`.
-            *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
-            if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
-                self.clock_gen_src
-                    .push((self.clock_generators.len(), scope.clone(), span.start));
-                self.clock_generators.push(cg);
-                if !self.sva_sites.is_empty() {
-                    // §16.5.1: keep the seed in Active so the slot-entry
-                    // Preponed snapshot precedes it, just like an ordinary
-                    // blocking assignment. The periodic toggles stay fast.
-                    let pid = self.next_pid;
-                    self.next_pid += 1;
-                    if !scope.is_empty() {
-                        self.process_scope_hint.insert(pid, scope);
-                    }
-                    self.process_origin.insert(pid, (span, "initial block"));
-                    self.event_queue
-                        .schedule(0, pid, vec![stmts[0].clone()].into());
-                }
-                continue;
+        enum InitItem {
+            Materialized(super::elaborate::InitialBlock),
+            Lazy(super::elaborate::PendingInitial),
+        }
+        // An instance's initial block shares its source with every other
+        // instance of the module until it is materialized for its own
+        // (`PendingInitial`). Materializing all of them here kept one owned
+        // copy of the body per instance queued at once: 512 instances of a
+        // 512-statement block took setup from 52 MB to 350 MB. A block is
+        // instead queued by its pending form and materialized when its
+        // process starts (`run_process_payload`), wherever nothing below
+        // needs the materialized statements first:
+        // - code coverage instruments them (`cov_initial`);
+        // - the clock-generator shape (two statements) is detected on them;
+        // - a body with an event control may become a process FSM, as may
+        //   any body with a wait under XEZIM_PROC_FSM=1;
+        // - a call in statement position blocks or not by the callee the
+        //   instance's own names resolve to, which decides the block's place
+        //   in the time-0 order (`t0_timing_free`).
+        let fsm_all = self.proc_fsm_mode == 1;
+        let can_defer_initial = |p: &super::elaborate::PendingInitial| -> bool {
+            if self.code_cov.is_some() || fsm_all {
+                return false;
             }
-            // Roadmap 12 (opt-in XEZIM_PROC_FSM=1): a compilable initial body
-            // with waits becomes a process FSM. The cheap timing-control
-            // count runs first so memory-init megablocks skip without the
-            // SeqBlock rebuild.
-            {
-                // 1 = every compilable initial body; 0 = none; unset = the
-                // plain-stimulus shape below (a testbench's clocked stimulus
-                // loop ran 8.6x slower on the AST path than as an FSM).
-                let fsm_mode = self.proc_fsm_mode;
-                let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
-                let admit = timing >= 1
-                    && match fsm_mode {
-                        1 => true,
-                        0 => false,
-                        _ => {
-                            // Clock-driven only: a body with at least one `@`
-                            // wait is the hot stimulus loop; delay-only
-                            // sequences (reset scripts, UDP/stall probes,
-                            // ordering tests) stay on the AST path, whose
-                            // per-statement waiter and UDP evaluation order
-                            // their pinned traces rely on. A labeled block is
-                            // a hierarchical scope (`disable lbl`, `lbl.v`)
-                            // the FSM does not model.
-                            std::env::var_os("XEZIM_VALUE_TRACE").is_none()
-                                && block_label.is_none()
-                                && stmts.iter().any(Self::stmt_contains_event_control)
-                                && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+            if matches!(&p.source.kind, StatementKind::SeqBlock { stmts, .. } if stmts.len() == 2) {
+                return false;
+            }
+            !Self::stmt_contains_event_control(&p.source)
+                && !Self::stmt_has_call_statement(&p.source)
+        };
+        let (deferred_pending, direct_pending): (Vec<_>, Vec<_>) =
+            pending_initial.into_iter().partition(can_defer_initial);
+        for item in early
+            .into_iter()
+            .chain(direct_pending.into_iter().map(&mut rename_pending))
+            .chain(initial_blocks)
+            .map(InitItem::Materialized)
+            .chain(deferred_pending.into_iter().map(InitItem::Lazy))
+        {
+            let (scope, span, block_label, is_blocking, lazy_entry, stmts): (
+                String,
+                crate::ast::Span,
+                Option<String>,
+                bool,
+                Option<super::elaborate::PendingInitial>,
+                Option<Vec<Statement>>,
+            ) = match item {
+                InitItem::Materialized(ib) => {
+                    let ib = self.cov_initial(ib);
+                    let scope = ib.scope;
+                    let span = ib.stmt.span;
+                    let block_label = match &ib.stmt.kind {
+                        StatementKind::SeqBlock { name, .. } => {
+                            name.as_ref().map(|n| n.name.clone())
                         }
+                        _ => None,
                     };
-                if admit {
-                    let wrapped = Statement::new(
-                        StatementKind::SeqBlock {
-                            name: None,
-                            stmts: stmts.clone(),
-                        },
-                        span,
-                    );
-                    if self.try_register_proc_fsm(&wrapped, &scope, false, "initial block") {
-                        continue;
+                    let stmts = match ib.stmt.kind {
+                        StatementKind::SeqBlock { stmts, .. } => stmts,
+                        other => vec![Statement::new(other, ib.stmt.span)].into(),
+                    };
+                    let is_blocking = stmts.iter().any(|st| self.stmt_is_blocking(st));
+                    (scope, span, block_label, is_blocking, None, Some(stmts.into_vec()))
+                }
+                InitItem::Lazy(p) => {
+                    let scope = p.scope();
+                    let span = p.source.span;
+                    let block_label = match &p.source.kind {
+                        StatementKind::SeqBlock { name, .. } => {
+                            name.as_ref().map(|n| n.name.clone())
+                        }
+                        _ => None,
+                    };
+                    let is_blocking = self.stmt_is_blocking(&p.source);
+                    (scope, span, block_label, is_blocking, Some(p), None)
+                }
+            };
+            if let Some(stmts) = &stmts {
+                // Clock-generator fast path:
+                //     initial begin VAR = CONST; forever #d VAR = ~VAR; end
+                // Otherwise each half-period would schedule a new process
+                // (~2.5ms per toggle on c910). Detect this pattern, apply
+                // the seed assignment immediately, and register a ClockGen
+                // so `fire_clock_generators` can toggle the signal O(1).
+                // The detection below EVALUATES the block's seed RHS, and that
+                // eval memoizes each bare name's resolution on its AST node. It
+                // must therefore run under THIS block's scope — the hint still
+                // holds whatever the previous block (or any earlier compile-time
+                // eval) left, and a bare wildcard-imported constant resolved once
+                // under a sibling's scope stays wrong for the whole run: `user`'s
+                // enum member `C` permanently read `shadower`'s local `int C`.
+                *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
+                if let Some(cg) = self.try_extract_initial_clock_gen(stmts) {
+                    self.clock_gen_src.push((
+                        self.clock_generators.len(),
+                        scope.clone(),
+                        span.start,
+                    ));
+                    self.clock_generators.push(cg);
+                    if !self.sva_sites.is_empty() {
+                        // §16.5.1: keep the seed in Active so the slot-entry
+                        // Preponed snapshot precedes it, just like an ordinary
+                        // blocking assignment. The periodic toggles stay fast.
+                        let pid = self.next_pid;
+                        self.next_pid += 1;
+                        if !scope.is_empty() {
+                            self.process_scope_hint.insert(pid, scope);
+                        }
+                        self.process_origin.insert(pid, (span, "initial block"));
+                        self.event_queue
+                            .schedule(0, pid, vec![stmts[0].clone()].into());
+                    }
+                    continue;
+                }
+                // Roadmap 12 (opt-in XEZIM_PROC_FSM=1): a compilable initial body
+                // with waits becomes a process FSM. The cheap timing-control
+                // count runs first so memory-init megablocks skip without the
+                // SeqBlock rebuild.
+                {
+                    // 1 = every compilable initial body; 0 = none; unset = the
+                    // plain-stimulus shape below (a testbench's clocked stimulus
+                    // loop ran 8.6x slower on the AST path than as an FSM).
+                    let fsm_mode = self.proc_fsm_mode;
+                    let timing = stmts.iter().map(Self::count_timing_controls).sum::<usize>();
+                    let admit = timing >= 1
+                        && match fsm_mode {
+                            1 => true,
+                            0 => false,
+                            _ => {
+                                // Clock-driven only: a body with at least one `@`
+                                // wait is the hot stimulus loop; delay-only
+                                // sequences (reset scripts, UDP/stall probes,
+                                // ordering tests) stay on the AST path, whose
+                                // per-statement waiter and UDP evaluation order
+                                // their pinned traces rely on. A labeled block is
+                                // a hierarchical scope (`disable lbl`, `lbl.v`)
+                                // the FSM does not model.
+                                std::env::var_os("XEZIM_VALUE_TRACE").is_none()
+                                    && block_label.is_none()
+                                    && stmts.iter().any(Self::stmt_contains_event_control)
+                                    && stmts.iter().all(|st| self.stmt_is_plain_stimulus(st))
+                            }
+                        };
+                    if admit {
+                        let wrapped = Statement::new(
+                            StatementKind::SeqBlock {
+                                name: None,
+                                stmts: stmts.clone().into(),
+                            },
+                            span,
+                        );
+                        if self.try_register_proc_fsm(&wrapped, &scope, false, "initial block") {
+                            continue;
+                        }
                     }
                 }
             }
             let pid = self.next_pid;
             self.next_pid += 1;
-            if !stmts.iter().any(|st| self.stmt_is_blocking(st)) {
+            if !is_blocking {
                 self.t0_timing_free.insert(pid);
             }
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
             self.process_origin.insert(pid, (span, "initial block"));
-            if let Some(l) = block_label {
+            if let Some(l) = &block_label {
                 // The outermost `begin/end` is flattened away below, so keep
                 // the label for `%m` here — see `process_m_label`.
                 self.process_m_label.insert(pid, l.clone());
-                self.disable_labels.insert(l, pid);
+                self.register_disable_label(l, pid);
             }
-            self.event_queue.schedule(0, pid, stmts.into());
+            if let Some(p) = lazy_entry {
+                self.lazy_initial.insert(pid, p);
+                self.event_queue.schedule(0, pid, ProcCont::empty());
+            } else {
+                let stmts = stmts.unwrap();
+                self.event_queue.schedule(0, pid, stmts.into());
+            }
         }
         self.order_time0_processes();
         // LRM §24: `program` initial blocks execute in the reactive region.
@@ -1731,9 +1963,9 @@ impl Simulator {
         for ib in std::mem::take(&mut self.module.program_initial_blocks) {
             let stmts = match ib.stmt.kind {
                 StatementKind::SeqBlock { stmts, .. } => stmts,
-                other => vec![Statement::new(other, ib.stmt.span)],
+                other => vec![Statement::new(other, ib.stmt.span)].into(),
             };
-            self.pending_reactive.push((stmts, ib.scope));
+            self.pending_reactive.push((stmts.into_vec(), ib.scope));
         }
         // The reactive region of time 0 runs at the end of the time-0 slot;
         // make sure that slot exists even when no module process starts

@@ -153,9 +153,35 @@ impl Simulator {
         )
     }
 
+    /// §11.4.13 / §11.4.5: real operands use numeric equality, including
+    /// conversion of an integral operand to real; a NaN must not match itself.
+    /// Integral pairs retain wildcard equality.
+    #[inline]
+    pub(super) fn inside_values_equal(val: &Value, item: &Value) -> Value {
+        if val.is_real || item.is_real {
+            val.is_equal(item)
+        } else {
+            val.wildcard_eq(item)
+        }
+    }
+
+    /// §12.5: a `case` item matches its expression bit for bit (`===`),
+    /// which Table 11-1 does not define for a real operand. When either is
+    /// real the pair compares numerically, an integral one converted to real
+    /// (§11.8.2), so `case (r) 1:` matches `r = 1.0`, as `==` would.
+    #[inline]
+    pub(super) fn case_values_match(val: &Value, item: &Value) -> bool {
+        if val.is_real || item.is_real {
+            val.is_equal(item).is_true()
+        } else {
+            val.case_eq(item).is_true()
+        }
+    }
+
     /// IEEE 1800-2017 §12.5.4 `case (e) inside`: an item is a range, a value or
     /// an array, matched with the same rules as the `inside` OPERATOR — ranges
-    /// are inclusive and x/z in an item are wildcards. `CaseInside` fell through
+    /// are inclusive and x/z in an item are wildcards for integral operands.
+    /// `CaseInside` fell through
     /// to exact `case_eq`, so a range item compared against a garbage value and
     /// a wildcard item never matched: both silently took `default`.
     pub(super) fn case_inside_match(&mut self, val: &Value, pat: &Expression) -> bool {
@@ -170,11 +196,12 @@ impl Simulator {
                 || val.less_equal(&self.eval_expr(hi)).is_true();
             return lo_ok && hi_ok;
         }
-        if let Some(nm) = self.array_operand_name(pat) {
-            let sz = self.get_queue_size(&nm);
-            for i in 0..sz {
-                if let Some(ev) = self.get_signal_value_by_name(&format!("{}[{}]", nm, i)) {
-                    if val.wildcard_eq(&ev).is_true() {
+        // An array item, also an associative one or a call returning an
+        // array (§11.4.13, §13.4.1), matches any of its elements.
+        if let Some(keys) = self.inside_operand_keys(pat) {
+            for key in keys {
+                if let Some(ev) = self.get_signal_value_by_name(&key) {
+                    if Self::inside_values_equal(val, &ev).is_true() {
                         return true;
                     }
                 }
@@ -182,7 +209,7 @@ impl Simulator {
             return false;
         }
         let pv = self.eval_expr(pat);
-        val.wildcard_eq(&pv).is_true()
+        Self::inside_values_equal(val, &pv).is_true()
     }
 
     /// IEEE 1800-2017 §6.12.2: converting a real to an integral type ROUNDS to
@@ -194,12 +221,38 @@ impl Simulator {
         Value::from_real_wrapped(f, width)
     }
 
+    /// §6.12.2: a real written into the integral slot whose current value is
+    /// `p` — rounded to the slot's width, stamped with its signedness. The
+    /// by-name stores (frame locals, struct leaves, collection elements) all
+    /// keep the slot's own type this way.
+    #[inline]
+    pub(super) fn real_into_slot(p: &Value, f: f64) -> Value {
+        let mut v = Self::real_to_int(f, p.width.max(1));
+        v.is_signed = p.is_signed;
+        v
+    }
+
+    /// §21.2.1.2 / §6.12.2: an integral format letter (`%d`, `%h`, `%o`,
+    /// `%b`, `%c`) applied to a REAL argument prints the real converted to an
+    /// integer: rounded to the nearest (ties away from zero) 32-bit signed
+    /// integer, the width and signedness of `integer`, so `%0d` of 15151.51
+    /// is `15152`, `%0h` of -15151.51 is `ffffc4d0` and `%d` pads to 11.
+    /// (Simulators agree on the 32-bit two's complement; most print the
+    /// decimal signed, one prints it unsigned.)
+    #[inline(never)]
+    pub(super) fn real_fmt_int(v: &Value) -> Value {
+        let mut i = Value::from_real_wrapped(v.to_f64(), 32);
+        i.is_signed = true;
+        i
+    }
+
     /// §13.4.1: how a function's value converts to its declared return type,
     /// for `ty` already resolved through its typedefs. Anything that is not a
     /// numeric scalar (a handle, string, void, unpacked aggregate or an
     /// unresolved type) keeps its value.
     pub(super) fn ret_conv_of(ty: &DataType, typedef_types: &HashMap<String, DataType>) -> RetConv {
         match ty {
+            DataType::Real { kind: crate::ast::types::RealType::ShortReal, .. } => RetConv::ShortReal,
             DataType::Real { .. } => RetConv::Real,
             DataType::IntegerVector { .. }
             | DataType::IntegerAtom { .. }
@@ -224,7 +277,7 @@ impl Simulator {
     /// the class (or an ancestor) wins over a same-named global one, and a
     /// type parameter takes the type bound on the running object (§8.25).
     pub(super) fn method_ret_conv(&self, rt: &DataType, cname: &str) -> RetConv {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         if let DataType::TypeReference {
             name, dimensions, ..
         } = rt
@@ -245,12 +298,15 @@ impl Simulator {
                 };
             }
         }
-        self.fn_ret_conv(rt)
+        Self::ret_conv_of(super::elaborate::resolve_typedef_chain(rt, tt), tt)
     }
 
     /// `ret_conv_of` for a concrete type-parameter binding, given by name.
     pub(super) fn concrete_ret_conv(&self, name: &str) -> RetConv {
-        if matches!(name, "real" | "realtime" | "shortreal") {
+        if name == "shortreal" {
+            return RetConv::ShortReal;
+        }
+        if matches!(name, "real" | "realtime") {
             return RetConv::Real;
         }
         if let Some(dt) = self.module.typedef_types.get(name) {
@@ -289,6 +345,7 @@ impl Simulator {
                 }
                 r
             }
+            RetConv::ShortReal => Value::from_f64(v.to_f64() as f32 as f64),
             RetConv::Real if !v.is_real && !v.is_fill => Value::from_f64(v.to_f64()),
             _ => v,
         }
@@ -300,7 +357,7 @@ impl Simulator {
     #[cold]
     #[inline(never)]
     pub(super) fn method_ret_typedef_fit(&self, rt: &DataType, cname: &str) -> (u32, Option<bool>) {
-        let tt = &self.module.typedef_types;
+        let tt = self.method_typedef_types();
         let dt = match rt {
             DataType::TypeReference {
                 name, dimensions, ..
@@ -322,7 +379,7 @@ impl Simulator {
         let w = resolve_type_width(
             dt,
             Some(&self.module.parameters),
-            Some(&self.module.typedefs),
+            Some(self.method_typedef_widths()),
         );
         (w, Some(super::elaborate::is_type_signed_resolved(dt, tt)))
     }
@@ -346,6 +403,7 @@ impl Simulator {
     pub(super) fn ret_needs_convert(v: &Value, conv: RetConv) -> bool {
         match conv {
             RetConv::Keep => false,
+            RetConv::ShortReal => true,
             RetConv::Real => !v.is_real && !v.is_fill,
             RetConv::Int { .. } => v.is_real,
         }
@@ -458,6 +516,71 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §6.24.1: a cast whose casting type is a constant primary is a SIZE
+    /// cast. A field of a struct parameter (`pt.DEPTH'(x)`, also written
+    /// `(pt.DEPTH)'(x)`) parses like a scoped type name and arrives as a
+    /// named cast, but it names a value: its root is a parameter in scope.
+    /// The field's value, or None for any other target.
+    pub(super) fn member_cast_size(&mut self, target: &Expression) -> Option<u32> {
+        // Walk to the root identifier; a bare `N'(x)` is not a field and
+        // keeps the parameter arm of the caller.
+        let mut root = target;
+        let mut field = false;
+        let h = loop {
+            match &root.kind {
+                ExprKind::Paren(inner) => root = inner,
+                ExprKind::MemberAccess { expr, .. } => {
+                    field = true;
+                    root = expr;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        // Shape first: every named cast comes through here, and a bare
+        // `T'(x)` must not pay for the scoped parameter lookup.
+        if !field && h.path.len() < 2 {
+            return None;
+        }
+        // The parameter is a prefix of the path. An instance's names arrive
+        // with the instance folded into the first segment (`u.pt` . `DEPTH`),
+        // which no scoped lookup of a bare name finds, and a `$root`-rooted
+        // path spells the instance out (`$root.u.pt.DEPTH`).
+        let mut key = String::new();
+        let mut is_param = match h.root.as_deref() {
+            None => self.scoped_param_value(&h.path[0].name.name).is_some(),
+            Some("$root") => false,
+            Some(_) => return None,
+        };
+        let prefixes = if field { h.path.len() } else { h.path.len() - 1 };
+        for seg in &h.path[..prefixes] {
+            if !key.is_empty() {
+                key.push('.');
+            }
+            key.push_str(&seg.name.name);
+            is_param = is_param || self.module.parameters.contains_key(key.as_str());
+        }
+        if !is_param {
+            return None;
+        }
+        // Elaboration also keys each member of a struct parameter by its
+        // whole path (`u.pt.DEPTH`); take that value when there is one.
+        let member_value = (!field)
+            .then(|| {
+                key.push('.');
+                key.push_str(&h.path.last()?.name.name);
+                self.module.parameters.get(key.as_str()).cloned()
+            })
+            .flatten();
+        let v = member_value.unwrap_or_else(|| self.eval_expr(target));
+        if v.has_xz() || v.is_real {
+            return None;
+        }
+        v.to_u64()
+            .filter(|&n| n > 0)
+            .and_then(|n| u32::try_from(n).ok())
     }
 
     /// The table key of a parser-lowered named cast's target (`T'(v)`,
@@ -711,8 +834,10 @@ impl Simulator {
     /// A formal no collection, struct, array or associative binder claims:
     /// no unpacked dimensions and a built-in integral, real or string type.
     pub(super) fn port_is_plain_scalar(port: &crate::ast::decl::FunctionPort) -> bool {
+        // §13.5.1: `[W-1:0] v` is an integral formal even when the
+        // declaration omits `logic`; its actual takes the declared width.
         port.dimensions.is_empty()
-            && matches!(
+            && (matches!(
                 port.data_type,
                 DataType::IntegerAtom { .. }
                     | DataType::IntegerVector { .. }
@@ -721,7 +846,7 @@ impl Simulator {
                         kind: crate::ast::types::SimpleType::String,
                         ..
                     }
-            )
+            ) || matches!(&port.data_type, DataType::Implicit { dimensions, .. } if !dimensions.is_empty()))
     }
 
     /// The SHAPE a call actual may be context-sized for: a plain scalar
@@ -758,20 +883,42 @@ impl Simulator {
         &self,
         port: &crate::ast::decl::FunctionPort,
     ) -> Option<u32> {
-        if !Self::actual_ctx_shape(port) {
-            return None;
-        }
-        let dt = &port.data_type;
-        let fixed = matches!(dt, DataType::IntegerAtom { .. }) || Self::packed_dims_are_constant(dt);
-        fixed
+        Self::actual_ctx_fixed(port)
             .then(|| {
                 super::elaborate::resolve_type_width(
-                    dt,
+                    &port.data_type,
                     Some(&self.module.parameters),
                     Some(&self.module.typedefs),
                 )
             })
             .filter(|w| *w > 0)
+    }
+
+    /// The formals `actual_context_width` answers for: an integral input
+    /// whose width is fixed by its declaration. The compiled call lowerings
+    /// ask the same question so compiled and interpreted calls agree.
+    pub(crate) fn actual_ctx_fixed(port: &crate::ast::decl::FunctionPort) -> bool {
+        Self::actual_ctx_shape(port)
+            && (matches!(port.data_type, DataType::IntegerAtom { .. })
+                || Self::packed_dims_are_constant(&port.data_type))
+    }
+
+    /// `actual_context_width` for a module- or package-scope task or
+    /// function, whose formal bounds may also name a parameter
+    /// (`input [W-1:0] v`): such a bound resolves where the call binds, to
+    /// the width the bound value is then fitted to (`fit_scalar_formal_seed`),
+    /// so the actual is evaluated at that width.
+    pub(super) fn free_actual_context_width(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+    ) -> Option<u32> {
+        self.actual_context_width(port).or_else(|| {
+            Self::actual_ctx_shape(port)
+                .then(|| self.scalar_formal_integral(&port.data_type))
+                .flatten()
+                .map(|(w, _)| w)
+                .filter(|w| *w > 0)
+        })
     }
 
     /// Parameter-free arithmetic bounds (including macro-expanded `[64-1:0]`)
@@ -793,15 +940,20 @@ impl Simulator {
             }
         }
         match dt {
-            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
-                PackedDimension::Range { left, right, .. } => {
-                    name_free(left)
-                        && name_free(right)
-                        && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
-                        && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
-                }
-                PackedDimension::Unsized(_) => false,
-            }),
+            // An omitted formal type can inherit the preceding formal's
+            // type (§13.5.2); an empty placeholder is not a one-bit vector.
+            DataType::Implicit { dimensions, .. } if dimensions.is_empty() => false,
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+                dimensions.iter().all(|d| match d {
+                    PackedDimension::Range { left, right, .. } => {
+                        name_free(left)
+                            && name_free(right)
+                            && crate::elaborate::const_eval_i64_with_params(left, None).is_some()
+                            && crate::elaborate::const_eval_i64_with_params(right, None).is_some()
+                    }
+                    PackedDimension::Unsized(_) => false,
+                })
+            }
             _ => false,
         }
     }
@@ -813,9 +965,14 @@ impl Simulator {
         port: &crate::ast::decl::FunctionPort,
         default: &Expression,
     ) -> Value {
+        if let Some(v) = self.formal_pattern_value(port, default) {
+            return v;
+        }
         let mut width = self.actual_context_width(port);
         if width.is_none() && Self::actual_ctx_shape(port) {
-            if let DataType::IntegerVector { dimensions, .. } = &port.data_type {
+            if let DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. } = &port.data_type
+            {
                 if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
                     dimensions.as_slice()
                 {
@@ -934,6 +1091,76 @@ impl Simulator {
         (!earlier.iter().any(|p| p.name.name == name)).then_some(name)
     }
 
+    /// §6.18, §7.4: the unpacked dimensions of a structure member: its own,
+    /// then those of a dimensioned typedef it is declared with (`typedef
+    /// real A[2]; struct { A m; }` has `m[0]` and `m[1]`), as the elaborator
+    /// registers a module-scope variable's members.
+    pub(super) fn member_decl_dims(
+        &self,
+        m_dt: &DataType,
+        own: &[crate::ast::types::UnpackedDimension],
+    ) -> Vec<crate::ast::types::UnpackedDimension> {
+        let mut dims = own.to_vec();
+        if let DataType::TypeReference {
+            name, dimensions, ..
+        } = m_dt
+            && dimensions.is_empty()
+            && let Some(td) = self.typedef_unpacked_dims_of(&name.name.name)
+        {
+            dims.extend(td.iter().cloned());
+        }
+        dims
+    }
+
+    /// §7.2, §7.4: the shape of each fixed one-dimensional unpacked array
+    /// member of the procedural-block unpacked structure `base`, whose leaves
+    /// live by name, as a module-scope variable's members get theirs at
+    /// elaboration: a whole-array write (`s.m = '{default: 2.5}`) finds its
+    /// elements through it.
+    pub(super) fn register_local_struct_member_arrays(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for m in &su.members {
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let key = format!("{}.{}", base, md.name.name);
+                let dims = self.member_decl_dims(&m.data_type, &md.dimensions);
+                match (&nested, dims.as_slice()) {
+                    (Some(inner), []) => {
+                        let inner = inner.clone();
+                        self.register_local_struct_member_arrays(&key, &inner, depth + 1);
+                    }
+                    (None, [_]) => {
+                        let Some(lists) = self.member_dim_indices(&dims) else {
+                            continue;
+                        };
+                        let (Some(&lo), Some(&hi)) = (lists[0].iter().min(), lists[0].iter().max())
+                        else {
+                            continue;
+                        };
+                        let w = super::elaborate::resolve_type_width(
+                            &m.data_type,
+                            Some(&self.module.parameters),
+                            Some(&self.module.typedefs),
+                        )
+                        .max(1);
+                        if !self.module.arrays.contains_key(&key) {
+                            self.meta_note(&key);
+                            self.module.arrays.insert(key, (lo, hi, w));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// §7.2: every storage LEAF of an unpacked struct, as
     /// `(key_suffix, caller_expr, width, is_real)`. Recurses into nested
     /// unpacked structs and expands fixed member dimensions, matching the
@@ -971,12 +1198,13 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_real = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+            let is_real = self.dt_is_real(&m.data_type);
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 let mexpr = mk_member(base, &md.name.name);
-                match self.member_elem_indices(&md.dimensions) {
+                match self.member_elem_indices(&dims) {
                     Some(tups) => {
                         // Every element, last dimension varying fastest —
                         // `m[2][3]` addresses elements `m[i][j]`.
@@ -994,7 +1222,7 @@ impl Simulator {
                                                 signed: true,
                                                 base: NumberBase::Decimal,
                                                 value: i.to_string(),
-                                                cached_val: std::cell::Cell::new(None),
+                                                cached_val: crate::ast::cache::LiteralCache::new(None),
                                             }),
                                             base.span,
                                         )),
@@ -1047,21 +1275,32 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let dv = if super::elaborate::is_type_real(&m.data_type) {
+            // §6.18: a typedef preserves the member's real type.
+            let is_real = self.dt_is_real(&m.data_type);
+            let mut dv = if is_real {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
                 &m.data_type,
                 &self.module.typedef_types,
-            ) {
+            ) || Self::dt_is_class_handle(&m.data_type, &self.module)
+            {
+                // §8.4: a class handle member starts null.
                 Value::zero(mw)
             } else {
                 Value::new(mw)
             };
+            // §6.11.3: the leaf carries its member's signedness, which a
+            // store into it keeps (a real rounds into it, §6.12.1: `-1.5`
+            // into an `int` member reads -2, not 4294967294).
+            if !is_real && self.type_is_signed_concrete(&m.data_type) {
+                dv.is_signed = true;
+            }
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let dims = self.member_dims(&m.data_type, &md.dimensions);
                 // Same keys as `unpacked_struct_leaves`.
-                let keys = match self.member_elem_indices(&md.dimensions) {
+                let keys = match self.member_elem_indices(&dims) {
                     Some(tups) => tups
                         .iter()
                         .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
@@ -1074,13 +1313,12 @@ impl Simulator {
                 // assignments). Scalar members only; the default is an
                 // assignment to the member's type.
                 let member_default = match (&md.init, &nested) {
-                    (Some(init), None) if md.dimensions.is_empty() => {
+                    (Some(init), None) if dims.is_empty() => {
                         let raw = self.eval_expr_ctx(init, mw.max(1));
                         let two_state = super::elaborate::is_type_two_state_resolved(
                             &m.data_type,
                             &self.module.typedef_types,
                         );
-                        let is_real = super::elaborate::is_type_real(&m.data_type);
                         let signed = self.type_is_signed_concrete(&m.data_type);
                         Some(Self::fit_local_decl_init(
                             raw,
@@ -1145,8 +1383,9 @@ impl Simulator {
                     selects: Vec::new(),
                 }],
                 span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: crate::ast::binding::Bound::UNSET,
             }),
             span,
         );
@@ -1353,6 +1592,14 @@ impl Simulator {
         Some(lv)
     }
 
+    pub(super) fn member_dims<'a>(
+        &self,
+        dt: &DataType,
+        declared: &'a [crate::ast::types::UnpackedDimension],
+    ) -> std::borrow::Cow<'a, [crate::ast::types::UnpackedDimension]> {
+        super::elaborate::struct_member_dims(dt, declared, &self.module.typedef_unpacked_dims)
+    }
+
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
     /// are stored one-per-leaf (§7.2), else `None`.
     pub(super) fn unpacked_struct_of(
@@ -1409,7 +1656,7 @@ impl Simulator {
             .count();
         let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, leaf_count, &widths)
+            .eval_flat_struct_pattern(&su, arg, leaf_count, &widths)
             .or_else(|| {
                 let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                 self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1607,14 +1854,17 @@ impl Simulator {
     /// a simple ordered pattern (caller falls back to member-access eval).
     pub(super) fn eval_flat_struct_pattern(
         &mut self,
+        su: &crate::ast::types::StructUnionType,
         arg: &Expression,
         n: usize,
         widths: &[u32],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(parts) = &arg.kind else {
+        let ExprKind::AssignmentPattern(parts) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
-        if parts.len() != n {
+        // §10.9.2: even a one-member replication needs member type
+        // context. Let the shared structure binder remove its inner braces.
+        if parts.len() != n || self.struct_replication_items(su, parts, n).is_some() {
             return None;
         }
         let mut out = Vec::with_capacity(n);
@@ -1645,7 +1895,7 @@ impl Simulator {
         arg: &Expression,
         keys: &[(String, u32, bool)],
     ) -> Option<Vec<Value>> {
-        let ExprKind::AssignmentPattern(items) = &arg.kind else {
+        let ExprKind::AssignmentPattern(items) = &self.unpacked_pattern(arg).kind else {
             return None;
         };
         if items.is_empty() {
@@ -1755,7 +2005,10 @@ impl Simulator {
             self.unpacked_struct_of(&m.data_type).is_some()
                 || m.declarators
                     .iter()
-                    .any(|md| self.member_dim_indices(&md.dimensions).is_some())
+                    .any(|md| {
+                        self.member_dim_indices(&self.member_dims(&m.data_type, &md.dimensions))
+                            .is_some()
+                    })
         });
         if nested_leaves {
             let mut leaves = Vec::new();
@@ -1767,7 +2020,7 @@ impl Simulator {
             locals.insert(format!("{}.", port_name), Value::zero(1));
             let widths: Vec<_> = leaves.iter().map(|l| l.2).collect();
             let pattern_vals = self
-                .eval_flat_struct_pattern(arg, leaves.len(), &widths)
+                .eval_flat_struct_pattern(&su, arg, leaves.len(), &widths)
                 .or_else(|| {
                     let keys: Vec<_> = leaves.iter().map(|l| (l.0.clone(), l.2, l.3)).collect();
                     self.struct_pattern_leaf_values(port_name, &su, arg, &keys)
@@ -1811,7 +2064,7 @@ impl Simulator {
             })
             .collect();
         let pattern_vals = self
-            .eval_flat_struct_pattern(arg, flat_names.len(), &widths)
+            .eval_flat_struct_pattern(&su, arg, flat_names.len(), &widths)
             .or_else(|| {
                 let mut keys = Vec::new();
                 for m in &su.members {
@@ -1820,7 +2073,7 @@ impl Simulator {
                         Some(&self.module.parameters),
                         Some(&self.module.typedefs),
                     );
-                    let r = super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type));
+                    let r = self.dt_is_real(&m.data_type);
                     for md in &m.declarators {
                         keys.push((format!("{}.{}", port_name, md.name.name), w, r));
                     }
@@ -1890,7 +2143,7 @@ impl Simulator {
                         } else {
                             i.to_string()
                         },
-                        cached_val: std::cell::Cell::new(None),
+                        cached_val: crate::ast::cache::LiteralCache::new(None),
                     }),
                     base.span,
                 )),
@@ -1914,8 +2167,9 @@ impl Simulator {
                     root: hier.root.clone(),
                     path,
                     span: base.span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 base.span,
             );
@@ -1947,6 +2201,10 @@ impl Simulator {
     /// class property: it keeps the plain hierarchical name, as before.
     pub(super) fn array_actual_storage(&mut self, arg: &Expression) -> Option<String> {
         use crate::ast::expr::ExprKind;
+        let arg = Self::unparen(arg);
+        if matches!(arg.kind, ExprKind::Call { .. }) {
+            return self.collection_call_actual(arg);
+        }
         let ExprKind::Ident(h) = &arg.kind else {
             // An explicit member access `c.member` / `this.member` naming an
             // unpacked-array property: evaluate the receiver to its object
@@ -1973,6 +2231,14 @@ impl Simulator {
                     .or_else(|| Some(n.into_owned()))
             }
         } else if h.path.iter().all(|s| s.selects.is_empty()) {
+            // §8.9, §8.23: `Cls::member` names the class's static collection.
+            if h.path.len() == 2
+                && self.module.classes.contains_key(&h.path[0].name.name)
+                && let Some(key) =
+                    self.class_scoped_static_coll(&h.path[0].name.name, &h.path[1].name.name)
+            {
+                return Some(key);
+            }
             // A flattened member chain `a.b.member` naming an unpacked-array
             // property. HEAD is the base object; middle segments are
             // handle-valued properties; the LAST names the collection, stored
@@ -2031,6 +2297,7 @@ impl Simulator {
         if !self.port_is_assoc_array(port) {
             return None;
         }
+        let arg = self.unpacked_pattern(arg);
         // §13.5.3 / §10.9.1: an assignment-pattern actual (a formal's default,
         // `int m[string] = '{default: 0}`) has no storage to copy from: the
         // formal starts as a fresh array holding the pattern's keyed items,
@@ -2065,6 +2332,7 @@ impl Simulator {
             if w > 0 {
                 self.widths.insert(key.clone(), w);
             }
+            self.register_formal_shape(&key, &port.dimensions);
             if matches!(arg.kind, ExprKind::AssignmentPattern(_)) {
                 self.assign_whole_coll(&key, Some(&port.data_type), arg);
             }
@@ -2078,6 +2346,9 @@ impl Simulator {
             return Some((caller.clone(), caller, prior));
         }
         let key = self.formal_dyn_key(&param, &port.data_type);
+        // §13.5.1: copied associative elements retain their packed fields.
+        self.register_packed_leaf_layout(&key, &port.data_type);
+        self.register_formal_shape(&key, &port.dimensions);
         if !matches!(port.direction, PortDirection::Output) {
             // §13.5.1: copy every element in, including unpacked-struct
             // member leaves (`caller[k].x`).
@@ -2229,6 +2500,17 @@ impl Simulator {
         }
     }
 
+    /// §13.5.1: the per-call storage key of a fixed unpacked array formal (see
+    /// `formal_dyn_key`). The element type and its packed geometry are
+    /// recorded under it as a block local array's declaration does, so an
+    /// element write fits, signs and selects like the declared type.
+    pub(super) fn array_formal_key(&mut self, port: &crate::ast::decl::FunctionPort) -> String {
+        let dt = &port.data_type;
+        let key = self.formal_dyn_key(&port.name.name, dt);
+        self.module.var_decl_types.insert(key.clone(), dt.clone());
+        key
+    }
+
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
     /// register the formal as an array so `a[i]` resolves inside the body.
     /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
@@ -2243,11 +2525,15 @@ impl Simulator {
         arg: &Expression,
     ) -> Option<(String, String, i64, i64)> {
         use crate::ast::types::UnpackedDimension as UD;
-        if port.dimensions.is_empty() {
-            return None;
-        }
+        let typedef_dims;
+        let declared_dims = if port.dimensions.is_empty() {
+            typedef_dims = self.fn_ret_coll_dims(&port.data_type)?;
+            &typedef_dims
+        } else {
+            &port.dimensions
+        };
         let dims = super::elaborate::normalize_unpacked_dims(
-            &port.dimensions,
+            declared_dims,
             &self.module.parameters,
             &self.module.typedef_types,
         );
@@ -2256,6 +2542,14 @@ impl Simulator {
         {
             return self.bind_array_arg(port, &selected);
         }
+        let arg = self.unpacked_pattern(arg);
+        // #1108: an array member of an instance-array element; #1311: an
+        // array of an interface through a virtual interface (§25.9).
+        let folded = match self.inst_array_member_canon(arg) {
+            Some(f) => Some(f),
+            None => self.vif_aggregate_canon(arg),
+        };
+        let arg = folded.as_ref().unwrap_or(arg);
         let params = Some(&self.module.parameters);
         let (lo, hi) = match dims.first()? {
             UD::Range { left, right, .. } => {
@@ -2272,6 +2566,49 @@ impl Simulator {
             }
             _ => return None,
         };
+        let descending = match dims.first() {
+            Some(UD::Range { left, right, .. }) => {
+                super::elaborate::const_eval_i64_with_params(left, params)
+                    > super::elaborate::const_eval_i64_with_params(right, params)
+            }
+            _ => false,
+        };
+        // §10.8 / §10.10: an input actual is an assignment-like context, so a
+        // concatenation passed to an unpacked array formal is an unpacked
+        // array concatenation. An array operand contributes all of its
+        // elements; there is no storage to copy back.
+        if let ExprKind::Concatenation(parts) = &Self::unparen(arg).kind {
+            if dims.len() != 1 {
+                return None;
+            }
+            let w = super::elaborate::resolve_type_width(
+                &port.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let param = self.array_formal_key(port);
+            self.module.arrays.insert(param.clone(), (lo, hi, w));
+            if descending {
+                self.module.descending_arrays.insert(param.clone());
+            }
+            if self.assign_struct_concat(&param, parts.iter().collect()) {
+                return Some((param, String::new(), lo, hi));
+            }
+            let expand_rows =
+                port.dimensions.is_empty() || !self.concat_element_type_is_array(&port.data_type);
+            let vals =
+                self.unpacked_concat_operand_values(parts.iter().collect(), expand_rows, None);
+            for (j, v) in vals.into_iter().take((hi - lo + 1) as usize).enumerate() {
+                let idx = if descending {
+                    hi - j as i64
+                } else {
+                    lo + j as i64
+                };
+                self.set_signal_value_by_name(&format!("{}[{}]", param, idx), v.resize(w));
+            }
+            return Some((param, String::new(), lo, hi));
+        }
         // §13.5.3 / §10.9.1: an assignment-pattern actual (in practice a
         // formal's default, `byte v[2] = '{8'hA5, 8'h5A}`) has no storage to
         // copy from: register the formal and assign the pattern's items to
@@ -2281,7 +2618,6 @@ impl Simulator {
             if dims.len() != 1 {
                 return None;
             }
-            let param = port.name.name.clone();
             let dt = &port.data_type;
             let w = super::elaborate::resolve_type_width(
                 dt,
@@ -2289,27 +2625,23 @@ impl Simulator {
                 Some(&self.module.typedefs),
             )
             .max(1);
-            let descending = match dims.first() {
-                Some(UD::Range { left, right, .. }) => {
-                    super::elaborate::const_eval_i64_with_params(left, params)
-                        > super::elaborate::const_eval_i64_with_params(right, params)
-                }
-                _ => false,
-            };
+            let param = self.array_formal_key(port);
             self.module.arrays.insert(param.clone(), (lo, hi, w));
-            let ordered: Vec<Expression> =
-                self.pattern_ordered(items).into_iter().cloned().collect();
-            let default = items.iter().find_map(|it| match it {
-                AssignmentPatternItem::Default(e) => Some(e.clone()),
-                _ => None,
-            });
-            for (j, idx) in (lo..=hi).enumerate() {
-                let idx = if descending { hi - (idx - lo) } else { idx };
-                let Some(e) = ordered.get(j).or(default.as_ref()) else {
-                    break;
-                };
-                let e = e.clone();
-                self.assign_pattern_or_leaf(&format!("{}[{}]", param, idx), dt, &e);
+            self.note_formal_direction(&param, descending);
+            let indices: Vec<i64> = if descending {
+                (lo..=hi).rev().collect()
+            } else {
+                (lo..=hi).collect()
+            };
+            let elems: Vec<Option<Expression>> = self
+                .pattern_elems_for_type(items, &indices, dt)
+                .into_iter()
+                .map(|o| o.cloned())
+                .collect();
+            for (idx, item) in indices.into_iter().zip(elems) {
+                if let Some(e) = item {
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", param, idx), dt, &e);
+                }
             }
             return Some((param, String::new(), lo, hi));
         }
@@ -2319,7 +2651,34 @@ impl Simulator {
         // `this.member` / `a.b.member` (handled by `array_actual_storage`;
         // a fixed-array property actual `parity_bytes` previously returned
         // None here, dropping the writeback).
+        // §7.4.6, §13.5: a slice actual of a one-dimensional formal is copied
+        // in, and back for an `output`, `inout` or `ref` formal, element by
+        // element left to right (#867).
+        if dims.len() == 1 {
+            let desc = match dims.first() {
+                Some(UD::Range { left, right, .. }) => {
+                    super::elaborate::const_eval_i64_with_params(left, params)
+                        > super::elaborate::const_eval_i64_with_params(right, params)
+                }
+                _ => false,
+            };
+            if let Some(bound) = self.bind_slice_array_arg(port, arg, lo, hi, desc) {
+                return Some(bound);
+            }
+        }
         let caller = self.array_actual_storage(arg)?;
+        // §13.5.2: a `ref` formal is an ALIAS of the actual's storage: the
+        // formal's name maps to the actual's key, so every read and write
+        // goes to the caller's array while the call runs and nothing is
+        // copied back.
+        if matches!(port.direction, PortDirection::Ref)
+            && (self.module.arrays.contains_key(&*caller)
+                || self.module.arrays_2d.contains_key(&*caller)
+                || self.module.arrays_nd.contains_key(&*caller))
+        {
+            self.map_formal_dyn(&port.name.name, &caller);
+            return Some((caller, String::new(), lo, hi));
+        }
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
         // every element of the caller's array in under the formal's name and
         // register the same shape, so element, `foreach`, `%p`, `$size` and
@@ -2327,21 +2686,35 @@ impl Simulator {
         // copy back through `writeback_array_args`. Only the first dimension
         // was handled before: a 2-D formal read x and never wrote back.
         if dims.len() >= 2 {
-            let param = port.name.name.clone();
-            let suffixes =
-                if let Some(&((a0, a1), (b0, b1), w)) = self.module.arrays_2d.get(&*caller) {
-                    self.module
-                        .arrays_2d
-                        .insert(param.clone(), ((a0, a1), (b0, b1), w));
-                    Self::nd_elem_suffixes(&[(a0, a1), (b0, b1)])
-                } else if let Some((shape, w)) = self.module.arrays_nd.get(&*caller).cloned() {
-                    self.module
-                        .arrays_nd
-                        .insert(param.clone(), (shape.clone(), w));
-                    Self::nd_elem_suffixes(&shape)
-                } else {
-                    return None;
-                };
+            if !self.module.arrays_2d.contains_key(&*caller)
+                && !self.module.arrays_nd.contains_key(&*caller)
+            {
+                return None;
+            }
+            let param = self.array_formal_key(port);
+            let callers = self.nd_formal_suffixes(&caller)?;
+            let declared = self.declared_fixed_dims(&dims)?;
+            let numeric: Vec<_> = declared
+                .iter()
+                .map(|&(l, r)| (l.min(r), l.max(r)))
+                .collect();
+            let suffixes = Self::nd_elem_suffixes(&declared);
+            let w = self
+                .module
+                .arrays_2d
+                .get(&*caller)
+                .map(|s| s.2)
+                .or_else(|| self.module.arrays_nd.get(&*caller).map(|s| s.1))?;
+            if numeric.len() == 2 {
+                self.module
+                    .arrays_2d
+                    .insert(param.clone(), (numeric[0], numeric[1], w));
+            } else {
+                self.module.arrays_nd.insert(param.clone(), (numeric, w));
+            }
+            self.module
+                .unpacked_decl_dims
+                .insert(param.clone(), declared);
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
                 let w = match self.module.arrays_2d.get(&param) {
@@ -2349,10 +2722,30 @@ impl Simulator {
                     None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
                 };
                 let out_default = self.output_formal_elem_default(port, w);
-                for sfx in &suffixes {
+                // §7.2, §13.5.1: an element of an unpacked-struct array is
+                // its member leaves, as in the one-dimensional case below.
+                let elem_su = self
+                    .p_elem_type(&caller)
+                    .or_else(|| self.p_elem_type(&param))
+                    .and_then(|dt| self.unpacked_struct_of(&dt));
+                for (sfx, src) in suffixes.iter().zip(&callers) {
+                    if let Some(su) = &elem_su {
+                        let d = format!("{}{}", param, sfx);
+                        if out_default.is_some() {
+                            let mut leaves = Vec::new();
+                            self.unpacked_struct_leaf_defaults(&d, su, 0, &mut leaves);
+                            for (k, dv, _) in leaves {
+                                self.signals.insert(k, dv);
+                            }
+                        } else {
+                            let s = format!("{}{}", caller, src);
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                        }
+                        continue;
+                    }
                     let v = match &out_default {
                         Some(d) => Some(d.clone()),
-                        None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
+                        None => self.get_signal_value_by_name(&format!("{}{}", caller, src)),
                     };
                     if let Some(v) = v {
                         self.signals.insert(format!("{}{}", param, sfx), v);
@@ -2364,7 +2757,7 @@ impl Simulator {
         if !self.module.arrays.contains_key(&*caller) {
             return None;
         }
-        let param = port.name.name.clone();
+        let param = self.array_formal_key(port);
         // §7.2: an element of an UNPACKED-struct array is a set of member
         // leaves. Copying `a[i]` alone brought nothing across, so a
         // `pkt_t arr[3]` formal read zero from every member.
@@ -2402,7 +2795,20 @@ impl Simulator {
             }
         }
         self.module.arrays.insert(param.clone(), (lo, hi, w));
+        // §7.6: a store to a descending formal (`output int o[5:3]`) starts
+        // at its left bound, as for any other descending array.
+        self.note_formal_direction(&param, descending);
         Some((param, caller.to_string(), lo, hi))
+    }
+
+    /// Record whether the one-dimensional array formal `param` is declared
+    /// descending, for the stores of the body (§7.6).
+    fn note_formal_direction(&mut self, param: &str, descending: bool) {
+        if descending {
+            self.module.descending_arrays.insert(param.to_string());
+        } else {
+            self.module.descending_arrays.remove(param);
+        }
     }
 
     /// §13.5.1: an `output` formal is not copied in: it starts at its type's
@@ -2429,7 +2835,7 @@ impl Simulator {
         ) {
             return Some(Value::from_string(""));
         }
-        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+        if self.dt_is_real(dt) {
             return Some(Value::from_f64(0.0));
         }
         if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {
@@ -2448,7 +2854,8 @@ impl Simulator {
             let (lo, hi) = (d0.min(d1), d0.max(d1));
             let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
             for prefix in &out {
-                for i in lo..=hi {
+                for offset in 0..=(hi - lo) {
+                    let i = if d0 > d1 { d0 - offset } else { d0 + offset };
                     next.push(format!("{}[{}]", prefix, i));
                 }
             }
@@ -2457,13 +2864,46 @@ impl Simulator {
         out
     }
 
+    /// §7.6: storage bounds are normalized; positional operations start at the
+    /// declared left bound of each remaining dimension.
+    pub(super) fn nd_ordered_suffixes(
+        &self,
+        name: &str,
+        shape: &[(i64, i64)],
+        skip: usize,
+    ) -> Vec<String> {
+        let declared = self.unpacked_decl_dims_of(name);
+        let ordered = declared
+            .as_deref()
+            .filter(|dims| dims.len() == shape.len())
+            .unwrap_or(shape);
+        Self::nd_elem_suffixes(&ordered[skip..])
+    }
+
+    pub(super) fn declared_fixed_dims(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as D;
+        let bound = |e: &Expression| {
+            super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+        };
+        dims.iter()
+            .map(|dim| match dim {
+                D::Range { left, right, .. } => Some((bound(left)?, bound(right)?)),
+                D::Expression { expr, .. } => Some((0, bound(expr)? - 1)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Element suffixes of a name registered as a multi-dimensional array.
     pub(super) fn nd_formal_suffixes(&self, name: &str) -> Option<Vec<String>> {
         if let Some(&(a, b, _)) = self.module.arrays_2d.get(name) {
-            return Some(Self::nd_elem_suffixes(&[a, b]));
+            return Some(self.nd_ordered_suffixes(name, &[a, b], 0));
         }
         if let Some((shape, _)) = self.module.arrays_nd.get(name) {
-            return Some(Self::nd_elem_suffixes(shape));
+            return Some(self.nd_ordered_suffixes(name, shape, 0));
         }
         None
     }
@@ -2495,6 +2935,7 @@ impl Simulator {
         if self.module.arrays_2d.remove(param).is_some()
             | self.module.arrays_nd.remove(param).is_some()
         {
+            self.module.unpacked_decl_dims.remove(param);
             self.multi_dim_array_names.remove(param);
         }
     }
@@ -2561,20 +3002,20 @@ impl Simulator {
                     _ => return None,
                 };
                 let rest: Vec<(i64, i64)> =
-                    if let Some(&(_, b, _)) = self.module.arrays_2d.get(&*name) {
-                        vec![b]
+                    if let Some(&(a, b, _)) = self.module.arrays_2d.get(&*name) {
+                        vec![a, b]
                     } else if let Some((shape, _)) = self.module.arrays_nd.get(&*name) {
                         if shape.len() < 2 {
                             return None;
                         }
-                        shape[1..].to_vec()
+                        shape.clone()
                     } else {
                         return None;
                     };
                 let i = self.eval_expr(index).to_i64()?;
                 Some((
                     format!("{}[{}]", name, i),
-                    Self::nd_elem_suffixes(&rest),
+                    self.nd_ordered_suffixes(&name, &rest, 1),
                     true,
                 ))
             }
@@ -2618,7 +3059,20 @@ impl Simulator {
         if !(l_nd || r_nd) || (lbase == rbase && lsfx == rsfx) {
             return false;
         }
+        // §7.2: an element of an unpacked-struct array is its member leaves.
+        let elem_su = self
+            .nd_elem_struct(&rbase)
+            .or_else(|| self.nd_elem_struct(&lbase))
+            .or_else(|| {
+                self.p_elem_type(&rbase)
+                    .and_then(|dt| self.unpacked_struct_of(&dt))
+            });
         for (ls, rs) in lsfx.iter().zip(rsfx.iter()) {
+            if let Some(su) = &elem_su {
+                let (d, s) = (format!("{}{}", lbase, ls), format!("{}{}", rbase, rs));
+                self.copy_unpacked_struct(&d, &s, &su.clone());
+                continue;
+            }
             let v = self
                 .get_signal_value_by_name(&format!("{}{}", rbase, rs))
                 .unwrap_or_else(|| Value::zero(32));
@@ -2627,14 +3081,80 @@ impl Simulator {
         true
     }
 
+    /// Copy each `output`/`inout`/`ref` array formal's per-call storage onto
+    /// a fresh key while the call's frame is still live (popping it tears
+    /// the formal's key down), and retarget the writeback at that copy. The
+    /// copy is applied after the caller's shadowed storage is restored, so a
+    /// same-named callee local cannot wipe it (see `stage_queue_param`).
+    pub(super) fn stage_array_writebacks(
+        &mut self,
+        wb: &[(String, String, i64, i64)],
+    ) -> Vec<(String, String, i64, i64)> {
+        let mut staged = Vec::with_capacity(wb.len());
+        for (param, caller, lo, hi) in wb {
+            let bare = param
+                .strip_prefix('@')
+                .and_then(|s| s.rsplit_once('#'))
+                .map_or(param.as_str(), |(b, _)| b);
+            let id = self.next_dyn_id;
+            self.next_dyn_id += 1;
+            let tmp = format!("@{}#{}", bare, id);
+            let moved: Vec<(String, Value)> = self
+                .signals
+                .keys_with_elem_prefix(&format!("{}[", param))
+                .into_iter()
+                .filter_map(|k| {
+                    let v = self.signals.get(&k)?.clone();
+                    Some((format!("{}{}", tmp, &k[param.len()..]), v))
+                })
+                .collect();
+            for (k, v) in moved {
+                self.signals.insert(k, v);
+            }
+            if let Some(shape) = self.module.arrays.get(param).copied() {
+                self.module.arrays.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_2d.get(param).copied() {
+                self.module.arrays_2d.insert(tmp.clone(), shape);
+            }
+            if let Some(shape) = self.module.arrays_nd.get(param).cloned() {
+                self.module.arrays_nd.insert(tmp.clone(), shape);
+            }
+            if let Some(bounds) = self.module.unpacked_decl_dims.get(param).cloned() {
+                self.module.unpacked_decl_dims.insert(tmp.clone(), bounds);
+            }
+            if self.multi_dim_array_names.contains(param) {
+                self.multi_dim_array_names.insert(tmp.clone());
+            }
+            staged.push((tmp, caller.clone(), *lo, *hi));
+        }
+        staged
+    }
+
     pub(super) fn writeback_array_args(&mut self, wb: &[(String, String, i64, i64)]) {
         for (param, caller, lo, hi) in wb {
+            if self.writeback_slice_arg(param, caller) {
+                continue;
+            }
             if let Some(sfxs) = self.nd_formal_suffixes(param) {
                 if param != caller {
-                    for sfx in sfxs {
+                    let elem_su = self
+                        .p_elem_type(param)
+                        .or_else(|| self.p_elem_type(caller))
+                        .and_then(|dt| self.unpacked_struct_of(&dt));
+                    let Some(destinations) = self.nd_formal_suffixes(caller) else {
+                        continue;
+                    };
+                    for (sfx, dst) in sfxs.iter().zip(destinations) {
+                        if let Some(su) = &elem_su {
+                            let (d, s) =
+                                (format!("{}{}", caller, dst), format!("{}{}", param, sfx));
+                            self.copy_unpacked_struct(&d, &s, &su.clone());
+                            continue;
+                        }
                         if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
-                            self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
+                            self.set_signal_value_by_name(&format!("{}{}", caller, dst), v);
                         }
                     }
                 }
@@ -2684,7 +3204,9 @@ impl Simulator {
         let d = port.default.as_ref()?;
         (matches!(
             d.kind,
-            ExprKind::AssignmentPattern(_) | ExprKind::Concatenation(_)
+            ExprKind::AssignmentPattern(_)
+                | ExprKind::TypedPattern { .. }
+                | ExprKind::Concatenation(_)
         ) || !port.dimensions.is_empty()
             || matches!(port.direction, PortDirection::Output | PortDirection::Inout))
         .then_some(d)
@@ -2812,7 +3334,7 @@ impl Simulator {
                     signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: "0".to_string(),
-                    cached_val: std::cell::Cell::new(None),
+                    cached_val: crate::ast::cache::LiteralCache::new(None),
                 }),
                 crate::ast::Span::dummy(),
             )
@@ -2967,7 +3489,7 @@ impl Simulator {
                     signed: true,
                     base: NumberBase::Decimal,
                     value: n.to_string(),
-                    cached_val: Cell::new(Some((n as u64, 0u64, 64u32))),
+                    cached_val: crate::ast::cache::LiteralCache::new(Some((n as u64, 0u64, 64u32))),
                 }),
                 x.span,
             ))
@@ -3172,7 +3694,8 @@ impl Simulator {
     pub(super) fn collect_decl_names(stmts: &[Statement], out: &mut HashSet<String>) {
         for st in stmts {
             match &st.kind {
-                StatementKind::VarDecl { declarators, .. } => {
+                StatementKind::VarDecl { declarators, .. }
+                | StatementKind::ParamDecl { declarators, .. } => {
                     for d in declarators {
                         out.insert(d.name.name.clone());
                     }
@@ -3216,7 +3739,9 @@ impl Simulator {
                 lifetime: Some(crate::ast::types::Lifetime::Static),
                 ..
             } => false,
-            StatementKind::Null | StatementKind::VarDecl { .. } => true,
+            StatementKind::Null
+            | StatementKind::VarDecl { .. }
+            | StatementKind::ParamDecl { .. } => true,
             StatementKind::Break | StatementKind::Continue => true,
             StatementKind::Return(e) => e.as_ref().is_none_or(|e| self.expr_is_pure(e, locals)),
             StatementKind::BlockingAssign { lvalue, rvalue } => {

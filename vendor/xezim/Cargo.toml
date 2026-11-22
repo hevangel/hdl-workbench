@@ -1,9 +1,9 @@
 [package]
 name = "xezim"
-version = "0.11.4"
+version = "0.11.7"
 build = "src/build.rs"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.100"
 description = "SystemVerilog bytecode interpreter (IEEE 1800-2023, with --sv2017 opt-out)."
 license = "MIT OR Apache-2.0"
 
@@ -33,6 +33,9 @@ cranelift-jit = { version = "0.131", optional = true }
 cranelift-module = { version = "0.131", optional = true }
 cranelift-native = { version = "0.131", optional = true }
 fst-writer = "0.3"
+# Checkpoint files (`$save`, `--save-at`). Same version xezim-core compresses
+# artifacts with, so no second copy is built.
+zstd = "0.14"
 # Inflate only, for the FST time-table repair in `fst_finish`. Already in the
 # tree via fst-writer, so this adds no build cost.
 miniz_oxide = "0.8"
@@ -70,16 +73,13 @@ web-time = "1"
 corosensei = { version = "0.3", default-features = false }
 
 [dev-dependencies]
+serde_json = "1"
 # `tests/gates/fst_roundtrip.rs` DECODES the FST dumps this crate writes, to
 # check var types, widths, aliases, values and the trailer's end_time. An FST
 # is block-compressed, so byte-level assertions cannot see any of that — and
 # shelling out to GTKWave's `fst2vcd` would put a system tool on the test path.
 # Reader half of the `fst-writer` above, same author and format revision.
 fst-reader = "0.17"
-# `tests/xtrace_conformance.rs` reads a zstd-compressed XTrace dump back to
-# check that its header declares the compression (XTrace §6.8). Same version
-# xezim-core writes the stream with.
-zstd = "0.14"
 
 [build-dependencies]
 cc = "1"

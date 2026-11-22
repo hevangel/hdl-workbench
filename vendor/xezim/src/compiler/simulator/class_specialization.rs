@@ -159,8 +159,9 @@ impl Simulator {
                         selects: Vec::new(),
                     }],
                     span: crate::ast::Span::dummy(),
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+                    cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                    cached_resolved_name: crate::ast::cache::NameCache::new(),
+                    bound: crate::ast::binding::Bound::UNSET,
                 }),
                 crate::ast::Span::dummy(),
             )
@@ -639,17 +640,18 @@ impl Simulator {
     }
 
     /// `(iface, modport)` of a specialization fragment spelling a virtual
-    /// interface type (`virtual bus_if`, `virtual I#(8).mp`, or the
-    /// `normalize_spec_ws` form `virtualbus_if`), else `None`.
+    /// interface type (`virtual bus_if`, `virtual I#(8).mp`), else `None`.
     fn vif_of_spec_frag(&self, frag: &str) -> Option<(String, Option<String>)> {
         let rest = frag.strip_prefix("virtual")?;
-        let spaced = rest.starts_with(char::is_whitespace);
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
         let rest = rest.trim();
         let end = rest
             .find(|c: char| c == '#' || c == '.' || c.is_whitespace())
             .unwrap_or(rest.len());
         let (name, tail) = rest.split_at(end);
-        if name.is_empty() || (!spaced && !self.module.interfaces.contains(name)) {
+        if name.is_empty() {
             return None;
         }
         let tail = match tail.rfind(')') {
@@ -799,6 +801,8 @@ impl Simulator {
             .insert(name.clone(), base.to_string());
         self.class_member_names_cell = std::cell::OnceCell::new();
         self.compiled_method_admission = None;
+        self.class_handle_member_types_cache = None;
+        self.class_scoped_enum_cache = None;
         self.persisted_method_context_hash = None;
         self.module.classes.get(&name).cloned()
     }
@@ -911,6 +915,8 @@ impl Simulator {
         // A newly materialized inheritance chain changes compile-time facts
         // and the design context used by subsequent persistent cache probes.
         self.compiled_method_admission = None;
+        self.class_handle_member_types_cache = None;
+        self.class_scoped_enum_cache = None;
         self.persisted_method_context_hash = None;
         self.spec_clone_origin
             .insert(name.clone(), cname.to_string());
@@ -1228,9 +1234,17 @@ impl Simulator {
                         .iter()
                         .filter(|(p, _)| !cd.virtual_iface_properties.contains_key(p.as_str()))
                         .filter_map(|(p, dt)| {
-                            if !matches!(dt, DataType::TypeReference { .. }) {
+                            let DataType::TypeReference { name, .. } = dt else {
                                 return None;
-                            }
+                            };
+                            // §8.23: through a class scope (`cfg_t::vif_t pv;`)
+                            // the typedef is the scope's class's, not a
+                            // same-named bare one.
+                            let dt = if name.scopes.is_empty() {
+                                dt
+                            } else {
+                                self.class_scope_typedef_target(name).unwrap_or(dt)
+                            };
                             match Self::resolve_type_ref(dt, &self.module.typedef_types) {
                                 DataType::Interface { name, modport, .. } => {
                                     Some((p.clone(), (name.name.clone(), modport.map(|m| m.name))))
@@ -1504,7 +1518,7 @@ impl Simulator {
     ) -> Option<Value> {
         let cd = self.get_class_def(cname)?;
         let tn = cd.properties.get(prop)?.type_name.clone()?;
-        if let Some(kind) = Self::container_base(&tn) {
+        if let Some(kind) = self.builtin_container_kind(&tn) {
             let h = self.alloc_builtin_container(kind, args);
             return Some(Value::from_u64(h as u64, 32));
         }
@@ -1516,6 +1530,7 @@ impl Simulator {
                 span: crate::ast::Span::dummy(),
             },
             span: crate::ast::Span::dummy(),
+            bound: Default::default(),
         };
         let (base, mut type_args) = if let Some((base, sig)) = self.extract_spec_from_string(&tn) {
             let args = Self::split_spec_args(&sig)
@@ -1880,6 +1895,18 @@ impl Simulator {
 
     pub(super) fn canonicalize_spec_frag(&self, frag: &str) -> String {
         let frag_norm = frag.trim();
+        // §8.25, §23.10: a type argument naming the instance's parameters
+        // (`logic [u6.TW-1:0]`, see `subst_instance_params`).
+        if frag_norm.contains('.')
+            && let Some(sub) = self.subst_instance_params(frag_norm)
+        {
+            return self.canonicalize_spec_frag(&sub);
+        }
+        // §8.25, §6.20: a vector type argument's range is a constant
+        // expression (`logic [6-1:0]` is `logic [5:0]`).
+        if let Some(folded) = self.fold_vector_frag_ranges(frag_norm) {
+            return self.canonicalize_spec_frag(&folded);
+        }
         // §6.22.1: `pkg::T` and the imported `T` are one type, so they
         // key one specialization.
         if let Some(leaf) = self.package_type_leaf(frag_norm) {
@@ -1952,12 +1979,13 @@ impl Simulator {
     /// distinct declaring name and remains a separate specialization.
     /// The class a plain type-argument fragment names. A direct key hit
     /// first; a `pkg::A::B` that is not a key falls back to `A::B`. The
-    /// pkg_scope collision pass renames a nested class whose leaf name is
-    /// declared in several packages to the mangled `A::B` (registered
-    /// under `A::B`, `A::A::B` and `pkg::A::A::B`), so a source spelling
-    /// that kept the unmangled `pkg::A::B` form misses the direct lookup
-    /// although the stripped form is one of its registered aliases.
-    fn class_arc_for_frag(&self, frag: &str) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
+    /// package collision pass can qualify the nested declaration itself.
+    /// Older compiled artifacts also carry duplicated enclosing-name aliases;
+    /// stripping the package keeps their original source spellings resolvable.
+    fn class_arc_for_frag(
+        &self,
+        frag: &str,
+    ) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
         if let Some(arc) = self.module.classes.get(frag) {
             return Some(arc.clone());
         }
@@ -1981,10 +2009,38 @@ impl Simulator {
             return None;
         }
         let arc = self.class_arc_for_frag(frag)?;
-        let declared = match &arc.enclosing {
-            Some(outer) => format!("{}::{}", outer, arc.name),
+        let mut declared = match &arc.enclosing {
+            Some(outer) => {
+                // §8.23 (#842): pkg_scope may already have qualified the
+                // declaration as Outer::Inner. Join only the missing prefix,
+                // exactly as the elaborator registers its class aliases.
+                let includes = |scope: &str| {
+                    arc.name == scope
+                        || arc
+                            .name
+                            .strip_prefix(scope)
+                            .is_some_and(|s| s.starts_with("::"))
+                };
+                if includes(outer) {
+                    arc.name.clone()
+                } else if let Some((at, _)) = outer
+                    .match_indices("::")
+                    .find(|(at, _)| includes(&outer[at + 2..]))
+                {
+                    format!("{}::{}", &outer[..at], arc.name)
+                } else {
+                    format!("{}::{}", outer, arc.name)
+                }
+            }
             None => arc.name.clone(),
         };
+        // Pre-#842 artifacts can retain only the duplicated declaring alias.
+        // Keep those aliases canonical with one another when decoding them.
+        if !self.module.classes.contains_key(&declared)
+            && let Some(outer) = &arc.enclosing
+        {
+            declared = format!("{}::{}", outer, arc.name);
+        }
         if declared == frag {
             return None; // already the declaring spelling
         }
@@ -2013,6 +2069,168 @@ impl Simulator {
         a.name == b.name && a.enclosing == b.enclosing && a.declaring_module == b.declaring_module
     }
 
+    /// §8.25: only parameters in the lexical class scope can shadow a module
+    /// constant. An unrelated class declaring the same name has no effect.
+    fn class_parameter_owner(&self, name: &str) -> Option<&str> {
+        let Some(Some(context)) = self.class_context_stack.last() else {
+            return None;
+        };
+        // Rule out ordinary type names before walking class scopes. A match
+        // in this global index still requires the lexical lookup below.
+        let names = self.class_member_names();
+        if !names.params.contains(name) && !names.static_or_param.contains(name) {
+            return None;
+        }
+        self.class_parameter_scopes(context)
+            .into_iter()
+            .find(|class| {
+                self.module.classes.get(*class).is_some_and(|definition| {
+                    definition.param_order.iter().any(|n| n == name)
+                        || definition.type_param_names.iter().any(|n| n == name)
+                        || definition.param_defaults.iter().any(|(n, _)| n == name)
+                })
+            })
+    }
+
+    fn class_parameter_scopes<'a>(&'a self, context: &'a str) -> Vec<&'a str> {
+        let mut pending = vec![(context, true)];
+        let mut seen = Vec::new();
+        let mut scopes = Vec::new();
+        while let Some((class, lexical)) = pending.pop() {
+            if seen.contains(&(class, lexical)) {
+                continue;
+            }
+            seen.push((class, lexical));
+            let Some(definition) = self.module.classes.get(class) else {
+                continue;
+            };
+            if !scopes.contains(&class) {
+                scopes.push(class);
+            }
+            // An ancestor's enclosing class is not itself inherited scope.
+            if lexical && let Some(enclosing) = definition.enclosing.as_deref() {
+                pending.push((enclosing, true));
+            }
+            if let Some(parent) = definition.extends.as_deref() {
+                pending.push((parent, false));
+            }
+        }
+        scopes
+    }
+
+    fn class_parameter_value(&self, owner: &str, name: &str) -> Option<Value> {
+        let definition = self.module.classes.get(owner)?;
+        if definition.type_param_names.iter().any(|n| n == name) {
+            return None;
+        }
+        let lexical = self.lexical_value_spec();
+        let signature = |class: &str| match &lexical {
+            Some((base, sig)) if base == class => sig.clone(),
+            Some((base, sig)) => self.ancestor_spec(base, sig, class).unwrap_or_default(),
+            None => String::new(),
+        };
+        let number = |fragment: &str| {
+            let (negative, body) = match fragment.trim().strip_prefix('-') {
+                Some(body) => (true, body),
+                None => (false, fragment.trim()),
+            };
+            let mut value = self.eval_number(&Self::parse_spec_number(body)?);
+            if negative {
+                value.is_signed = true;
+                value = value.negate();
+            }
+            Some(value)
+        };
+        let arguments = Self::split_spec_args(&signature(owner));
+        if let Some(index) = definition.param_order.iter().position(|n| n == name)
+            && let Some(argument) = arguments.get(index).filter(|a| !a.trim().is_empty())
+        {
+            return number(argument);
+        }
+        if let Some((_, Some(initializer))) =
+            definition.param_defaults.iter().find(|(n, _)| n == name)
+            && let ExprKind::Number(number) = &initializer.kind
+        {
+            return Some(self.eval_number(number));
+        }
+
+        // A body localparam uses its declaring class's values, including the
+        // concrete arguments of inherited parameters. Remove shadowed module
+        // names before evaluating defaults, so a missing class binding cannot
+        // silently turn into a module constant.
+        let mut parameters = HashMap::default();
+        let mut module_parameters_seeded = false;
+        let mut scopes = self.class_parameter_scopes(owner);
+        scopes.reverse();
+        for class in scopes {
+            let definition = self.module.classes.get(class)?;
+            let arguments = Self::split_spec_args(&signature(class));
+            for parameter in &definition.type_param_names {
+                parameters.remove(parameter);
+            }
+            for (parameter, _) in &definition.param_defaults {
+                parameters.remove(parameter);
+            }
+            let mut supplied = Vec::new();
+            for (index, parameter) in definition.param_order.iter().enumerate() {
+                if let Some(argument) = arguments.get(index).filter(|a| !a.trim().is_empty()) {
+                    supplied.push(parameter.as_str());
+                    if let Some(value) = number(argument) {
+                        parameters.insert(parameter.clone(), value);
+                    }
+                }
+            }
+            for _ in 0..definition.param_defaults.len() {
+                let mut changed = false;
+                for (parameter, initializer) in &definition.param_defaults {
+                    if supplied.contains(&parameter.as_str()) || parameters.contains_key(parameter)
+                    {
+                        continue;
+                    }
+                    let Some(initializer) = initializer else {
+                        continue;
+                    };
+                    let mut value = super::elaborate::const_eval_i64_with_params(
+                        initializer,
+                        Some(&parameters),
+                    );
+                    if value.is_none() && !module_parameters_seeded {
+                        // Header bindings and ordinary class-local defaults
+                        // need only the small overlay above. Copy the module
+                        // table only when a default actually needs its scope.
+                        let class_values = std::mem::take(&mut parameters);
+                        parameters = self.module.parameters.clone();
+                        for scope in self.class_parameter_scopes(class) {
+                            let definition = self.module.classes.get(scope)?;
+                            for parameter in &definition.type_param_names {
+                                parameters.remove(parameter);
+                            }
+                            for (parameter, _) in &definition.param_defaults {
+                                parameters.remove(parameter);
+                            }
+                        }
+                        parameters.extend(class_values);
+                        module_parameters_seeded = true;
+                        value = super::elaborate::const_eval_i64_with_params(
+                            initializer,
+                            Some(&parameters),
+                        );
+                    }
+                    if let Some(value) = value {
+                        let mut value = Value::from_u64(value as u64, 64);
+                        value.is_signed = true;
+                        parameters.insert(parameter.clone(), value);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        parameters.get(name).cloned()
+    }
+
     /// §8.25: specializations match when their value arguments have the SAME
     /// VALUE, however written: `P#(2+2)`, `P#('h4)` and `P#(4)` are one
     /// specialization with one set of statics. The decimal value of a
@@ -2023,6 +2241,14 @@ impl Simulator {
     /// as part of its type, so `Q#(4'd4)` is not `Q#(4)`. Memoized: keys are
     /// canonicalized at run time.
     pub(super) fn fold_const_spec_frag(&self, frag: &str, typed: bool) -> Option<String> {
+        // §8.25, §23.10: elaboration qualifies a module instance's own
+        // parameters in the arguments it writes (`g#(u6.PW * 2)`); each
+        // stands for that instance's value.
+        if frag.contains('.')
+            && let Some(sub) = self.subst_instance_params(frag)
+        {
+            return self.fold_const_spec_frag(&sub, typed).or(Some(sub));
+        }
         let b = frag.as_bytes();
         let first = *b.first()?;
         let ident_start = first.is_ascii_alphabetic() || first == b'_';
@@ -2036,12 +2262,14 @@ impl Simulator {
         // a type, class, or enum name keeps its spelling. Its value depends
         // on the scope, so it is not memoized.
         if ident_start && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_') {
+            // An untyped parameter retains its actual's type, including the
+            // literal width and signedness carried by the caller's binding.
+            if !typed && self.class_parameter_owner(frag).is_some() {
+                return self.enclosing_value_param_fragment(frag);
+            }
             // `scoped_param_value` tests the parameter leaf names first: the
             // common type / class name costs one probe.
             let v = self.scoped_param_value(frag)?;
-            if self.class_member_names().params.contains(frag) {
-                return None;
-            }
             return v.to_i64().map(|n| n.to_string());
         }
         // A package parameter named through its package (`P#(pkg::W)`) is
@@ -2094,8 +2322,15 @@ impl Simulator {
                 }
             }
         }
-        // A text naming parameters folds per scope: memoize it under the
-        // scope it was folded in.
+        // Class value parameters must be bound before the signature enters a
+        // different callee's scope. Named class expressions are not memoized:
+        // instances of the same lexical class can have different bindings.
+        // Literal-only expressions remain context-independent and cached.
+        if b.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_')
+            && matches!(self.class_context_stack.last(), Some(Some(_)))
+        {
+            return self.fold_const_spec_text(frag);
+        }
         let key = if b.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_') {
             let scope = self.name_resolve_hint.borrow().clone().unwrap_or_default();
             format!("{}|{}", scope, frag)
@@ -2112,10 +2347,86 @@ impl Simulator {
         folded
     }
 
-    /// The value of design parameter `name` as seen from the executing scope:
-    /// the top's own (bare key), else the nearest enclosing instance's
-    /// (`scope.name`, walking the resolve hint outward).
+    /// A `bit`/`logic`/`reg` vector fragment whose packed range bounds are
+    /// constant expressions, with each bound folded to a decimal; None when
+    /// every bound is already a number or one does not fold.
+    fn fold_vector_frag_ranges(&self, frag: &str) -> Option<String> {
+        let kw = ["bit", "logic", "reg"]
+            .into_iter()
+            .find(|k| frag.starts_with(k))?;
+        let open = frag.find('[')?;
+        let head = &frag[..open];
+        if head[kw.len()..]
+            .trim()
+            .split_whitespace()
+            .any(|w| !matches!(w, "signed" | "unsigned"))
+        {
+            return None;
+        }
+        let mut out = head.to_string();
+        let mut rest = &frag[open..];
+        let mut changed = false;
+        while let Some(body) = rest.strip_prefix('[') {
+            let close = body.find(']')?;
+            let (l, r) = body[..close].split_once(':')?;
+            let mut bound = |t: &str| -> Option<String> {
+                let t = t.trim();
+                if t.parse::<i64>().is_ok() {
+                    return Some(t.to_string());
+                }
+                changed = true;
+                self.fold_const_spec_text(t)
+            };
+            let (l, r) = (bound(l)?, bound(r)?);
+            out.push_str(&format!("[{l}:{r}]"));
+            rest = body[close + 1..].trim_start();
+        }
+        (rest.is_empty() && changed).then_some(out)
+    }
+
+    /// `frag` with every instance-qualified parameter name (`u6.PW`, the
+    /// spelling elaboration gives a module instance's own parameter inside a
+    /// specialization's arguments) replaced by its decimal value; None when
+    /// it names none.
+    fn subst_instance_params(&self, frag: &str) -> Option<String> {
+        let b = frag.as_bytes();
+        let name_char = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+        let mut out = String::with_capacity(frag.len());
+        let mut hit = false;
+        let mut i = 0;
+        while i < b.len() {
+            let start = i;
+            if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                while i < b.len() && (name_char(b[i]) || (b[i] == b'.' && i + 1 < b.len())) {
+                    i += 1;
+                }
+                let name = &frag[start..i];
+                if name.contains('.')
+                    && let Some(v) = self.module.parameters.get(name).and_then(|v| v.to_i64())
+                {
+                    out.push_str(&v.to_string());
+                    hit = true;
+                    continue;
+                }
+            } else if b[i].is_ascii_digit() || b[i] == b'\'' {
+                i += 1;
+                while i < b.len() && (name_char(b[i]) || b[i] == b'\'') {
+                    i += 1;
+                }
+            } else {
+                i += frag[i..].chars().next().map_or(1, char::len_utf8);
+            }
+            out.push_str(&frag[start..i]);
+        }
+        hit.then_some(out)
+    }
+
+    /// The parameter value in the executing lexical scope: a class parameter
+    /// first, otherwise the module constant resolved through its instance.
     pub(super) fn scoped_param_value(&self, name: &str) -> Option<Value> {
+        if let Some(owner) = self.class_parameter_owner(name) {
+            return self.class_parameter_value(owner, name);
+        }
         let leaves = self.param_leaf_names.get_or_init(|| {
             self.module
                 .parameters
@@ -2143,9 +2454,7 @@ impl Simulator {
     #[inline(never)]
     pub(super) fn fold_const_spec_text(&self, text: &str) -> Option<String> {
         use crate::ast::decl::{ModuleItem, ParameterKind};
-        // Literals, operators, and design parameters no class declares (a
-        // class's own parameter of the same name would shadow it).
-        let names = self.class_member_names();
+        // Literals, operators, and parameters in the executing lexical scope.
         let literal_only = |e: &Expression| -> bool {
             fn walk(e: &Expression, ok_name: &dyn Fn(&str) -> bool) -> bool {
                 match &e.kind {
@@ -2172,7 +2481,7 @@ impl Simulator {
             }
             walk(e, &|n: &str| match self.package_param_key(n) {
                 Some(key) => self.module.parameters.contains_key(key),
-                None => !names.params.contains(n) && self.scoped_param_value(n).is_some(),
+                None => self.scoped_param_value(n).is_some(),
             })
         };
         // `W`, or `pkg::W` (an identifier path or, in some contexts, a
@@ -2272,6 +2581,35 @@ impl Simulator {
     pub(super) fn fold_package_const_expr(&self, e: &Expression) -> Option<String> {
         let mut ptab: HashMap<String, Value> = HashMap::default();
         if !self.bind_default_operands(e, &[], &[], &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
+    }
+
+    /// §8.25, §6.20.2: a constant expression over the ACTIVE specialization's
+    /// value parameters (`W/4` in a typedef of `outer_c #(16)`), folded to
+    /// the number it names there. `fold_package_const_expr` knows only
+    /// literals and package parameters, so the argument was dropped and the
+    /// parameter took its default.
+    pub(super) fn fold_enclosing_param_expr(&self, e: &Expression) -> Option<String> {
+        if !matches!(
+            e.kind,
+            ExprKind::Binary { .. }
+                | ExprKind::Unary { .. }
+                | ExprKind::Paren(_)
+                | ExprKind::Conditional { .. }
+        ) {
+            return None;
+        }
+        let (b, s) = self.current_spec.as_ref()?;
+        let cd = self.get_class_def(b)?;
+        let bound: Vec<String> = Self::split_spec_args(s)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let names = &cd.param_order[..cd.param_order.len().min(bound.len())];
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(e, names, &bound, &mut ptab) {
             return None;
         }
         super::elaborate::const_eval_i64_with_params(e, Some(&ptab)).map(|n| n.to_string())
@@ -2544,6 +2882,23 @@ impl Simulator {
     }
 
     pub(super) fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
+        // Enclosing value-parameter references depend on active method lexical context,
+        // so only memoize when no class context is active.
+        let has_ctx = self.class_context_stack.last().is_some_and(|c| c.is_some());
+        if !has_ctx {
+            let key = (class_name.to_string(), sig.to_string());
+            if let Some(cached) = self.spec_sig_cache.borrow().get(&key) {
+                return cached.clone();
+            }
+            let res = self.canonicalize_spec_sig_uncached(class_name, sig);
+            self.spec_sig_cache.borrow_mut().insert(key, res.clone());
+            res
+        } else {
+            self.canonicalize_spec_sig_uncached(class_name, sig)
+        }
+    }
+
+    fn canonicalize_spec_sig_uncached(&self, class_name: &str, sig: &str) -> String {
         // The class's parameter lists are read in place: every call below
         // takes `&self`.
         let Some(cd) = self.module.classes.get(class_name) else {
@@ -2757,6 +3112,17 @@ impl Simulator {
     /// instance method lands in the SAME shared store the static-method path
     /// (and any `ClassName::m[...]` spelling) uses.
     pub(super) fn spec_static_coll_key_in_class(&self, name: &str, ctx: &str) -> String {
+        self.spec_static_coll_key_in_class_with(name, ctx, None)
+    }
+
+    /// `spec_static_coll_key_in_class` under the specialization `spec`
+    /// (an object's own, §8.25) instead of the active one, when given.
+    pub(super) fn spec_static_coll_key_in_class_with(
+        &self,
+        name: &str,
+        ctx: &str,
+        spec: Option<&(String, String)>,
+    ) -> String {
         // Walk ctx's inheritance chain for a STATIC collection property.
         // Static collections are registered in `static_collections`
         // (name, is_assoc, width) — NOT queue_properties/assoc_properties,
@@ -2767,7 +3133,7 @@ impl Simulator {
                 if cd.static_properties.contains(name)
                     && cd.static_collections.iter().any(|(n, _, _)| n == name)
                 {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
+                    if let Some(key) = self.static_prop_key_spec(ctx, name, spec) {
                         // Rewrite storage to the per-DECLARING-class key ONLY
                         // when the bare name collides across classes (§8.9) or
                         // the class is parameterized (`#spec`). A statically
@@ -2924,6 +3290,11 @@ impl Simulator {
                     }
                     return Some(key);
                 }
+                // §8.14: the nearest declaration wins — an instance property
+                // hides a same-named static or constant of an ancestor.
+                if cd.properties.contains_key(prop) {
+                    return None;
+                }
                 // §8.23: a NESTED class sees its lexically enclosing class's
                 // statics — hop to the enclosing class when the extends
                 // chain is exhausted.
@@ -2942,12 +3313,15 @@ impl Simulator {
     /// compiled plan. The common (non-parameterized) path always returns 0 and is
     /// untouched.
     pub(super) fn instance_spec_id(&mut self, handle: usize) -> u32 {
-        let Some(spec) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|inst| inst.spec.clone())
-        else {
+        let spec = if handle != 0 {
+            self.heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|inst| inst.spec.clone())
+        } else {
+            self.current_spec.clone()
+        };
+        let Some(spec) = spec else {
             return 0;
         };
         if let Some(&id) = self.compiled_spec_intern.get(&spec) {
@@ -3251,15 +3625,43 @@ impl Simulator {
     }
 
     pub(super) fn class_scoped_const(&mut self, start_class: &str, member: &str) -> Option<Value> {
-        // Collect the inheritance chain and its enum-typedef names + widths
-        // under an immutable borrow, then resolve under separate borrows so
-        // the later `class_static_get` (&mut self) doesn't conflict.
+        if let Some(v) = self.class_scoped_enum_literal(start_class, member) {
+            return Some(v);
+        }
+        // §8.25: a parameter of the active specialization of this class.
+        if let Some(v) = self.active_spec_param_value(start_class, member) {
+            return Some(v);
+        }
+        // Static property / localparam fallback.
         let mut chain_classes: Vec<String> = Vec::new();
+        let mut cur: Option<&str> = Some(start_class);
+        while let Some(cn) = cur {
+            chain_classes.push(cn.to_string());
+            cur = self
+                .module
+                .classes
+                .get(cn)
+                .and_then(|cd| cd.extends.as_deref());
+        }
+        for cn in &chain_classes {
+            if let Some(v) = self.class_static_get(cn, member) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// The enum literal `member` of the nearest class on `start_class`'s
+    /// chain that declares one — the first step of `class_scoped_const`.
+    pub(super) fn class_scoped_enum_literal(
+        &self,
+        start_class: &str,
+        member: &str,
+    ) -> Option<Value> {
         let mut enum_tds: Vec<(String, u32)> = Vec::new();
         {
             let mut cur: Option<&str> = Some(start_class);
             while let Some(cn) = cur {
-                chain_classes.push(cn.to_string());
                 match self.module.classes.get(cn) {
                     Some(cd) => {
                         for (td_name, dt) in &cd.typedef_targets {
@@ -3280,22 +3682,11 @@ impl Simulator {
                 }
             }
         }
-        // Enum literal lookup.
         for (td_name, w) in &enum_tds {
             if let Some(members) = self.module.enum_members.get(td_name) {
                 if let Some((_, val)) = members.iter().find(|(n, _)| n == member) {
                     return Some(Value::from_u64(*val, *w));
                 }
-            }
-        }
-        // §8.25: a parameter of the active specialization of this class.
-        if let Some(v) = self.active_spec_param_value(start_class, member) {
-            return Some(v);
-        }
-        // Static property / localparam fallback.
-        for cn in &chain_classes {
-            if let Some(v) = self.class_static_get(cn, member) {
-                return Some(v);
             }
         }
         None
@@ -3777,13 +4168,12 @@ impl Simulator {
                 let lname: &str = h.path[0].name.name.as_str();
                 // `null` acts only on a vif property of `this` or a name that
                 // holds a `__vif_local__` key (the key removal otherwise finds
-                // nothing; the store generation still moves). Any other RHS
-                // must be able to name an interface instance.
+                // nothing, and the ordinary assignment notes the name). Any
+                // other RHS must be able to name an interface instance.
                 if matches!(&rvalue.kind, ExprKind::Null) {
                     if !self.class_member_names().vif_props.contains(lname)
                         && !self.vif_local_names.contains(lname)
                     {
-                        bump_store_gen();
                         return false;
                     }
                 } else if !self.vif_rhs_possible(rvalue) {
@@ -3891,6 +4281,18 @@ impl Simulator {
             .is_some_and(|l| l.contains_key(name))
         {
             return true;
+        }
+        // §13.5, §25.9: the running frame does not declare `name`, so it
+        // reads the enclosing scope (a module, interface or package
+        // variable). The key a CALLER's virtual-interface formal of that name
+        // made does not speak for it: no caller frame is visible here. The
+        // running subroutine's own formal (its alias frame is the last one,
+        // read from a nested scope such as an inline constraint) still is.
+        if let Some((own, callers)) = self.local_iface_aliases.split_last()
+            && !own.contains_key(name)
+            && callers.iter().any(|f| f.contains_key(name))
+        {
+            return false;
         }
         let Some(th) = self.this_stack.last().copied().flatten() else {
             return true;

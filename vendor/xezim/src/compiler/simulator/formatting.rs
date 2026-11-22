@@ -48,11 +48,7 @@ impl Simulator {
             K::ToLower => Value::from_string(&Self::sv_ascii_case(&v(0).to_sv_string(), false)),
             K::Compare | K::ICompare | K::Order => {
                 let (a, b) = (v(0).to_sv_string(), v(1).to_sv_string());
-                let d = match kind {
-                    K::Compare => Self::sv_strcmp(&a, &b, false),
-                    K::ICompare => Self::sv_strcmp(&a, &b, true),
-                    _ => Self::sv_str_order(&a, &b),
-                };
+                let d = Self::sv_strcmp(&a, &b, matches!(kind, K::ICompare));
                 let mut out = Value::from_u64(d as u64, 32);
                 out.is_signed = true;
                 out
@@ -115,6 +111,14 @@ impl Simulator {
                 } => {
                     let v = &regs[f.args[ai] as usize];
                     ai += 1;
+                    // §6.12.2: an integral letter prints a real as an integer.
+                    let conv;
+                    let v = if v.is_real && matches!(spec, 'd' | 'b' | 'h' | 'x' | 'o' | 'c') {
+                        conv = Self::real_fmt_int(v);
+                        &conv
+                    } else {
+                        v
+                    };
                     let pad = |out: &mut String, core: String, w: usize, left: bool| {
                         if core.len() >= w {
                             out.push_str(&core);
@@ -224,27 +228,6 @@ impl Simulator {
         }
     }
 
-    /// Minimal (leading-zero-trimmed) form of a binary/octal/hex string; x/z
-    /// digits stop the trim, and an all-zero value keeps one digit.
-    pub(super) fn trim_radix_zeros(s: &str) -> String {
-        let t = s.trim_start_matches('0');
-        if t.is_empty() {
-            return "0".to_string();
-        }
-        // §21.2.1.3 automatic sizing: a leading RUN of x (or z) digits
-        // collapses to one, like leading zeros — `%0h` of 8'hxx is "x",
-        // of 16'hxx3f is "x3f". Mixed-case runs (X vs x) keep the first.
-        let mut chars = t.chars();
-        if let Some(first) = chars.next() {
-            if matches!(first, 'x' | 'X' | 'z' | 'Z') {
-                let rest: &str = chars.as_str();
-                let trimmed = rest.trim_start_matches(|c: char| c.eq_ignore_ascii_case(&first));
-                return format!("{}{}", first, trimmed);
-            }
-        }
-        t.to_string()
-    }
-
     /// Full-width octal rendering from a binary string, x/z-aware: a digit is
     /// `x`/`z` when all three bits are, `X`/`Z` when only some are.
     pub(super) fn bin_to_oct_string(bin: &str) -> String {
@@ -326,30 +309,9 @@ impl Simulator {
         )
     }
 
-    /// §21.2.1.2 hex/binary/octal field padding. a reference simulator (and C) pad a bare
-    /// `%Nh` with SPACES around the natural full-width form (`8'h0f` -> `  0f`
-    /// for `%4h`); the leading-`0` flag both selects the minimal
-    /// (leading-zero-trimmed) form AND zero-pads it (`%04h` -> `000f`). A `-`
-    /// flag left-justifies with trailing spaces. Passing `full` (not a
-    /// pre-trimmed core) lets us honour the flag correctly.
+    /// §21.2.1.2–3: trim leading zero digits, preserving each x/z digit.
+    /// Explicit widths pad on the left with zeros or on the right with spaces.
     pub(super) fn push_radix(result: &mut String, full: &str, width: usize, left_align: bool) {
-        // The reference simulator's radix-field model, re-measured
-        // byte-for-byte (commercial tools disagree here; xezim previously
-        // followed the OTHER tool's space-pad-to-natural-width model — the
-        // switch is deliberate, see tests/strings/format_sibling_fixes.rs):
-        //   * bare `%0<r>`: minimal form — leading zeros AND a leading x/z
-        //     run collapse (`%0h` of 16'hxx3f -> "x3f", of 8'hzz -> "z").
-        //   * explicit width W: the core is the value with leading ZEROS
-        //     trimmed only — an x/z run is kept (`%6h` of 8'hzz ->
-        //     "0000zz"). Never truncated below the core (`%2h` of 16'h2a5
-        //     -> "2a5"). Right-justified pads with '0' REGARDLESS of the
-        //     `0` flag (`%4h` == `%04h` of 8'h0f -> "000f"); `-` pads with
-        //     spaces on the right (`%-4h` -> "f   ", `%-08h` of 32'hFF ->
-        //     "ff      "). Zero value: `%4h` of 8'h00 -> "0000".
-        if width == 0 {
-            result.push_str(&Self::trim_radix_zeros(full));
-            return;
-        }
         let t = full.trim_start_matches('0');
         let core = if t.is_empty() { "0" } else { t };
         if core.len() >= width {
@@ -480,6 +442,24 @@ impl Simulator {
                 "St"
             }
         }
+        // §10.6.2: a force overrides every driver of the net, so the net
+        // shows the forced value and the forced strength. The force
+        // statement carries no strength of its own, so the forced drive is
+        // strong (§28.7 default). The names of one alias group share the
+        // net's storage, so they share the force too (§10.11).
+        if let ExprKind::Ident(h) = &arg.kind {
+            let name = self.resolve_hier_name(h).into_owned();
+            if let Some(&id) = self.signal_name_to_id.get(name.as_str())
+                && let Some(fv) = self.forced_signals.get(&id)
+            {
+                return match fv.get_bit(0) {
+                    LogicBit::One => "St1".to_string(),
+                    LogicBit::Zero => "St0".to_string(),
+                    LogicBit::Z => "HiZ".to_string(),
+                    LogicBit::X => "StX".to_string(),
+                };
+            }
+        }
         // §28.12: a net several drivers resolve reports the strength they
         // resolve to (bit 0, like the value letter below).
         if let ExprKind::Ident(h) = &arg.kind
@@ -589,11 +569,12 @@ impl Simulator {
     pub(super) fn strength_bit(ds: &[(i8, i8, Option<bool>, Value)], i: usize) -> Option<(i8, i8)> {
         let mut acc: Option<(i8, i8)> = None;
         for (s0, s1, on, v) in ds {
-            let b = if i < v.width as usize {
-                v.get_bit(i)
-            } else {
-                LogicBit::Zero
-            };
+            // §5.7: an unsized `'1`/`'z`/`'x`/`'0` driver value is a FILL —
+            // `get_bit` replicates it into the wider context. The old
+            // bounds guard (`i < v.width else Zero`) instead clamped the
+            // fill's value to bit 0, so `assign (weak0,weak1) n = '1;` on an
+            // 8-bit net pulled only `n[0]` up (#1061).
+            let b = v.get_bit(i);
             let mut r = match b {
                 LogicBit::Zero => (-*s0, -*s0),
                 LogicBit::One => (*s1, *s1),
@@ -681,6 +662,25 @@ impl Simulator {
     /// enum and union properties would need the elaboration-time typedef
     /// table, which is not reachable here, so they keep the elaborated width
     /// rather than risk a wrong one.
+    pub(super) fn class_chain_has_value_params(&self, start_class: &str) -> bool {
+        let mut cur = Some(start_class);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(c) = self.module.classes.get(cn) else {
+                break;
+            };
+            if c.param_order.iter().any(|p| !c.type_param_names.contains(p)) {
+                return true;
+            }
+            cur = c.extends.as_deref();
+        }
+        false
+    }
+
     pub(super) fn respec_packed_width(
         &self,
         decl_class: &str,
@@ -705,6 +705,10 @@ impl Simulator {
                 .or_default()
                 .insert(prop.to_string(), v);
         };
+        if !self.class_chain_has_value_params(decl_class) {
+            note(false);
+            return None;
+        }
         let cd = self.module.classes.get(decl_class)?;
         let dt = self.class_prop_decl_type(cd, prop);
         let dims = match dt {
@@ -946,21 +950,25 @@ impl Simulator {
             return None;
         }
         // `respec_packed_width` answers only for a range that is not constant
-        // on its own (its classification, without the instance).
-        let respec = self.module.classes.get(cn.as_str()).is_none_or(|c| {
-            let dims = match self.class_prop_decl_type(c, prop) {
-                Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
-                    dimensions
-                }
-                Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
-                _ => return false,
-            };
-            dims.iter().any(|d| {
-                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-            })
-        });
+        // on its own (its classification, without the instance) when the
+        // declaring class chain actually has value parameters.
+        let respec = self.class_chain_has_value_params(cn.as_str())
+            && self.module.classes.get(cn.as_str()).is_none_or(|c| {
+                let dims = match self.class_prop_decl_type(c, prop) {
+                    Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                        dimensions
+                    }
+                    Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => {
+                        dimensions
+                    }
+                    _ => return false,
+                };
+                dims.iter().any(|d| {
+                    matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                        if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                            || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                })
+            });
         if respec {
             return None;
         }
@@ -1024,8 +1032,23 @@ impl Simulator {
         } else {
             ctx
         };
+        let handle = self.this_stack.last().copied().flatten()?;
+        self.shadowed_prop_key_in(&viewing, handle, name)
+    }
+
+    /// `shadowed_prop_key` of object `handle` seen from class `viewing`
+    /// (a reference's declared class, §8.14), whether or not it is `this`.
+    pub(super) fn shadowed_prop_key_in(
+        &self,
+        viewing: &str,
+        handle: usize,
+        name: &str,
+    ) -> Option<String> {
+        if self.shadowed_prop_names.is_empty() || !self.shadowed_prop_names.contains(name) {
+            return None;
+        }
         // Nearest declarer at or above the viewing class.
-        let mut cur = Some(viewing);
+        let mut cur = Some(viewing.to_string());
         let mut target: Option<String> = None;
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
@@ -1036,8 +1059,7 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         let target = target?;
-        // The leaf-most declarer for the CURRENT object.
-        let handle = self.this_stack.last().copied().flatten()?;
+        // The leaf-most declarer for the object.
         let leaf = self
             .heap
             .get(handle)
@@ -1062,15 +1084,21 @@ impl Simulator {
         // §10.7: every integral store takes the destination's signedness,
         // including stores whose width already matches the declaration.
         if val.is_real {
-            return val.clone();
+            // §6.12.2: a real into an INTEGRAL property rounds to its declared
+            // width (`heap_prop_width` is None for a real, string or handle
+            // property, which keep the value).
+            return match self.heap_prop_width(handle, prop) {
+                Some(w) => {
+                    let mut f = Self::real_to_int(val.to_f64(), w);
+                    f.is_signed = self.class_prop_signed_of(handle, prop);
+                    f
+                }
+                None => val.clone(),
+            };
         }
         let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) => {
-                let mut fitted = if w != val.width {
-                    val.resize_for_assign(w)
-                } else {
-                    val.clone()
-                };
+                let mut fitted = val.resize_for_assign(w);
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
@@ -1110,6 +1138,107 @@ impl Simulator {
                 let bound =
                     self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
                 return super::elaborate::is_type_two_state_resolved(
+                    bound.as_ref().unwrap_or(dt),
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// Whether some class declares a property `prop` (or `C::prop`) that can
+    /// hold a `real`: one declared real, or one typed by a class type
+    /// parameter (`class_real_props`). Keeps the declared-type walks below
+    /// off the assignments that cannot name one.
+    #[inline]
+    pub(super) fn may_name_real_class_prop(&self, prop: &str) -> bool {
+        if self.class_real_props.is_empty() {
+            return false;
+        }
+        let leaf = prop.rsplit_once("::").map_or(prop, |(_, l)| l);
+        self.class_real_props.contains(leaf)
+    }
+
+    /// The `class_real_props` of a design: the class properties declared
+    /// `real`, `shortreal` or `realtime` (or a typedef of one), or typed by a
+    /// class type parameter, which a specialization can bind to one.
+    pub(super) fn collect_class_real_props(module: &ElaboratedModule) -> HashSet<String> {
+        let mut out = HashSet::default();
+        for cd in module.classes.values() {
+            for (name, dt) in &cd.property_types {
+                let real = match dt {
+                    DataType::TypeReference { name: tn, .. } => {
+                        cd.type_param_names.iter().any(|t| *t == tn.name.name)
+                            || cd.typedef_targets.get(&tn.name.name).is_some_and(|t| {
+                                super::elaborate::is_type_real_resolved(t, &module.typedef_types)
+                            })
+                            || super::elaborate::is_type_real_resolved(dt, &module.typedef_types)
+                    }
+                    _ => super::elaborate::is_type_real_resolved(dt, &module.typedef_types),
+                };
+                if real {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether property `prop` of the object `handle` is declared `real`
+    /// (or a typedef of one). The twin of `class_prop_two_state`: a real
+    /// property has no integral width, so `class_prop_width_impl` answers
+    /// None for it and a caller that must still size a store (an NBA
+    /// lvalue) needs the real-ness itself.
+    pub(super) fn class_prop_is_real(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let (start, prop) = prop
+            .rsplit_once("::")
+            .unwrap_or((inst.class_name.as_str(), prop));
+        self.class_prop_is_real_in(start, prop, handle)
+    }
+
+    /// The declared-type walk behind `class_prop_is_real`, started from a
+    /// class NAME — for an owner-qualified static (`C::prop`) where no
+    /// object exists. `handle` 0 (null) leaves a type parameter unbound,
+    /// which a real declaration never is.
+    pub(super) fn class_prop_is_real_in(&self, start: &str, prop: &str, handle: usize) -> bool {
+        if !self.may_name_real_class_prop(prop) {
+            return false;
+        }
+        let mut cur = Some(start);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A class-local typedef first, then the design's.
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                // §8.25: a type parameter the object binds to a real type.
+                // `bind_type_params_in` answers only integral bindings.
+                if let DataType::TypeReference { name, .. } = dt
+                    && !name.has_scope()
+                    && cd.type_param_names.iter().any(|t| *t == name.name.name)
+                    && let Some(b) = self.obj_type_param(handle, cn, &name.name.name)
+                {
+                    let b = b.trim();
+                    return self.concrete_type_real(b);
+                }
+                // §8.25: the state domain of a type parameter belongs to
+                // this object, including when another specialization calls it.
+                let bound =
+                    self.bind_type_params_in(dt, &|name| self.obj_type_param(handle, cn, name));
+                return super::elaborate::is_type_real_resolved(
                     bound.as_ref().unwrap_or(dt),
                     &self.module.typedef_types,
                 );
