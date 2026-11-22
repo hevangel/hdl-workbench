@@ -4,6 +4,10 @@ Changes to HDL Workbench are recorded here.
 
 ## Unreleased
 
+## 1.1.0 — 2026-11-22
+
+- Ignored the local `.kilo/` configuration directory.
+
 ## 1.0.0 — 2026-11-22
 
 - Updated Xezim to 0.11.7 and xezim-core to 0.11.7 (Rust 1.100). Surfer stays at v0.7.0, the latest upstream release.
