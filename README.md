@@ -6,6 +6,8 @@ An AI coding agent (for example Codex or Claude Code) can optionally drive the s
 
 > **Simulation always runs in the browser.** There is no server-side or native fallback. If the WASM simulator assets are missing, the Run button is disabled rather than quietly using something else.
 
+![HDL Workbench with the counter module in the editor and its waveform in the embedded Surfer viewer](docs/workbench.png)
+
 For a visual walkthrough of how the pieces fit together, open [`docs/index.html`](docs/index.html) in a browser.
 
 ## What you can do
